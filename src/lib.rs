@@ -1,14 +1,27 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Kriging library for Rust with optional WASM bindings.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub type Real = f32;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod distance;
+pub mod error;
+#[cfg(feature = "gpu")]
+pub mod gpu;
+pub mod kriging;
+pub mod matrix;
+pub mod utils;
+pub mod variogram;
+
+#[cfg(feature = "wasm")]
+pub mod wasm;
+
+pub use distance::GeoCoord;
+pub use error::KrigingError;
+#[cfg(feature = "gpu")]
+pub use gpu::{GpuBackend, GpuSupport, build_rhs_covariances_gpu, detect_gpu_support, gpu_square};
+pub use kriging::binomial::{
+    BinomialKrigingModel, BinomialObservation, BinomialPrediction, BinomialPrior,
+};
+pub use kriging::ordinary::{OrdinaryKrigingModel, Prediction};
+pub use variogram::fitting::{FitResult, fit_variogram};
+pub use variogram::models::{VariogramModel, VariogramType};
+pub use variogram::{VariogramConfig, compute_empirical_variogram};
