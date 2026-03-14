@@ -1,0 +1,42 @@
+---
+description: Rust test-driven design workflow and expectations
+alwaysApply: true
+---
+# Rust Test-Driven Design
+Use Red-Green-Refactor for code changes in this repository.
+## Workflow
+1. Write or update a failing test first for the target behavior.
+2. Implement the smallest change that makes the test pass.
+3. Refactor only after tests are green, then re-run tests.
+## Test Expectations
+- Prefer unit tests for focused logic and integration tests for public behavior.
+- Keep tests deterministic, fast, and isolated from timing/network flakiness.
+- Assert outcomes and edge cases, not private implementation details.
+- Add regression tests when fixing bugs before changing production code.
+## Rust Example
+```rust
+// Bad: implementation first (no failing test to drive behavior)
+pub fn clamp_non_negative(x: i32) -> i32 {
+    if x < 0 { 0 } else { x }
+}
+```
+
+```rust
+// Good: fail-first test, then minimal implementation
+#[test]
+fn returns_zero_for_negative_values() {
+    assert_eq!(clamp_non_negative(-3), 0);
+}
+
+pub fn clamp_non_negative(x: i32) -> i32 {
+    if x < 0 { 0 } else { x }
+}
+```
+```rust
+// Safe refactor: preserve behavior while improving readability
+pub fn clamp_non_negative(x: i32) -> i32 {
+    x.max(0)
+}
+```
+
+Keep behavior tests unchanged and run `cargo test` after each refactor step.
