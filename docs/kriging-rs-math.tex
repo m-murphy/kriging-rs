@@ -1,0 +1,198 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{geometry}
+\usepackage{hyperref}
+
+\geometry{margin=1in}
+\title{Mathematical Description of kriging-rs}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+This document describes the mathematical approach implemented by the kriging-rs library: ordinary kriging (covariance formulation), variogram models, Haversine distance, empirical variogram and fitting, and binomial kriging.
+
+\section{Setup and Notation}
+
+\subsection{Spatial domain}
+Locations are given as geographic coordinates: latitude $\phi$ and longitude $\lambda$ (in degrees in the API). The library predicts at unsampled locations on the sphere.
+
+\subsection{Distance}
+Pairwise distances between locations are computed using the \emph{Haversine} formula on a sphere of radius
+\begin{equation}
+  R = 6371 \;\text{km}.
+\end{equation}
+Let $\phi_1,\phi_2$ and $\lambda_1,\lambda_2$ be latitudes and longitudes in radians, and set $\Delta\phi = \phi_2 - \phi_1$, $\Delta\lambda = \lambda_2 - \lambda_1$. Define
+\begin{equation}
+  a = \sin^2\Bigl(\frac{\Delta\phi}{2}\Bigr) + \cos\phi_1 \cos\phi_2 \sin^2\Bigl(\frac{\Delta\lambda}{2}\Bigr).
+\end{equation}
+The Haversine distance between the two points is
+\begin{equation}
+  d(s_1, s_2) = R \cdot 2\,\arctan2\bigl(\sqrt{a}, \sqrt{1-a}\bigr).
+\end{equation}
+All covariance and variogram evaluations in the kriging system use this distance.
+
+\subsection{Observations}
+We have $n$ observed locations $s_1, \ldots, s_n$ and values $Z(s_1), \ldots, Z(s_n)$. The goal is to predict the value at an unsampled location $s_0$, and optionally to report the kriging variance.
+
+\section{Variogram and Covariance}
+
+\subsection{Relationship}
+The \emph{semivariogram} $\gamma(h)$ and the \emph{covariance} $C(h)$ are related by
+\begin{equation}
+  C(h) = C(0) - \gamma(h).
+\end{equation}
+The implementation uses the covariance everywhere; variogram models are defined via $\gamma(h)$ and then $C(h) = \sigma^2 - \gamma(h)$ with $\sigma^2 = C(0)$ the sill.
+
+\subsection{Parameterization}
+Each model is parameterized by:
+\begin{itemize}
+  \item \textbf{Nugget} $c_0 \ge 0$: discontinuity at $h=0$.
+  \item \textbf{Sill} $\sigma^2 = C(0) > 0$: variance at zero distance.
+  \item \textbf{Range} $a > 0$: distance scale.
+  \item \textbf{Partial sill} $p = \sigma^2 - c_0 \ge 0$.
+\end{itemize}
+
+\subsection{Spherical model}
+For $h \ge 0$,
+\begin{equation}
+  \gamma(h) =
+  \begin{cases}
+    c_0 + p\,\Bigl(1.5\,\frac{h}{a} - 0.5\,\Bigl(\frac{h}{a}\Bigr)^3\Bigr) & \text{if } h < a, \\
+    \sigma^2 & \text{if } h \ge a.
+  \end{cases}
+\end{equation}
+
+\subsection{Exponential model}
+\begin{equation}
+  \gamma(h) = c_0 + p\,\Bigl(1 - \exp\Bigl(-\frac{3h}{a}\Bigr)\Bigr), \quad h \ge 0.
+\end{equation}
+
+\subsection{Gaussian model}
+\begin{equation}
+  \gamma(h) = c_0 + p\,\Bigl(1 - \exp\Bigl(-\frac{3h^2}{a^2}\Bigr)\Bigr), \quad h \ge 0.
+\end{equation}
+
+\subsection{Cubic model}
+The cubic model is smooth at the origin (twice differentiable) and reaches the sill at range $a$:
+\begin{equation}
+  \gamma(h) =
+  \begin{cases}
+    c_0 + p\,\Bigl(7\,\Bigl(\frac{h}{a}\Bigr)^2 - 8.5\,\Bigl(\frac{h}{a}\Bigr)^3 + 3.5\,\Bigl(\frac{h}{a}\Bigr)^5 - 0.5\,\Bigl(\frac{h}{a}\Bigr)^7\Bigr) & \text{if } h < a, \\
+    \sigma^2 & \text{if } h \ge a.
+  \end{cases}
+\end{equation}
+
+\subsection{Stable model}
+With shape parameter $\alpha \in (0, 2]$:
+\begin{equation}
+  \gamma(h) = c_0 + p\,\Bigl(1 - \exp\Bigl(-\Bigl(\frac{h}{a}\Bigr)^\alpha\Bigr)\Bigr), \quad h \ge 0.
+\end{equation}
+Exponential corresponds to $\alpha = 1$ (with a different range scaling than the 3-parameter exponential above).
+
+\subsection{Matérn model}
+With smoothness parameter $\nu > 0$ and $K_\nu$ the modified Bessel function of the second kind:
+\begin{equation}
+  \gamma(h) = c_0 + p\,\Bigl(1 - \frac{2^{1-\nu}}{\Gamma(\nu)}\,\Bigl(\frac{h\sqrt{2\nu}}{a}\Bigr)^\nu K_\nu\Bigl(\frac{h\sqrt{2\nu}}{a}\Bigr)\Bigr), \quad h \ge 0.
+\end{equation}
+
+\subsection{Covariance}
+In all of the above models the covariance used in the kriging system is
+\begin{equation}
+  C(h) = \sigma^2 - \gamma(h) \ge 0.
+\end{equation}
+
+\section{Ordinary Kriging}
+
+\subsection{Assumptions}
+The random field is assumed to have constant (unknown) mean $\mu$. Ordinary kriging gives the best linear unbiased predictor (BLUP) under this assumption, with weights $\lambda_1, \ldots, \lambda_n$ and a Lagrange multiplier $\mu$ (scalar) enforcing unbiasedness.
+
+\subsection{Linear system}
+The weights $\lambda \in \mathbb{R}^n$ and $\mu \in \mathbb{R}$ solve the system in covariance form:
+\begin{equation}
+  \begin{bmatrix}
+    \mathbf{C} & \mathbf{1} \\
+    \mathbf{1}^\top & 0
+  \end{bmatrix}
+  \begin{bmatrix}
+    \lambda \\ \mu
+  \end{bmatrix}
+  =
+  \begin{bmatrix}
+    \mathbf{c}_0 \\ 1
+  \end{bmatrix},
+\end{equation}
+where
+\begin{itemize}
+  \item $\mathbf{C}$ is the $n \times n$ matrix with entries $C_{ij} = C(d(s_i, s_j))$. For numerical stability, the diagonal is regularized: $C_{ii}$ is replaced by $C_{ii} + 10^{-10}$.
+  \item $\mathbf{1}$ is the $n$-vector of ones; the bottom block enforces $\sum_{i=1}^n \lambda_i = 1$.
+  \item $\mathbf{c}_0$ is the $n$-vector with entries $c_{0,i} = C(d(s_i, s_0))$.
+\end{itemize}
+
+\subsection{Prediction}
+The ordinary kriging predictor at $s_0$ is
+\begin{equation}
+  \hat{Z}(s_0) = \sum_{i=1}^n \lambda_i Z(s_i).
+\end{equation}
+
+\subsection{Kriging variance}
+The kriging variance at $s_0$ is
+\begin{equation}
+  \sigma_{\mathrm{OK}}^2(s_0) = C(0) - \lambda^\top \mathbf{c}_0 - \mu.
+\end{equation}
+The implementation reports $\max\bigl(0, \, C(0) - \lambda^\top \mathbf{c}_0 - \mu\bigr)$.
+
+\section{Empirical Variogram and Fitting}
+
+\subsection{Empirical variogram}
+Observations are binned by distance. For each bin $k$ with pair set $N_k$ (pairs $(i,j)$ whose distance falls in the bin), the mean distance and semivariance are
+\begin{align}
+  \bar{h}_k &= \frac{1}{|N_k|} \sum_{(i,j) \in N_k} d(s_i, s_j), \\
+  \hat{\gamma}(\bar{h}_k) &= \frac{1}{|N_k|} \sum_{(i,j) \in N_k} \frac{1}{2}\bigl(Z(s_i) - Z(s_j)\bigr)^2.
+\end{align}
+The number of pairs in bin $k$, $n_k = |N_k|$, is stored for use as weight in fitting.
+
+\subsection{Fitting}
+A parametric variogram $\gamma(h; \theta)$ with $\theta = (c_0, \sigma^2, a)$ is fitted by \emph{weighted least squares} (WLS): minimize
+\begin{equation}
+  \sum_k n_k\,\Bigl(\hat{\gamma}(\bar{h}_k) - \gamma(\bar{h}_k; \theta)\Bigr)^2
+\end{equation}
+over $\theta$. The implementation uses a discrete grid search over nugget, sill, and range scales (no gradient-based optimizer).
+
+\section{Binomial Kriging}
+
+\subsection{Data}
+At each location $s_i$ we observe counts: successes $y_i$ and trials $n_i$ (with $0 \le y_i \le n_i$).
+
+\subsection{Smoothed probability}
+A Beta prior with parameters $\alpha > 0$, $\beta > 0$ is used to smooth the raw proportion. The smoothed probability at $s_i$ is
+\begin{equation}
+  p_i = \frac{y_i + \alpha}{n_i + \alpha + \beta}.
+\end{equation}
+Default in the implementation is $\alpha = \beta = 0.5$.
+
+\subsection{Logit transform}
+The logit at $s_i$ is
+\begin{equation}
+  L(s_i) = \ln\frac{p_i}{1 - p_i}.
+\end{equation}
+
+\subsection{Ordinary kriging on logits}
+Ordinary kriging is applied to the values $L(s_1), \ldots, L(s_n)$ with the same variogram model, yielding the predicted logit $\hat{L}(s_0)$ and its kriging variance $\sigma_{\mathrm{OK}}^2(s_0)$ (on the logit scale).
+
+\subsection{Prevalence}
+The predicted prevalence (probability) at $s_0$ is
+\begin{equation}
+  \hat{p}(s_0) = \mathrm{logistic}\bigl(\hat{L}(s_0)\bigr) = \frac{1}{1 + e^{-\hat{L}(s_0)}}.
+\end{equation}
+The variance returned by the library is the kriging variance of the logit; it is not back-transformed to the probability scale.
+
+\section{Implementation Notes}
+
+\begin{itemize}
+  \item \textbf{Stability:} The kriging matrix diagonal is regularized with $C_{ii} + 10^{-10}$ to avoid singular systems.
+  \item \textbf{Distance:} All pairwise distances in the kriging system and in the right-hand side use the Haversine formula; the API does not offer Euclidean or other distance options.
+\end{itemize}
+
+\end{document}

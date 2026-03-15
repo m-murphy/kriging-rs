@@ -6,32 +6,33 @@ Geostatistical kriging library for Rust with WebAssembly support.
 
 - Ordinary kriging for spatial interpolation
 - Binomial kriging for prevalence surface estimation
+- Variogram models: spherical, exponential, Gaussian, cubic, stable, Matérn (stable and Matérn accept an optional shape parameter)
 - Geographic coordinate support with Haversine distances
 - Optional WASM bindings for browser applications
 - `Real` abstraction defaults to `f32` for compute paths
 - Optional cross-platform GPU capability path via `wgpu`
 
+## Repository layout
+
+- **Root:** Rust crate (`Cargo.toml`, `src/`, `examples/`, `tests/`, `benches/`), shared docs, and CI.
+- **`npm/kriging-rs-wasm/`:** TypeScript/WASM npm package; builds from this crate and is publish-ready.
+- **`www/`:** Optional browser demo that depends on the npm package. See `www/README.md`.
+
 ## Rust usage
 
 ```rust
-use kriging_rs::{GeoCoord, OrdinaryKrigingModel, VariogramModel};
+use kriging_rs::{GeoCoord, GeoDataset, OrdinaryKrigingModel, VariogramModel, VariogramType};
 
 let coords = vec![
-    GeoCoord { lat: 0.0, lon: 0.0 },
-    GeoCoord { lat: 0.0, lon: 1.0 },
-    GeoCoord { lat: 1.0, lon: 0.0 },
+    GeoCoord::try_new(0.0, 0.0)?,
+    GeoCoord::try_new(0.0, 1.0)?,
+    GeoCoord::try_new(1.0, 0.0)?,
 ];
 let values = vec![1.0, 2.0, 1.5];
-let model = OrdinaryKrigingModel::new(
-    coords,
-    values,
-    VariogramModel::Exponential {
-        nugget: 0.01,
-        sill: 2.0,
-        range: 300.0,
-    },
-)?;
-let prediction = model.predict(GeoCoord { lat: 0.3, lon: 0.3 })?;
+let dataset = GeoDataset::new(coords, values)?;
+let variogram = VariogramModel::new(0.01, 2.0, 300.0, VariogramType::Exponential)?;
+let model = OrdinaryKrigingModel::new(dataset, variogram)?;
+let prediction = model.predict(GeoCoord::try_new(0.3, 0.3)?)?;
 println!("{:?}", prediction.value);
 ```
 
@@ -98,27 +99,14 @@ GPU-assisted batch prediction APIs:
   `fit_variogram`) and then predict using `OrdinaryKrigingModel` or
   `BinomialKrigingModel`
 
-## Performance notes (1000-point workloads)
+## Performance
 
-Recent benchmark and profiling work focused on `~1000` sample points and `~1000` prediction points.
-The latest pass uses `f32` default compute plus native parallel batch prediction (WASM keeps sequential batch execution).
+Run `cargo bench` for current numbers; see `bench-results/README.md` for logging and comparison.
 
-- `ordinary_predict_batch_1000_with_1000pts`: `~263.6ms -> ~12.7ms`
-- `pipeline_ordinary_end_to_end_1000`: `~387.0ms -> ~83.6ms`
-- `pipeline_binomial_end_to_end_1000`: `~389.4ms -> ~84.4ms`
-- `pipeline_ordinary_model_build_1000`: `~109.3ms -> ~101.0ms` (about `7.5%` faster)
-- `pipeline_binomial_model_build_1000`: `~105.2ms -> ~101.5ms` (about `3.5%` faster)
+## WASM batch and typed-array APIs
 
-All regression and simulation tests remain green after optimization, and existing APIs remain backward compatible.
-
-## WASM high-throughput output APIs
-
-For large prediction batches, typed-array APIs avoid per-record JS object creation:
-
-- `WasmOrdinaryKriging.predictBatchArrays(...)` returns `{ values: Float64Array, variances: Float64Array }`
-- `WasmBinomialKriging.predictBatchArrays(...)` returns `{ prevalences: Float64Array, logitValues: Float64Array, variances: Float64Array }`
-- Use `fitOrdinaryVariogram(...)` + model constructors and call `predictBatchArrays(...)` for typed-array throughput
+For large prediction batches and typed-array usage (`predictBatchArrays`, `fitOrdinaryVariogram`, `VariogramType`), see the [npm package README](npm/kriging-rs-wasm/README.md).
 
 ## License
 
-Licensed under either Apache-2.0 or MIT at your option.
+Licensed under MIT.
