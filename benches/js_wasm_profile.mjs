@@ -10,6 +10,7 @@ const wasm = await import(pkgPath);
 
 const {
   WasmOrdinaryKriging,
+  WasmVariogramType,
   fitOrdinaryVariogram,
 } = wasm;
 
@@ -98,7 +99,7 @@ function buildPredictionGrid(lats, lons, resolution) {
 function profileWasm(rounds = 10, warmup = 3) {
   const sample = buildSurfaceSamples(350, 20260313);
   const grid = buildPredictionGrid(sample.lats, sample.lons, 36);
-  const variogramTypes = ["spherical", "exponential", "gaussian"];
+  const variogramType = WasmVariogramType.Exponential;
 
   const phases = {
     fitMs: [],
@@ -119,7 +120,7 @@ function profileWasm(rounds = 10, warmup = 3) {
       sample.values,
       undefined,
       12,
-      variogramTypes,
+      variogramType,
     );
     let t1 = performance.now();
     const fitMs = t1 - t0;
@@ -155,7 +156,7 @@ function profileWasm(rounds = 10, warmup = 3) {
       sample.values,
       undefined,
       12,
-      variogramTypes
+      variogramType,
     );
     const pipelineModel = new WasmOrdinaryKriging(
       sample.lats,
