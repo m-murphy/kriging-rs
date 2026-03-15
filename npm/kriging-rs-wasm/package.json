@@ -5,19 +5,31 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/m-murphy/kriging-rs.git",
+    "url": "git+https://github.com/m-murphy/kriging-rs.git",
     "directory": "npm/kriging-rs-wasm"
   },
   "homepage": "https://github.com/m-murphy/kriging-rs#readme",
   "bugs": {
     "url": "https://github.com/m-murphy/kriging-rs/issues"
   },
+  "author": "Maxwell Murphy <mm@maxmurphy.dev>",
+  "keywords": [
+    "kriging",
+    "geostatistics",
+    "wasm",
+    "interpolation",
+    "spatial"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "type": "module",
   "sideEffects": true,
   "files": [
     "dist",
     "pkg",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "exports": {
     ".": {
@@ -29,8 +41,8 @@
   "main": "./dist/index.js",
   "scripts": {
     "clean": "rm -rf dist pkg",
-    "build:wasm": "wasm-pack build ../.. --release --no-opt --target web --out-dir npm/kriging-rs-wasm/pkg -- --features wasm",
-    "build:wasm:gpu": "wasm-pack build ../.. --release --no-opt --target web --out-dir npm/kriging-rs-wasm/pkg -- --features wasm,gpu",
+    "build:wasm": "wasm-pack build ../.. --release --target web --out-dir npm/kriging-rs-wasm/pkg -- --features wasm",
+    "build:wasm:gpu": "wasm-pack build ../.. --release --target web --out-dir npm/kriging-rs-wasm/pkg -- --features wasm,gpu",
     "build:ts": "tsc -p tsconfig.build.json",
     "build": "npm run build:wasm && npm run build:ts",
     "typecheck:contracts": "tsc -p tsconfig.contracts.json --noEmit",
@@ -40,7 +52,8 @@
     "lint": "eslint src tests --max-warnings 0",
     "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\" \"*.js\"",
     "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\" \"*.js\"",
-    "verify": "npm run typecheck:contracts && npm run lint && npm run build && npm run smoke && npm test"
+    "verify": "npm run typecheck:contracts && npm run lint && npm run build && npm run smoke && npm test",
+    "prepublishOnly": "npm run build"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
