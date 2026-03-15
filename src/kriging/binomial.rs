@@ -1,21 +1,82 @@
+use crate::geo_dataset::GeoDataset;
 use crate::Real;
 use crate::distance::GeoCoord;
 use crate::error::KrigingError;
 use crate::kriging::ordinary::OrdinaryKrigingModel;
-use crate::utils::logistic;
+use crate::utils::{logistic, logit, Probability};
 use crate::variogram::models::VariogramModel;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BinomialObservation {
-    pub coord: GeoCoord,
-    pub successes: u32,
-    pub trials: u32,
+    coord: GeoCoord,
+    successes: u32,
+    trials: u32,
+}
+
+impl BinomialObservation {
+    /// Creates an observation with validated `trials > 0` and `successes <= trials`.
+    pub fn new(
+        coord: GeoCoord,
+        successes: u32,
+        trials: u32,
+    ) -> Result<Self, KrigingError> {
+        if trials == 0 {
+            return Err(KrigingError::InvalidBinomialData(
+                "trials must be greater than 0".to_string(),
+            ));
+        }
+        if successes > trials {
+            return Err(KrigingError::InvalidBinomialData(format!(
+                "successes ({}) cannot exceed trials ({})",
+                successes, trials
+            )));
+        }
+        Ok(Self {
+            coord,
+            successes,
+            trials,
+        })
+    }
+
+    #[inline]
+    pub fn coord(self) -> GeoCoord {
+        self.coord
+    }
+
+    #[inline]
+    pub fn successes(self) -> u32 {
+        self.successes
+    }
+
+    #[inline]
+    pub fn trials(self) -> u32 {
+        self.trials
+    }
+
+    pub fn smoothed_probability(&self) -> Real {
+        self.smoothed_probability_with_prior(BinomialPrior::default())
+    }
+
+    pub fn smoothed_probability_with_prior(&self, prior: BinomialPrior) -> Real {
+        let s = self.successes as Real;
+        let n = self.trials as Real;
+        (s + prior.alpha) / (n + prior.alpha + prior.beta)
+    }
+
+    pub fn smoothed_logit(&self) -> Real {
+        self.smoothed_logit_with_prior(BinomialPrior::default())
+    }
+
+    pub fn smoothed_logit_with_prior(&self, prior: BinomialPrior) -> Real {
+        let p = self.smoothed_probability_with_prior(prior);
+        logit(Probability::from_known_in_range(p))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BinomialPrior {
-    pub alpha: Real,
-    pub beta: Real,
+    alpha: Real,
+    beta: Real,
 }
 
 impl Default for BinomialPrior {
@@ -28,45 +89,29 @@ impl Default for BinomialPrior {
 }
 
 impl BinomialPrior {
-    pub fn validate(self) -> Result<(), KrigingError> {
-        if self.alpha <= 0.0 || self.beta <= 0.0 {
-            return Err(KrigingError::InvalidBinomialData(format!(
-                "prior alpha={} and beta={} must both be > 0",
-                self.alpha, self.beta
-            )));
+    /// Creates a prior with validated `alpha > 0` and `beta > 0`.
+    pub fn new(alpha: Real, beta: Real) -> Result<Self, KrigingError> {
+        if alpha <= 0.0 || !alpha.is_finite() {
+            return Err(KrigingError::InvalidBinomialData(
+                "prior alpha must be finite and positive".to_string(),
+            ));
         }
-        Ok(())
-    }
-}
-
-impl BinomialObservation {
-    pub fn smoothed_probability(&self) -> Result<Real, KrigingError> {
-        self.smoothed_probability_with_prior(BinomialPrior::default())
-    }
-
-    pub fn smoothed_probability_with_prior(
-        &self,
-        prior: BinomialPrior,
-    ) -> Result<Real, KrigingError> {
-        if self.trials == 0 || self.successes > self.trials {
-            return Err(KrigingError::InvalidBinomialData(format!(
-                "successes={} and trials={} are invalid",
-                self.successes, self.trials
-            )));
+        if beta <= 0.0 || !beta.is_finite() {
+            return Err(KrigingError::InvalidBinomialData(
+                "prior beta must be finite and positive".to_string(),
+            ));
         }
-        prior.validate()?;
-        let s = self.successes as Real;
-        let n = self.trials as Real;
-        Ok((s + prior.alpha) / (n + prior.alpha + prior.beta))
+        Ok(Self { alpha, beta })
     }
 
-    pub fn smoothed_logit(&self) -> Result<Real, KrigingError> {
-        self.smoothed_logit_with_prior(BinomialPrior::default())
+    #[inline]
+    pub fn alpha(self) -> Real {
+        self.alpha
     }
 
-    pub fn smoothed_logit_with_prior(&self, prior: BinomialPrior) -> Result<Real, KrigingError> {
-        let p = self.smoothed_probability_with_prior(prior)?;
-        Ok((p / (1.0 - p)).ln())
+    #[inline]
+    pub fn beta(self) -> Real {
+        self.beta
     }
 }
 
@@ -98,12 +143,11 @@ impl BinomialKrigingModel {
         if observations.len() < 2 {
             return Err(KrigingError::InsufficientData(2));
         }
-        prior.validate()?;
-        let coords = observations.iter().map(|o| o.coord).collect::<Vec<_>>();
+        let coords = observations.iter().map(|o| o.coord()).collect::<Vec<_>>();
         let logits = observations
             .iter()
             .map(|o| o.smoothed_logit_with_prior(prior))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Vec<_>>();
         Self::from_precomputed_logits(coords, logits, variogram)
     }
 
@@ -112,10 +156,8 @@ impl BinomialKrigingModel {
         logits: Vec<Real>,
         variogram: VariogramModel,
     ) -> Result<Self, KrigingError> {
-        if coords.len() < 2 {
-            return Err(KrigingError::InsufficientData(2));
-        }
-        let ordinary_model = OrdinaryKrigingModel::new(coords, logits, variogram)?;
+        let dataset = GeoDataset::new(coords, logits)?;
+        let ordinary_model = OrdinaryKrigingModel::new(dataset, variogram)?;
         Ok(Self { ordinary_model })
     }
 
@@ -182,18 +224,10 @@ mod tests {
 
     #[test]
     fn handles_zero_and_all_successes_with_smoothing() {
-        let o1 = BinomialObservation {
-            coord: GeoCoord { lat: 0.0, lon: 0.0 },
-            successes: 0,
-            trials: 10,
-        };
-        let o2 = BinomialObservation {
-            coord: GeoCoord { lat: 0.0, lon: 1.0 },
-            successes: 10,
-            trials: 10,
-        };
-        let p1 = o1.smoothed_probability().expect("valid");
-        let p2 = o2.smoothed_probability().expect("valid");
+        let o1 = BinomialObservation::new(GeoCoord::try_new(0.0, 0.0).unwrap(), 0, 10).unwrap();
+        let o2 = BinomialObservation::new(GeoCoord::try_new(0.0, 1.0).unwrap(), 10, 10).unwrap();
+        let p1 = o1.smoothed_probability();
+        let p2 = o2.smoothed_probability();
         assert!(p1 > 0.0 && p1 < 1.0);
         assert!(p2 > 0.0 && p2 < 1.0);
     }

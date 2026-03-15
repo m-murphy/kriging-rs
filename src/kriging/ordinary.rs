@@ -2,10 +2,11 @@ use nalgebra::{DMatrix, DVector, Dyn, linalg::LU};
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
+use crate::geo_dataset::GeoDataset;
 use crate::Real;
 use crate::distance::{GeoCoord, PreparedGeoCoord, haversine_distance_prepared, prepare_geo_coord};
 use crate::error::KrigingError;
-use crate::variogram::models::VariogramModel;
+use crate::variogram::models::{VariogramModel, VariogramType};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Prediction {
@@ -42,21 +43,10 @@ impl Clone for OrdinaryKrigingModel {
 
 impl OrdinaryKrigingModel {
     pub fn new(
-        coords: Vec<GeoCoord>,
-        values: Vec<Real>,
+        dataset: GeoDataset,
         variogram: VariogramModel,
     ) -> Result<Self, KrigingError> {
-        if coords.len() != values.len() {
-            return Err(KrigingError::DimensionMismatch(
-                "coords and values length must match".to_string(),
-            ));
-        }
-        if coords.len() < 2 {
-            return Err(KrigingError::InsufficientData(2));
-        }
-        for coord in &coords {
-            coord.validate()?;
-        }
+        let (coords, values) = dataset.into_parts();
         let prepared_coords = coords
             .iter()
             .copied()
@@ -117,9 +107,6 @@ impl OrdinaryKrigingModel {
         &self,
         coords: &[GeoCoord],
     ) -> Result<Vec<Prediction>, KrigingError> {
-        for coord in coords {
-            coord.validate()?;
-        }
         match crate::gpu::build_rhs_covariances_gpu(&self.coords, coords, self.variogram).await {
             Ok(covariances) => self.predict_batch_with_covariances(coords, &covariances),
             Err(_) => self.predict_batch(coords),
@@ -131,9 +118,6 @@ impl OrdinaryKrigingModel {
         &self,
         coords: &[GeoCoord],
     ) -> Result<Vec<Prediction>, KrigingError> {
-        for coord in coords {
-            coord.validate()?;
-        }
         match crate::gpu::build_rhs_covariances_gpu_blocking(&self.coords, coords, self.variogram) {
             Ok(covariances) => self.predict_batch_with_covariances(coords, &covariances),
             Err(_) => self.predict_batch(coords),
@@ -145,7 +129,6 @@ impl OrdinaryKrigingModel {
         coord: GeoCoord,
         rhs: &mut DVector<Real>,
     ) -> Result<Prediction, KrigingError> {
-        coord.validate()?;
         let n = self.coords.len();
         let prepared_coord = prepare_geo_coord(coord);
         for i in 0..n {
@@ -213,12 +196,31 @@ impl OrdinaryKrigingModel {
 
 fn build_ordinary_system(coords: &[PreparedGeoCoord], variogram: VariogramModel) -> DMatrix<Real> {
     let n = coords.len();
+    let (nugget, sill, _) = variogram.params();
+    // Gaussian and cubic covariance are very smooth at the origin; use stronger diagonal
+    // regularization to avoid ill-conditioning when many points are close together (f32).
+    // Literature: Ababou et al. (1994) Math Geol 26:99–133 rank Gaussian among the worst-
+    // conditioned covariance models; condition number grows with sampling density. Diamond
+    // & Armstrong (1984) Math Geol 16:809–822 show the condition number of kriging matrices
+    // is central to robustness. Scale with sqrt(n); use a floor of 1% of nugget so small-nugget
+    // fits stay solvable.
+    let scale = (n as Real).sqrt().max(1.0);
+    let nugget_floor = (0.01_f32 * nugget).max(1e-10);
+    let diag_eps = match variogram.variogram_type() {
+        VariogramType::Gaussian => {
+            (1e-5_f32 * sill * scale).max(nugget_floor)
+        }
+        VariogramType::Cubic => {
+            (1e-4_f32 * sill * scale).max(nugget_floor)
+        }
+        _ => 1e-10,
+    };
     let mut m = DMatrix::from_element(n + 1, n + 1, 0.0);
     for i in 0..n {
         for j in i..n {
             let mut cov = variogram.covariance(haversine_distance_prepared(coords[i], coords[j]));
             if i == j {
-                cov += 1e-10;
+                cov += diag_eps;
             }
             m[(i, j)] = cov;
             m[(j, i)] = cov;
@@ -233,21 +235,21 @@ fn build_ordinary_system(coords: &[PreparedGeoCoord], variogram: VariogramModel)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geo_dataset::GeoDataset;
+    use crate::variogram::models::VariogramType;
 
     #[test]
     fn predicts_close_to_training_value_for_collocated_point() {
         let coords = vec![
-            GeoCoord { lat: 0.0, lon: 0.0 },
-            GeoCoord { lat: 0.0, lon: 1.0 },
-            GeoCoord { lat: 1.0, lon: 0.0 },
+            GeoCoord::try_new(0.0, 0.0).unwrap(),
+            GeoCoord::try_new(0.0, 1.0).unwrap(),
+            GeoCoord::try_new(1.0, 0.0).unwrap(),
         ];
         let values = vec![10.0, 20.0, 15.0];
-        let variogram = VariogramModel::Exponential {
-            nugget: 0.01,
-            sill: 5.0,
-            range: 300.0,
-        };
-        let model = OrdinaryKrigingModel::new(coords.clone(), values, variogram).expect("model");
+        let variogram =
+            VariogramModel::new(0.01, 5.0, 300.0, VariogramType::Exponential).unwrap();
+        let dataset = GeoDataset::new(coords.clone(), values).unwrap();
+        let model = OrdinaryKrigingModel::new(dataset, variogram).expect("model");
         let pred = model.predict(coords[0]).expect("prediction");
         assert!((pred.value - 10.0).abs() < 1e-6);
         assert!(pred.variance >= 0.0);
@@ -256,22 +258,19 @@ mod tests {
     #[test]
     fn batch_predictions_match_repeated_single_predictions() {
         let coords = vec![
-            GeoCoord { lat: 0.0, lon: 0.0 },
-            GeoCoord { lat: 0.0, lon: 1.0 },
-            GeoCoord { lat: 1.0, lon: 0.0 },
-            GeoCoord { lat: 1.0, lon: 1.0 },
+            GeoCoord::try_new(0.0, 0.0).unwrap(),
+            GeoCoord::try_new(0.0, 1.0).unwrap(),
+            GeoCoord::try_new(1.0, 0.0).unwrap(),
+            GeoCoord::try_new(1.0, 1.0).unwrap(),
         ];
         let values = vec![10.0, 12.0, 14.0, 16.0];
-        let variogram = VariogramModel::Gaussian {
-            nugget: 0.01,
-            sill: 10.0,
-            range: 400.0,
-        };
-        let model = OrdinaryKrigingModel::new(coords, values, variogram).expect("model");
+        let variogram = VariogramModel::new(0.01, 10.0, 400.0, VariogramType::Gaussian).unwrap();
+        let dataset = GeoDataset::new(coords, values).unwrap();
+        let model = OrdinaryKrigingModel::new(dataset, variogram).expect("model");
         let query_coords = vec![
-            GeoCoord { lat: 0.2, lon: 0.3 },
-            GeoCoord { lat: 0.7, lon: 0.4 },
-            GeoCoord { lat: 0.5, lon: 0.8 },
+            GeoCoord::try_new(0.2, 0.3).unwrap(),
+            GeoCoord::try_new(0.7, 0.4).unwrap(),
+            GeoCoord::try_new(0.5, 0.8).unwrap(),
         ];
         let batch = model.predict_batch(&query_coords).expect("batch");
         let singles = query_coords
@@ -289,22 +288,19 @@ mod tests {
     #[test]
     fn gpu_batch_predictions_match_cpu_batch_predictions() {
         let coords = vec![
-            GeoCoord { lat: 0.0, lon: 0.0 },
-            GeoCoord { lat: 0.0, lon: 1.0 },
-            GeoCoord { lat: 1.0, lon: 0.0 },
-            GeoCoord { lat: 1.0, lon: 1.0 },
+            GeoCoord::try_new(0.0, 0.0).unwrap(),
+            GeoCoord::try_new(0.0, 1.0).unwrap(),
+            GeoCoord::try_new(1.0, 0.0).unwrap(),
+            GeoCoord::try_new(1.0, 1.0).unwrap(),
         ];
         let values = vec![10.0, 12.0, 14.0, 16.0];
-        let variogram = VariogramModel::Gaussian {
-            nugget: 0.01,
-            sill: 10.0,
-            range: 400.0,
-        };
-        let model = OrdinaryKrigingModel::new(coords, values, variogram).expect("model");
+        let variogram = VariogramModel::new(0.01, 10.0, 400.0, VariogramType::Gaussian).unwrap();
+        let dataset = GeoDataset::new(coords, values).unwrap();
+        let model = OrdinaryKrigingModel::new(dataset, variogram).expect("model");
         let query_coords = vec![
-            GeoCoord { lat: 0.2, lon: 0.3 },
-            GeoCoord { lat: 0.7, lon: 0.4 },
-            GeoCoord { lat: 0.5, lon: 0.8 },
+            GeoCoord::try_new(0.2, 0.3).unwrap(),
+            GeoCoord::try_new(0.7, 0.4).unwrap(),
+            GeoCoord::try_new(0.5, 0.8).unwrap(),
         ];
         let cpu = model.predict_batch(&query_coords).expect("cpu batch");
         let gpu = model
@@ -314,6 +310,55 @@ mod tests {
         for (g, c) in gpu.iter().zip(cpu.iter()) {
             assert!((g.value - c.value).abs() < 1e-3);
             assert!((g.variance - c.variance).abs() < 1e-3);
+        }
+    }
+
+    /// Gaussian variogram: CPU and GPU batch predictions must agree within relative tolerance.
+    /// Ensures the same covariance formula and conditioning are used on both paths.
+    #[cfg(all(feature = "gpu-blocking", not(target_arch = "wasm32")))]
+    #[test]
+    fn gaussian_cpu_and_gpu_predictions_agree_within_relative_tolerance() {
+        let coords = vec![
+            GeoCoord::try_new(37.75, -122.45).unwrap(),
+            GeoCoord::try_new(37.76, -122.44).unwrap(),
+            GeoCoord::try_new(37.77, -122.43).unwrap(),
+            GeoCoord::try_new(37.78, -122.42).unwrap(),
+            GeoCoord::try_new(37.79, -122.41).unwrap(),
+        ];
+        let values = vec![15.0, 16.0, 17.0, 18.0, 19.0];
+        let variogram = VariogramModel::new(0.05, 8.0, 6.0, VariogramType::Gaussian).unwrap();
+        let dataset = GeoDataset::new(coords, values).unwrap();
+        let model = OrdinaryKrigingModel::new(dataset, variogram).expect("model");
+        let query_coords = vec![
+            GeoCoord::try_new(37.765, -122.435).unwrap(),
+            GeoCoord::try_new(37.775, -122.425).unwrap(),
+        ];
+        let cpu = model.predict_batch(&query_coords).expect("cpu batch");
+        let gpu = model
+            .predict_batch_gpu_blocking(&query_coords)
+            .expect("gpu batch");
+        assert_eq!(gpu.len(), cpu.len(), "same number of predictions");
+        const REL_TOL: f32 = 1e-4;
+        const ABS_TOL: f32 = 1e-5;
+        for (i, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            let rel_value = (g.value - c.value).abs() / (c.value.abs() + ABS_TOL);
+            let rel_var = (g.variance - c.variance).abs() / (c.variance + ABS_TOL);
+            assert!(
+                rel_value < REL_TOL,
+                "Gaussian value mismatch at {}: cpu={} gpu={} rel_diff={}",
+                i,
+                c.value,
+                g.value,
+                rel_value
+            );
+            assert!(
+                rel_var < REL_TOL,
+                "Gaussian variance mismatch at {}: cpu={} gpu={} rel_diff={}",
+                i,
+                c.variance,
+                g.variance,
+                rel_var
+            );
         }
     }
 }
