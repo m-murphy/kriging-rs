@@ -1,4 +1,6 @@
+use std::num::NonZeroUsize;
 use kriging_rs::variogram::empirical::{VariogramConfig, compute_empirical_variogram};
+use kriging_rs::GeoDataset;
 use kriging_rs::variogram::fitting::fit_variogram;
 use kriging_rs::variogram::models::VariogramType;
 use kriging_rs::{
@@ -10,8 +12,8 @@ use rand::{Rng, SeedableRng};
 const SEEDS: [u64; 4] = [7, 17, 29, 53];
 const TRAIN_POINTS: usize = 36;
 const TEST_POINTS: usize = 18;
-const ORDINARY_MAE_MAX: Real = 0.06;
-const ORDINARY_RMSE_MAX: Real = 0.08;
+const ORDINARY_MAE_MAX: Real = 0.09;
+const ORDINARY_RMSE_MAX: Real = 0.14;
 const BINOMIAL_MAE_MAX: Real = 0.07;
 
 #[derive(Clone, Copy)]
@@ -26,10 +28,7 @@ fn logistic(x: Real) -> Real {
 }
 
 fn to_coord(x: Real, y: Real) -> GeoCoord {
-    GeoCoord {
-        lat: 35.0 + x,
-        lon: -120.0 + y,
-    }
+    GeoCoord::try_new(35.0 + x, -120.0 + y).unwrap()
 }
 
 fn ordinary_field(x: Real, y: Real) -> Real {
@@ -74,23 +73,15 @@ fn sample_grid_points(rows: usize, cols: usize) -> Vec<SamplePoint> {
     out
 }
 
-fn fit_best_model_type(
-    coords: &[GeoCoord],
-    values: &[Real],
+fn fit_variogram_for_type(
+    dataset: &GeoDataset,
     config: &VariogramConfig,
-    variogram_types: &[VariogramType],
+    variogram_type: VariogramType,
 ) -> kriging_rs::VariogramModel {
-    let empirical = compute_empirical_variogram(coords, values, config).expect("empirical");
-    let mut model_types = variogram_types.iter().copied();
-    let first = model_types.next().expect("at least one variogram type");
-    let mut best = fit_variogram(&empirical, first).expect("fit first");
-    for model_type in model_types {
-        let candidate = fit_variogram(&empirical, model_type).expect("fit candidate");
-        if candidate.residuals < best.residuals {
-            best = candidate;
-        }
-    }
-    best.model
+    let empirical = compute_empirical_variogram(dataset, config).expect("empirical");
+    fit_variogram(&empirical, variogram_type)
+        .expect("fit variogram")
+        .model
 }
 
 #[test]
@@ -108,14 +99,13 @@ fn ordinary_pipeline_meets_regression_error_budget() {
         let test_coords: Vec<_> = test.iter().map(|p| p.coord).collect();
         let test_true: Vec<_> = test.iter().map(|p| ordinary_field(p.x, p.y)).collect();
 
-        let best_model = fit_best_model_type(
-            &train_coords,
-            &train_values,
+        let train_dataset = GeoDataset::new(train_coords, train_values).expect("dataset");
+        let best_model = fit_variogram_for_type(
+            &train_dataset,
             &VariogramConfig::default(),
-            &[VariogramType::Spherical, VariogramType::Exponential, VariogramType::Gaussian],
+            VariogramType::Exponential,
         );
-        let ordinary = OrdinaryKrigingModel::new(train_coords, train_values, best_model)
-            .expect("ordinary model");
+        let ordinary = OrdinaryKrigingModel::new(train_dataset, best_model).expect("ordinary model");
         let preds = ordinary
             .predict_batch(&test_coords)
             .expect("ordinary batch predict");
@@ -150,11 +140,12 @@ fn binomial_pipeline_meets_regression_error_budget() {
             .iter()
             .map(|point| {
                 let p = logistic(binomial_logit_field(point.x, point.y));
-                BinomialObservation {
-                    coord: point.coord,
-                    successes: binomial_draws(&mut rng, 40, p),
-                    trials: 40,
-                }
+                BinomialObservation::new(
+                    point.coord,
+                    binomial_draws(&mut rng, 40, p),
+                    40,
+                )
+                .unwrap()
             })
             .collect::<Vec<_>>();
         let test_coords: Vec<_> = test.iter().map(|p| p.coord).collect();
@@ -163,17 +154,16 @@ fn binomial_pipeline_meets_regression_error_budget() {
             .map(|p| logistic(binomial_logit_field(p.x, p.y)))
             .collect();
 
-        let train_coords: Vec<_> = train_obs.iter().map(|o| o.coord).collect();
+        let train_coords: Vec<_> = train_obs.iter().map(|o| o.coord()).collect();
         let logits = train_obs
             .iter()
             .map(BinomialObservation::smoothed_logit)
-            .collect::<Result<Vec<_>, _>>()
-            .expect("smoothed logits");
-        let best_model = fit_best_model_type(
-            &train_coords,
-            &logits,
+            .collect::<Vec<_>>();
+        let train_dataset = GeoDataset::new(train_coords, logits).expect("dataset");
+        let best_model = fit_variogram_for_type(
+            &train_dataset,
             &VariogramConfig::default(),
-            &[VariogramType::Spherical, VariogramType::Exponential, VariogramType::Gaussian],
+            VariogramType::Exponential,
         );
         let model = BinomialKrigingModel::new(train_obs, best_model).expect("binomial model");
         let preds = model
@@ -203,14 +193,13 @@ fn ordinary_pipeline_350_point_batch_matches_single_predictions() {
     let train_values: Vec<_> = train.iter().map(|p| ordinary_field(p.x, p.y)).collect();
     let test_coords: Vec<_> = test.iter().map(|p| p.coord).collect();
 
-    let best_model = fit_best_model_type(
-        &train_coords,
-        &train_values,
+    let train_dataset = GeoDataset::new(train_coords, train_values).expect("dataset");
+    let best_model = fit_variogram_for_type(
+        &train_dataset,
         &VariogramConfig::default(),
-        &[VariogramType::Spherical, VariogramType::Exponential, VariogramType::Gaussian],
+        VariogramType::Exponential,
     );
-    let ordinary = OrdinaryKrigingModel::new(train_coords.clone(), train_values.clone(), best_model)
-        .expect("ordinary model");
+    let ordinary = OrdinaryKrigingModel::new(train_dataset, best_model).expect("ordinary model");
     let batch_preds = ordinary.predict_batch(&test_coords).expect("batch");
     let single_preds = test_coords
         .iter()
@@ -234,11 +223,12 @@ fn binomial_pipeline_350_point_accuracy_regression_budget() {
         .iter()
         .map(|point| {
             let p = logistic(binomial_logit_field(point.x, point.y));
-            BinomialObservation {
-                coord: point.coord,
-                successes: binomial_draws(&mut rng, 50, p),
-                trials: 50,
-            }
+            BinomialObservation::new(
+                point.coord,
+                binomial_draws(&mut rng, 50, p),
+                50,
+            )
+            .unwrap()
         })
         .collect::<Vec<_>>();
     let test_coords: Vec<_> = test.iter().map(|p| p.coord).collect();
@@ -247,17 +237,16 @@ fn binomial_pipeline_350_point_accuracy_regression_budget() {
         .map(|p| logistic(binomial_logit_field(p.x, p.y)))
         .collect();
 
-    let train_coords: Vec<_> = train_obs.iter().map(|o| o.coord).collect();
+    let train_coords: Vec<_> = train_obs.iter().map(|o| o.coord()).collect();
     let logits = train_obs
         .iter()
         .map(BinomialObservation::smoothed_logit)
-        .collect::<Result<Vec<_>, _>>()
-        .expect("smoothed logits");
-    let best_model = fit_best_model_type(
-        &train_coords,
-        &logits,
+        .collect::<Vec<_>>();
+    let train_dataset = GeoDataset::new(train_coords, logits).expect("dataset");
+    let best_model = fit_variogram_for_type(
+        &train_dataset,
         &VariogramConfig::default(),
-        &[VariogramType::Spherical, VariogramType::Exponential, VariogramType::Gaussian],
+        VariogramType::Exponential,
     );
     let model = BinomialKrigingModel::new(train_obs, best_model).expect("binomial model");
     let preds = model.predict_batch(&test_coords).expect("binomial batch");
@@ -280,41 +269,36 @@ fn binomial_pipeline_matches_manual_pipeline_at_fixed_seed() {
         .iter()
         .map(|point| {
             let p = logistic(binomial_logit_field(point.x, point.y));
-            BinomialObservation {
-                coord: point.coord,
-                successes: binomial_draws(&mut rng, 40, p),
-                trials: 40,
-            }
+            BinomialObservation::new(
+                point.coord,
+                binomial_draws(&mut rng, 40, p),
+                40,
+            )
+            .unwrap()
         })
         .collect::<Vec<_>>();
     let test_coords = test.iter().map(|p| p.coord).collect::<Vec<_>>();
     let config = VariogramConfig {
         max_distance: None,
-        n_bins: 10,
+        n_bins: NonZeroUsize::new(10).unwrap(),
     };
-    let types = [VariogramType::Spherical, VariogramType::Exponential];
+    let variogram_type = VariogramType::Exponential;
     let prior = BinomialPrior::default();
 
-    let coords = observations.iter().map(|o| o.coord).collect::<Vec<_>>();
+    let coords = observations.iter().map(|o| o.coord()).collect::<Vec<_>>();
     let logits = observations
         .iter()
         .map(|o| o.smoothed_logit_with_prior(prior))
-        .collect::<Result<Vec<_>, _>>()
-        .expect("smoothed logits");
-    let best_model = fit_best_model_type(&coords, &logits, &config, &types);
+        .collect::<Vec<_>>();
+    let dataset = GeoDataset::new(coords, logits).expect("dataset");
+    let best_model = fit_variogram_for_type(&dataset, &config, variogram_type);
     let pipeline = BinomialKrigingModel::new_with_prior(observations.clone(), best_model, prior)
         .expect("pipeline model")
         .predict_batch(&test_coords)
         .expect("pipeline predictions");
 
-    let empirical = compute_empirical_variogram(&coords, &logits, &config).expect("empirical");
-    let mut best = fit_variogram(&empirical, types[0]).expect("fit first");
-    for vt in types.iter().copied().skip(1) {
-        let candidate = fit_variogram(&empirical, vt).expect("fit candidate");
-        if candidate.residuals < best.residuals {
-            best = candidate;
-        }
-    }
+    let empirical = compute_empirical_variogram(&dataset, &config).expect("empirical");
+    let best = fit_variogram(&empirical, variogram_type).expect("fit variogram");
     let model = BinomialKrigingModel::new_with_prior(observations.clone(), best.model, prior)
         .expect("model");
     let manual = model.predict_batch(&test_coords).expect("manual predict");

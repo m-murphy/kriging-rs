@@ -1,13 +1,16 @@
 use std::time::Instant;
 
 use kriging_rs::distance::haversine_distance;
-use kriging_rs::{GeoCoord, Real, VariogramModel};
+use kriging_rs::{GeoCoord, Real, VariogramModel, VariogramType};
 
 fn build_coords(count: usize, lat0: Real, lon0: Real, step: Real) -> Vec<GeoCoord> {
     (0..count)
-        .map(|i| GeoCoord {
-            lat: lat0 + (i as Real) * step,
-            lon: lon0 + (i as Real) * step * 0.7,
+        .map(|i| {
+            GeoCoord::try_new(
+                lat0 + (i as Real) * step,
+                lon0 + (i as Real) * step * 0.7,
+            )
+            .unwrap()
         })
         .collect()
 }
@@ -35,11 +38,7 @@ fn checksum(v: &[Real]) -> Real {
 fn main() {
     let n_obs = 10_000usize;
     let n_pred = 1_000usize;
-    let variogram = VariogramModel::Exponential {
-        nugget: 0.01,
-        sill: 4.0,
-        range: 20.0,
-    };
+    let variogram = VariogramModel::new(0.01, 4.0, 20.0, VariogramType::Exponential).unwrap();
 
     let train = build_coords(n_obs, 35.0, -120.0, 0.0005);
     let pred = build_coords(n_pred, 35.05, -119.95, 0.0008);
