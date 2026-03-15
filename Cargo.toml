@@ -2,10 +2,8 @@
 name = "kriging-rs"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94.0"
-authors = ["Maxwell Murphy"]
+rust-version = "1.85.0"
 license = "MIT"
-license-file = "LICENSE"
 description = "Geostatistical kriging library with WASM support"
 keywords = ["kriging", "geostatistics", "wasm", "interpolation", "spatial"]
 categories = ["science", "wasm"]
