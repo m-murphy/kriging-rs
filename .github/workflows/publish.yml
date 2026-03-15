@@ -63,6 +63,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+      - name: Add WASM target
+        run: rustup target add wasm32-unknown-unknown
       - uses: actions/setup-node@v4
         with:
           node-version: "22"  # 22.14+ required for npm trusted publishing
