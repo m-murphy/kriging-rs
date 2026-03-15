@@ -4,8 +4,8 @@ const EARTH_RADIUS_KM: Real = 6_371.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GeoCoord {
-    pub lat: Real,
-    pub lon: Real,
+    lat: Real,
+    lon: Real,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -16,14 +16,32 @@ pub(crate) struct PreparedGeoCoord {
 }
 
 impl GeoCoord {
-    pub fn validate(&self) -> Result<(), KrigingError> {
-        if !(-90.0..=90.0).contains(&self.lat) || !(-180.0..=180.0).contains(&self.lon) {
-            return Err(KrigingError::InvalidCoordinate {
-                lat: self.lat,
-                lon: self.lon,
-            });
+    /// Creates a valid coordinate. Returns an error if `lat` is not in [-90, 90] or `lon` is not in [-180, 180].
+    pub fn try_new(lat: Real, lon: Real) -> Result<Self, KrigingError> {
+        if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+            return Err(KrigingError::InvalidCoordinate { lat, lon });
         }
-        Ok(())
+        Ok(Self { lat, lon })
+    }
+
+    #[inline]
+    pub fn lat(self) -> Real {
+        self.lat
+    }
+
+    #[inline]
+    pub fn lon(self) -> Real {
+        self.lon
+    }
+}
+
+pub(crate) fn prepare_geo_coord(coord: GeoCoord) -> PreparedGeoCoord {
+    let lat_rad = coord.lat().to_radians();
+    let lon_rad = coord.lon().to_radians();
+    PreparedGeoCoord {
+        lat_rad,
+        lon_rad,
+        cos_lat: lat_rad.cos(),
     }
 }
 
@@ -33,16 +51,6 @@ pub fn haversine_distance(coord1: GeoCoord, coord2: GeoCoord) -> Real {
     let a = haversine_a(prepared1, prepared2);
     let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
     EARTH_RADIUS_KM * c
-}
-
-pub(crate) fn prepare_geo_coord(coord: GeoCoord) -> PreparedGeoCoord {
-    let lat_rad = coord.lat.to_radians();
-    let lon_rad = coord.lon.to_radians();
-    PreparedGeoCoord {
-        lat_rad,
-        lon_rad,
-        cos_lat: lat_rad.cos(),
-    }
 }
 
 pub(crate) fn haversine_distance_prepared(
@@ -79,18 +87,15 @@ mod tests {
     use approx::assert_relative_eq;
 
     #[test]
-    fn geo_coord_validation_rejects_invalid_inputs() {
-        let bad = GeoCoord {
-            lat: 120.0,
-            lon: 0.0,
-        };
-        assert!(bad.validate().is_err());
+    fn geo_coord_try_new_rejects_invalid_inputs() {
+        assert!(GeoCoord::try_new(120.0, 0.0).is_err());
+        assert!(GeoCoord::try_new(0.0, 200.0).is_err());
     }
 
     #[test]
     fn haversine_distance_matches_known_equator_segment() {
-        let coord1 = GeoCoord { lat: 0.0, lon: 0.0 };
-        let coord2 = GeoCoord { lat: 0.0, lon: 1.0 };
+        let coord1 = GeoCoord::try_new(0.0, 0.0).unwrap();
+        let coord2 = GeoCoord::try_new(0.0, 1.0).unwrap();
         let dist = haversine_distance(coord1, coord2);
         assert_relative_eq!(dist, 111.1949, epsilon = 0.05);
     }
@@ -98,9 +103,9 @@ mod tests {
     #[test]
     fn distance_matrix_is_symmetric_with_zero_diagonal() {
         let coords = vec![
-            GeoCoord { lat: 0.0, lon: 0.0 },
-            GeoCoord { lat: 0.0, lon: 1.0 },
-            GeoCoord { lat: 1.0, lon: 1.0 },
+            GeoCoord::try_new(0.0, 0.0).unwrap(),
+            GeoCoord::try_new(0.0, 1.0).unwrap(),
+            GeoCoord::try_new(1.0, 1.0).unwrap(),
         ];
         let m = distance_matrix(&coords);
         assert_eq!(m[0][0], 0.0);
@@ -113,14 +118,8 @@ mod tests {
 
     #[test]
     fn prepared_haversine_matches_public_haversine() {
-        let coord1 = GeoCoord {
-            lat: 10.123,
-            lon: -45.987,
-        };
-        let coord2 = GeoCoord {
-            lat: -5.456,
-            lon: 120.789,
-        };
+        let coord1 = GeoCoord::try_new(10.123, -45.987).unwrap();
+        let coord2 = GeoCoord::try_new(-5.456, 120.789).unwrap();
         let direct = haversine_distance(coord1, coord2);
         let prepared =
             haversine_distance_prepared(prepare_geo_coord(coord1), prepare_geo_coord(coord2));

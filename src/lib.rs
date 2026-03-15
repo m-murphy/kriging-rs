@@ -4,11 +4,14 @@ pub type Real = f32;
 
 pub mod distance;
 pub mod error;
+pub mod geo_dataset;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod kriging;
 pub mod matrix;
 pub mod utils;
+
+pub use utils::{logit, logit_clamped, clamp_probability, logistic, Probability};
 pub mod variogram;
 
 #[cfg(feature = "wasm")]
@@ -16,6 +19,7 @@ pub mod wasm;
 
 pub use distance::GeoCoord;
 pub use error::KrigingError;
+pub use geo_dataset::GeoDataset;
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuBackend, GpuSupport, build_rhs_covariances_gpu, detect_gpu_support, gpu_square};
 pub use kriging::binomial::{
@@ -24,4 +28,4 @@ pub use kriging::binomial::{
 pub use kriging::ordinary::{OrdinaryKrigingModel, Prediction};
 pub use variogram::fitting::{FitResult, fit_variogram};
 pub use variogram::models::{VariogramModel, VariogramType};
-pub use variogram::{VariogramConfig, compute_empirical_variogram};
+pub use variogram::{PositiveReal, VariogramConfig, compute_empirical_variogram};
