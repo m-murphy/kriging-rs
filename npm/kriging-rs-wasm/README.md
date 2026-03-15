@@ -53,15 +53,12 @@ import init, {
 
 await init();
 
-const model = new OrdinaryKriging(
-  [37.7, 37.71, 37.72],
-  [-122.45, -122.44, -122.43],
-  [10, 12, 11],
-  "gaussian",
-  0.01,
-  1.5,
-  5.0
-);
+const model = new OrdinaryKriging({
+  lats: [37.7, 37.71, 37.72],
+  lons: [-122.45, -122.44, -122.43],
+  values: [10, 12, 11],
+  variogram: { variogramType: "gaussian", nugget: 0.01, sill: 1.5, range: 5.0 },
+});
 
 const prediction = model.predict(37.705, -122.435);
 
@@ -74,16 +71,18 @@ const fitted = fitOrdinaryVariogram(
   12,
   VariogramType.Exponential
 );
-const fittedModel = new OrdinaryKriging(
-  [37.7, 37.71, 37.72],
-  [-122.45, -122.44, -122.43],
-  [10, 12, 11],
-  fitted.variogramType,
-  fitted.nugget,
-  fitted.sill,
-  fitted.range,
-  fitted.shape  // optional; used for stable/matern
-);
+const fittedModel = new OrdinaryKriging({
+  lats: [37.7, 37.71, 37.72],
+  lons: [-122.45, -122.44, -122.43],
+  values: [10, 12, 11],
+  variogram: {
+    variogramType: fitted.variogramType,
+    nugget: fitted.nugget,
+    sill: fitted.sill,
+    range: fitted.range,
+    shape: fitted.shape,  // optional; used for stable/matern
+  },
+});
 const batch = fittedModel.predictBatch(lats, lons);
 ```
 
@@ -101,16 +100,13 @@ const lons = [-122.45, -122.44, -122.43];
 const successes = [2, 5, 3];  // counts
 const trials = [10, 10, 10];
 
-const model = new BinomialKriging(
+const model = new BinomialKriging({
   lats,
   lons,
   successes,
   trials,
-  "exponential",
-  0.01,
-  1.0,
-  100
-);
+  variogram: { variogramType: "exponential", nugget: 0.01, sill: 1.0, range: 100 },
+});
 const pred = model.predict(37.705, -122.435);
 // pred.prevalence in [0, 1], pred.variance, pred.logitValue
 ```
@@ -118,17 +114,14 @@ const pred = model.predict(37.705, -122.435);
 With a Beta prior (e.g. when counts are small):
 
 ```ts
-const model = BinomialKriging.newWithPrior(
+const model = BinomialKriging.newWithPrior({
   lats,
   lons,
   successes,
   trials,
-  "exponential",
-  0.01,
-  1.0,
-  100,
-  1, 1  // alpha, beta
-);
+  variogram: { variogramType: "exponential", nugget: 0.01, sill: 1.0, range: 100 },
+  prior: { alpha: 1, beta: 1 },
+});
 ```
 
 ### Batch prediction and typed arrays
@@ -168,7 +161,12 @@ Constructors (`OrdinaryKriging`, `BinomialKriging`, `BinomialKriging.newWithPrio
 ```ts
 import { KrigingError } from "kriging-rs-wasm";
 try {
-  const model = new OrdinaryKriging(lats, lons, values, "gaussian", 0.01, 1, 100);
+  const model = new OrdinaryKriging({
+    lats,
+    lons,
+    values,
+    variogram: { variogramType: "gaussian", nugget: 0.01, sill: 1, range: 100 },
+  });
 } catch (e) {
   if (e instanceof KrigingError) {
     console.error(e.message, e.cause);

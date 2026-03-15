@@ -59,15 +59,12 @@ describe("Ordinary kriging", () => {
   });
 
   test("OrdinaryKriging predict returns value and variance", () => {
-    const model = new OrdinaryKriging(
+    const model = new OrdinaryKriging({
       lats,
       lons,
       values,
-      variogramType,
-      nugget,
-      sill,
-      range
-    );
+      variogram: { variogramType, nugget, sill, range },
+    });
     const pred = model.predict(0.5, 0.5);
     expect(pred).toMatchObject({
       value: expect.any(Number),
@@ -78,15 +75,12 @@ describe("Ordinary kriging", () => {
   });
 
   test("OrdinaryKriging predictBatch returns array of predictions", () => {
-    const model = new OrdinaryKriging(
+    const model = new OrdinaryKriging({
       lats,
       lons,
       values,
-      variogramType,
-      nugget,
-      sill,
-      range
-    );
+      variogram: { variogramType, nugget, sill, range },
+    });
     const batchLats = [0.25, 0.5, 0.75];
     const batchLons = [0.25, 0.5, 0.75];
     const out = model.predictBatch(batchLats, batchLons);
@@ -103,15 +97,12 @@ describe("Ordinary kriging", () => {
   });
 
   test("OrdinaryKriging predictBatchArrays returns Float64Arrays", () => {
-    const model = new OrdinaryKriging(
+    const model = new OrdinaryKriging({
       lats,
       lons,
       values,
-      variogramType,
-      nugget,
-      sill,
-      range
-    );
+      variogram: { variogramType, nugget, sill, range },
+    });
     const batchLats = [0.25, 0.5];
     const batchLons = [0.25, 0.5];
     const out = model.predictBatchArrays(batchLats, batchLons);
@@ -132,15 +123,18 @@ describe("Ordinary kriging", () => {
       12,
       VariogramType.Gaussian
     );
-    const model = new OrdinaryKriging(
+    const model = new OrdinaryKriging({
       lats,
       lons,
       values,
-      fit.variogramType,
-      fit.nugget,
-      fit.sill,
-      fit.range
-    );
+      variogram: {
+        variogramType: fit.variogramType,
+        nugget: fit.nugget,
+        sill: fit.sill,
+        range: fit.range,
+        shape: fit.shape,
+      },
+    });
     const pred = model.predict(0.5, 0.5);
     expect(Number.isFinite(pred.value)).toBe(true);
     expect(pred.variance).toBeGreaterThanOrEqual(0);
@@ -159,16 +153,13 @@ describe("Binomial kriging", () => {
   const range = 100;
 
   test("BinomialKriging predict returns prevalence, logitValue, variance", () => {
-    const model = new BinomialKriging(
+    const model = new BinomialKriging({
       lats,
       lons,
       successes,
       trials,
-      variogramType,
-      nugget,
-      sill,
-      range
-    );
+      variogram: { variogramType, nugget, sill, range },
+    });
     const pred = model.predict(0.5, 0.5);
     expect(pred).toMatchObject({
       prevalence: expect.any(Number),
@@ -182,16 +173,13 @@ describe("Binomial kriging", () => {
   });
 
   test("BinomialKriging predictBatch returns array of predictions", () => {
-    const model = new BinomialKriging(
+    const model = new BinomialKriging({
       lats,
       lons,
       successes,
       trials,
-      variogramType,
-      nugget,
-      sill,
-      range
-    );
+      variogram: { variogramType, nugget, sill, range },
+    });
     const out = model.predictBatch([0.25, 0.5], [0.25, 0.5]);
     expect(Array.isArray(out)).toBe(true);
     expect(out.length).toBe(2);
@@ -204,16 +192,13 @@ describe("Binomial kriging", () => {
   });
 
   test("BinomialKriging predictBatchArrays returns Float64Arrays", () => {
-    const model = new BinomialKriging(
+    const model = new BinomialKriging({
       lats,
       lons,
       successes,
       trials,
-      variogramType,
-      nugget,
-      sill,
-      range
-    );
+      variogram: { variogramType, nugget, sill, range },
+    });
     const out = model.predictBatchArrays([0.25, 0.5], [0.25, 0.5]);
     expect(out.prevalences).toBeInstanceOf(Float64Array);
     expect(out.logitValues).toBeInstanceOf(Float64Array);
@@ -225,18 +210,14 @@ describe("Binomial kriging", () => {
   test("BinomialKriging.newWithPrior produces valid predictions", () => {
     const alpha = 1;
     const beta = 1;
-    const model = BinomialKriging.newWithPrior(
+    const model = BinomialKriging.newWithPrior({
       lats,
       lons,
       successes,
       trials,
-      variogramType,
-      nugget,
-      sill,
-      range,
-      alpha,
-      beta
-    );
+      variogram: { variogramType, nugget, sill, range },
+      prior: { alpha, beta },
+    });
     const pred = model.predict(0.5, 0.5);
     expect(Number.isFinite(pred.prevalence)).toBe(true);
     expect(pred.prevalence).toBeGreaterThanOrEqual(0);
@@ -262,31 +243,25 @@ describe("Error handling", () => {
   test("OrdinaryKriging with mismatched lats/lons throws KrigingError", () => {
     expect(
       () =>
-        new OrdinaryKriging(
-          [0, 1],
-          [0, 1, 2],
-          [1, 2, 3],
-          "gaussian",
-          0.01,
-          1,
-          100
-        )
+        new OrdinaryKriging({
+          lats: [0, 1],
+          lons: [0, 1, 2],
+          values: [1, 2, 3],
+          variogram: { variogramType: "gaussian", nugget: 0.01, sill: 1, range: 100 },
+        })
     ).toThrow(KrigingError);
   });
 
   test("BinomialKriging with mismatched arrays throws KrigingError", () => {
     expect(
       () =>
-        new BinomialKriging(
-          [0, 1],
-          [0, 1],
-          [1, 2, 3],
-          [10, 10, 10],
-          "gaussian",
-          0.01,
-          1,
-          100
-        )
+        new BinomialKriging({
+          lats: [0, 1],
+          lons: [0, 1],
+          successes: [1, 2, 3],
+          trials: [10, 10, 10],
+          variogram: { variogramType: "gaussian", nugget: 0.01, sill: 1, range: 100 },
+        })
     ).toThrow(KrigingError);
   });
 });

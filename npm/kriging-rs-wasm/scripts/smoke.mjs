@@ -15,15 +15,18 @@ const fit = kriging.fitOrdinaryVariogram(
   12,
   kriging.VariogramType.Exponential
 );
-const model = new kriging.OrdinaryKriging(
-  sampleLats,
-  sampleLons,
-  sampleValues,
-  fit.variogramType,
-  fit.nugget,
-  fit.sill,
-  fit.range
-);
+const model = new kriging.OrdinaryKriging({
+  lats: sampleLats,
+  lons: sampleLons,
+  values: sampleValues,
+  variogram: {
+    variogramType: fit.variogramType,
+    nugget: fit.nugget,
+    sill: fit.sill,
+    range: fit.range,
+    shape: fit.shape,
+  },
+});
 const out = model.predictBatch([0.25, 0.5], [0.25, 0.5]);
 
 if (!Array.isArray(out) || out.length !== 2) {

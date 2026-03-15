@@ -95,16 +95,18 @@ async function runOrdinaryPerformanceHarness(options, backendSelection, webgpuAv
     const variogramFitMs = t1 - t0;
 
     t0 = performance.now();
-    const model = new OrdinaryKriging(
-      sampleLats,
-      sampleLons,
-      sampleValues,
-      variogramType,
-      fitted.nugget,
-      fitted.sill,
-      fitted.range,
-      fitted.shape,
-    );
+    const model = new OrdinaryKriging({
+      lats: sampleLats,
+      lons: sampleLons,
+      values: sampleValues,
+      variogram: {
+        variogramType,
+        nugget: fitted.nugget,
+        sill: fitted.sill,
+        range: fitted.range,
+        shape: fitted.shape,
+      },
+    });
     t1 = performance.now();
     const modelBuildMs = t1 - t0;
 
@@ -246,19 +248,20 @@ export default function SurfaceDemo({ uploadedData, onError, webgpuStatus }) {
           options.variogramType,
         );
         const vt = fitted.variogramType;
-        const model = BinomialKriging.newWithPrior(
-          sampleLats,
-          sampleLons,
-          sampleSuccesses,
-          sampleTrials,
-          vt,
-          fitted.nugget,
-          fitted.sill,
-          fitted.range,
-          options.alpha,
-          options.beta,
-          fitted.shape,
-        );
+        const model = BinomialKriging.newWithPrior({
+          lats: sampleLats,
+          lons: sampleLons,
+          successes: sampleSuccesses,
+          trials: sampleTrials,
+          variogram: {
+            variogramType: vt,
+            nugget: fitted.nugget,
+            sill: fitted.sill,
+            range: fitted.range,
+            shape: fitted.shape,
+          },
+          prior: { alpha: options.alpha, beta: options.beta },
+        });
         predictions = backendResolved.useGpu
           ? await model.predictBatchGpu(grid.predLats, grid.predLons)
           : model.predictBatch(grid.predLats, grid.predLons);
@@ -281,16 +284,18 @@ export default function SurfaceDemo({ uploadedData, onError, webgpuStatus }) {
           options.variogramType,
         );
         const vt = fitted.variogramType;
-        const model = new OrdinaryKriging(
-          sampleLats,
-          sampleLons,
-          sampleValues,
-          vt,
-          fitted.nugget,
-          fitted.sill,
-          fitted.range,
-          fitted.shape,
-        );
+        const model = new OrdinaryKriging({
+          lats: sampleLats,
+          lons: sampleLons,
+          values: sampleValues,
+          variogram: {
+            variogramType: vt,
+            nugget: fitted.nugget,
+            sill: fitted.sill,
+            range: fitted.range,
+            shape: fitted.shape,
+          },
+        });
         predictions = backendResolved.useGpu
           ? await model.predictBatchGpu(grid.predLats, grid.predLons)
           : model.predictBatch(grid.predLats, grid.predLons);

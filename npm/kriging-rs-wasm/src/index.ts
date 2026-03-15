@@ -75,6 +75,62 @@ export interface FittedVariogram {
 }
 
 /**
+ * Variogram parameters for model construction (nugget, sill, range, optional shape).
+ */
+export interface VariogramParams {
+  variogramType: VariogramTypeName;
+  nugget: number;
+  sill: number;
+  range: number;
+  /** Shape parameter for stable/matern; omit for other types. */
+  shape?: number;
+}
+
+/**
+ * Options for constructing an ordinary kriging model. Pass a single object to
+ * {@link OrdinaryKriging} constructor.
+ */
+export interface OrdinaryKrigingOptions {
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  values: NumericArrayInput;
+  variogram: VariogramParams;
+}
+
+/**
+ * Options for constructing a binomial kriging model. Pass a single object to
+ * {@link BinomialKriging} constructor.
+ */
+export interface BinomialKrigingOptions {
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  successes: IntegerArrayInput;
+  trials: IntegerArrayInput;
+  variogram: VariogramParams;
+}
+
+/**
+ * Beta(alpha, beta) prior parameters for binomial kriging.
+ */
+export interface BinomialPriorParams {
+  alpha: number;
+  beta: number;
+}
+
+/**
+ * Options for constructing a binomial kriging model with a prior. Pass a single
+ * object to {@link BinomialKriging.newWithPrior}.
+ */
+export interface BinomialKrigingWithPriorOptions {
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  successes: IntegerArrayInput;
+  trials: IntegerArrayInput;
+  variogram: VariogramParams;
+  prior: BinomialPriorParams;
+}
+
+/**
  * Error thrown by the library when WASM operations fail (invalid inputs, model build failure, etc.).
  * The underlying cause is attached as `cause` when available.
  */
@@ -106,43 +162,32 @@ interface WasmBinomialInstance {
   predictBatchGpu?(lats: Float64Array, lons: Float64Array): Promise<unknown>;
 }
 
+/** Shape passed to WASM (plain arrays for serde deserialization). */
+interface OrdinaryKrigingOptionsWasm {
+  lats: number[];
+  lons: number[];
+  values: number[];
+  variogram: { variogramType: string; nugget: number; sill: number; range: number; shape?: number };
+}
+
+interface BinomialKrigingOptionsWasm {
+  lats: number[];
+  lons: number[];
+  successes: number[];
+  trials: number[];
+  variogram: { variogramType: string; nugget: number; sill: number; range: number; shape?: number };
+}
+
+interface BinomialKrigingWithPriorOptionsWasm extends BinomialKrigingOptionsWasm {
+  prior: { alpha: number; beta: number };
+}
+
 type RawModule = {
   default: (input?: unknown) => Promise<unknown>;
-  WasmOrdinaryKriging: new (
-    lats: Float64Array,
-    lons: Float64Array,
-    values: Float64Array,
-    variogramType: string,
-    nugget: number,
-    sill: number,
-    range: number,
-    shape?: number
-  ) => WasmOrdinaryInstance;
+  WasmOrdinaryKriging: new (options: OrdinaryKrigingOptionsWasm) => WasmOrdinaryInstance;
   WasmBinomialKriging: {
-    new (
-      lats: Float64Array,
-      lons: Float64Array,
-      successes: Uint32Array,
-      trials: Uint32Array,
-      variogramType: string,
-      nugget: number,
-      sill: number,
-      range: number,
-      shape?: number
-    ): WasmBinomialInstance;
-    newWithPrior(
-      lats: Float64Array,
-      lons: Float64Array,
-      successes: Uint32Array,
-      trials: Uint32Array,
-      variogramType: string,
-      nugget: number,
-      sill: number,
-      range: number,
-      shape: number | undefined,
-      alpha: number,
-      beta: number
-    ): WasmBinomialInstance;
+    new (options: BinomialKrigingOptionsWasm): WasmBinomialInstance;
+    newWithPrior(options: BinomialKrigingWithPriorOptionsWasm): WasmBinomialInstance;
   };
   WasmVariogramType: {
     readonly Spherical: number;
@@ -212,36 +257,64 @@ export async function init(input?: unknown): Promise<unknown> {
 
 export default init;
 
+function toOrdinaryOptionsWasm(opts: OrdinaryKrigingOptions): OrdinaryKrigingOptionsWasm {
+  return {
+    lats: Array.from(toFloat64Array(opts.lats)),
+    lons: Array.from(toFloat64Array(opts.lons)),
+    values: Array.from(toFloat64Array(opts.values)),
+    variogram: {
+      variogramType: opts.variogram.variogramType,
+      nugget: opts.variogram.nugget,
+      sill: opts.variogram.sill,
+      range: opts.variogram.range,
+      shape: opts.variogram.shape,
+    },
+  };
+}
+
+function toBinomialOptionsWasm(opts: BinomialKrigingOptions): BinomialKrigingOptionsWasm {
+  return {
+    lats: Array.from(toFloat64Array(opts.lats)),
+    lons: Array.from(toFloat64Array(opts.lons)),
+    successes: Array.from(toUint32Array(opts.successes)),
+    trials: Array.from(toUint32Array(opts.trials)),
+    variogram: {
+      variogramType: opts.variogram.variogramType,
+      nugget: opts.variogram.nugget,
+      sill: opts.variogram.sill,
+      range: opts.variogram.range,
+      shape: opts.variogram.shape,
+    },
+  };
+}
+
+function toBinomialWithPriorOptionsWasm(
+  opts: BinomialKrigingWithPriorOptions
+): BinomialKrigingWithPriorOptionsWasm {
+  return {
+    ...toBinomialOptionsWasm({
+      lats: opts.lats,
+      lons: opts.lons,
+      successes: opts.successes,
+      trials: opts.trials,
+      variogram: opts.variogram,
+    }),
+    prior: { alpha: opts.prior.alpha, beta: opts.prior.beta },
+  };
+}
+
 /**
  * Ordinary kriging model for spatial interpolation of continuous values.
  * Coordinates are in degrees (latitude, longitude); distances use Haversine (great-circle).
- * Variogram parameters (nugget, sill, range) define the spatial correlation model.
+ * Pass a single options object with data and variogram parameters.
  */
 export class OrdinaryKriging {
   private readonly inner: WasmOrdinaryInstance;
 
-  constructor(
-    lats: NumericArrayInput,
-    lons: NumericArrayInput,
-    values: NumericArrayInput,
-    variogramType: VariogramTypeName,
-    nugget: number,
-    sill: number,
-    range: number,
-    shape?: number
-  ) {
+  constructor(options: OrdinaryKrigingOptions) {
     const mod = requireLoadedModule();
     try {
-      this.inner = new mod.WasmOrdinaryKriging(
-        toFloat64Array(lats),
-        toFloat64Array(lons),
-        toFloat64Array(values),
-        variogramType,
-        nugget,
-        sill,
-        range,
-        shape
-      );
+      this.inner = new mod.WasmOrdinaryKriging(toOrdinaryOptionsWasm(options));
     } catch (e) {
       throw new KrigingError(e instanceof Error ? e.message : String(e), {
         cause: e,
@@ -317,30 +390,10 @@ export class OrdinaryKriging {
 export class BinomialKriging {
   private inner: WasmBinomialInstance;
 
-  constructor(
-    lats: NumericArrayInput,
-    lons: NumericArrayInput,
-    successes: IntegerArrayInput,
-    trials: IntegerArrayInput,
-    variogramType: VariogramTypeName,
-    nugget: number,
-    sill: number,
-    range: number,
-    shape?: number
-  ) {
+  constructor(options: BinomialKrigingOptions) {
     const mod = requireLoadedModule();
     try {
-      this.inner = new mod.WasmBinomialKriging(
-        toFloat64Array(lats),
-        toFloat64Array(lons),
-        toUint32Array(successes),
-        toUint32Array(trials),
-        variogramType,
-        nugget,
-        sill,
-        range,
-        shape
-      );
+      this.inner = new mod.WasmBinomialKriging(toBinomialOptionsWasm(options));
     } catch (e) {
       throw new KrigingError(e instanceof Error ? e.message : String(e), {
         cause: e,
@@ -352,36 +405,14 @@ export class BinomialKriging {
    * Create a binomial kriging model with a Beta(alpha, beta) prior on prevalence.
    * Useful when counts are small or some locations have zero trials.
    */
-  static newWithPrior(
-    lats: NumericArrayInput,
-    lons: NumericArrayInput,
-    successes: IntegerArrayInput,
-    trials: IntegerArrayInput,
-    variogramType: VariogramTypeName,
-    nugget: number,
-    sill: number,
-    range: number,
-    alpha: number,
-    beta: number,
-    shape?: number
-  ): BinomialKriging {
+  static newWithPrior(options: BinomialKrigingWithPriorOptions): BinomialKriging {
     const mod = requireLoadedModule();
     const instance = Object.create(
       BinomialKriging.prototype
     ) as BinomialKriging;
     try {
       instance.inner = mod.WasmBinomialKriging.newWithPrior(
-        toFloat64Array(lats),
-        toFloat64Array(lons),
-        toUint32Array(successes),
-        toUint32Array(trials),
-        variogramType,
-        nugget,
-        sill,
-        range,
-        shape,
-        alpha,
-        beta
+        toBinomialWithPriorOptionsWasm(options)
       );
     } catch (e) {
       throw new KrigingError(e instanceof Error ? e.message : String(e), {

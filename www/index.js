@@ -220,16 +220,18 @@ async function runOrdinaryPerformanceHarness(options, backendSelection) {
     const variogramFitMs = t1 - t0;
 
     t0 = performance.now();
-    const model = new WasmOrdinaryKriging(
-      sampleLats,
-      sampleLons,
-      sampleValues,
-      variogramType,
-      fitted.nugget,
-      fitted.sill,
-      fitted.range,
-      fitted.shape,
-    );
+    const model = new WasmOrdinaryKriging({
+      lats: Array.from(sampleLats),
+      lons: Array.from(sampleLons),
+      values: Array.from(sampleValues),
+      variogram: {
+        variogramType,
+        nugget: fitted.nugget,
+        sill: fitted.sill,
+        range: fitted.range,
+        shape: fitted.shape,
+      },
+    });
     t1 = performance.now();
     const modelBuildMs = t1 - t0;
 
@@ -888,15 +890,12 @@ async function main() {
     const lons = [-122.42, -122.41, -122.4, -122.43];
     const values = [15, 18, 14, 13];
 
-    const model = new WasmOrdinaryKriging(
+    const model = new WasmOrdinaryKriging({
       lats,
       lons,
       values,
-      "exponential",
-      0.1,
-      6.0,
-      5.0,
-    );
+      variogram: { variogramType: "exponential", nugget: 0.1, sill: 6.0, range: 5.0 },
+    });
     const pred = model.predict(37.765, -122.415);
     write("Ordinary kriging prediction", pred);
   });
@@ -907,16 +906,13 @@ async function main() {
     const successes = [25, 35, 20];
     const trials = [50, 50, 50];
 
-    const model = new WasmBinomialKriging(
+    const model = new WasmBinomialKriging({
       lats,
       lons,
       successes,
       trials,
-      "gaussian",
-      0.01,
-      1.5,
-      10.0,
-    );
+      variogram: { variogramType: "gaussian", nugget: 0.01, sill: 1.5, range: 10.0 },
+    });
     const pred = model.predict(40.715, -74.005);
     write("Binomial kriging prediction", pred);
   });
@@ -938,16 +934,18 @@ async function main() {
         options.nBins,
         options.variogramType,
       );
-      const ordinaryModel = new WasmOrdinaryKriging(
-        sampleLats,
-        sampleLons,
-        values,
-        ordinaryFit.variogramType ?? ordinaryFit.variogram_type,
-        ordinaryFit.nugget,
-        ordinaryFit.sill,
-        ordinaryFit.range,
-        ordinaryFit.shape,
-      );
+      const ordinaryModel = new WasmOrdinaryKriging({
+        lats: Array.from(sampleLats),
+        lons: Array.from(sampleLons),
+        values: Array.from(values),
+        variogram: {
+          variogramType: ordinaryFit.variogramType ?? ordinaryFit.variogram_type,
+          nugget: ordinaryFit.nugget,
+          sill: ordinaryFit.sill,
+          range: ordinaryFit.range,
+          shape: ordinaryFit.shape,
+        },
+      });
       const ordinaryOut = ordinaryModel.predictBatch(predLats, predLons);
       ordinaryModel.free();
 
@@ -967,19 +965,20 @@ async function main() {
         options.nBins,
         options.variogramType,
       );
-      const binomialModel = WasmBinomialKriging.newWithPrior(
-        sampleLats,
-        sampleLons,
-        sampleSuccesses,
-        sampleTrials,
-        binomialFit.variogramType ?? binomialFit.variogram_type,
-        binomialFit.nugget,
-        binomialFit.sill,
-        binomialFit.range,
-        binomialFit.shape,
-        options.alpha,
-        options.beta,
-      );
+      const binomialModel = WasmBinomialKriging.newWithPrior({
+        lats: Array.from(sampleLats),
+        lons: Array.from(sampleLons),
+        successes: sampleSuccesses,
+        trials: sampleTrials,
+        variogram: {
+          variogramType: binomialFit.variogramType ?? binomialFit.variogram_type,
+          nugget: binomialFit.nugget,
+          sill: binomialFit.sill,
+          range: binomialFit.range,
+          shape: binomialFit.shape,
+        },
+        prior: { alpha: options.alpha, beta: options.beta },
+      });
       const binomialOut = binomialModel.predictBatch(predLats, predLons);
       binomialModel.free();
       write("Fitted pipeline output", { ordinaryOut, binomialOut, options });
@@ -1034,19 +1033,20 @@ async function main() {
         if (typeof variogramType !== "string") {
           throw new Error("fitOrdinaryVariogram returned invalid variogramType");
         }
-        const model = WasmBinomialKriging.newWithPrior(
-          sampleLats,
-          sampleLons,
-          sampleSuccesses,
-          sampleTrials,
-          variogramType,
-          fitted.nugget,
-          fitted.sill,
-          fitted.range,
-          fitted.shape,
-          options.alpha,
-          options.beta,
-        );
+        const model = WasmBinomialKriging.newWithPrior({
+          lats: Array.from(sampleLats),
+          lons: Array.from(sampleLons),
+          successes: sampleSuccesses,
+          trials: sampleTrials,
+          variogram: {
+            variogramType,
+            nugget: fitted.nugget,
+            sill: fitted.sill,
+            range: fitted.range,
+            shape: fitted.shape,
+          },
+          prior: { alpha: options.alpha, beta: options.beta },
+        });
         predictions = backend.useGpu
           ? await model.predictBatchGpu(grid.predLats, grid.predLons)
           : model.predictBatch(grid.predLats, grid.predLons);
@@ -1075,16 +1075,18 @@ async function main() {
         if (typeof variogramType !== "string") {
           throw new Error("fitOrdinaryVariogram returned invalid variogramType");
         }
-        const model = new WasmOrdinaryKriging(
-          sampleLats,
-          sampleLons,
-          sampleValues,
-          variogramType,
-          fitted.nugget,
-          fitted.sill,
-          fitted.range,
-          fitted.shape,
-        );
+        const model = new WasmOrdinaryKriging({
+          lats: Array.from(sampleLats),
+          lons: Array.from(sampleLons),
+          values: Array.from(sampleValues),
+          variogram: {
+            variogramType,
+            nugget: fitted.nugget,
+            sill: fitted.sill,
+            range: fitted.range,
+            shape: fitted.shape,
+          },
+        });
         predictions = backend.useGpu
           ? await model.predictBatchGpu(grid.predLats, grid.predLons)
           : model.predictBatch(grid.predLats, grid.predLons);

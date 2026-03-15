@@ -52,16 +52,18 @@ export default function CompareView({ onError, webgpuAvailable = false }) {
           nBins,
           variogramType,
         );
-        const model = new OrdinaryKriging(
-          sampleLats,
-          sampleLons,
-          sampleValues,
-          fitted.variogramType,
-          fitted.nugget,
-          fitted.sill,
-          fitted.range,
-          fitted.shape,
-        );
+        const model = new OrdinaryKriging({
+          lats: sampleLats,
+          lons: sampleLons,
+          values: sampleValues,
+          variogram: {
+            variogramType: fitted.variogramType,
+            nugget: fitted.nugget,
+            sill: fitted.sill,
+            range: fitted.range,
+            shape: fitted.shape,
+          },
+        });
         const predictions = backend.useGpu
           ? await model.predictBatchGpu(grid.predLats, grid.predLons)
           : model.predictBatch(grid.predLats, grid.predLons);

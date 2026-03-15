@@ -21,7 +21,12 @@ export default function QuickDemos({ onError }) {
       const lats = [37.77, 37.78, 37.76, 37.75];
       const lons = [-122.42, -122.41, -122.4, -122.43];
       const values = [15, 18, 14, 13];
-      const model = new OrdinaryKriging(lats, lons, values, "exponential", 0.1, 6.0, 5.0);
+      const model = new OrdinaryKriging({
+        lats,
+        lons,
+        values,
+        variogram: { variogramType: "exponential", nugget: 0.1, sill: 6.0, range: 5.0 },
+      });
       const pred = model.predict(37.765, -122.415);
       model.free();
       write("Ordinary kriging prediction", pred);
@@ -40,16 +45,13 @@ export default function QuickDemos({ onError }) {
       const lons = [-74.0, -73.99, -74.02];
       const successes = [25, 35, 20];
       const trials = [50, 50, 50];
-      const model = new BinomialKriging(
+      const model = new BinomialKriging({
         lats,
         lons,
         successes,
         trials,
-        "gaussian",
-        0.01,
-        1.5,
-        10.0,
-      );
+        variogram: { variogramType: "gaussian", nugget: 0.01, sill: 1.5, range: 10.0 },
+      });
       const pred = model.predict(40.715, -74.005);
       model.free();
       write("Binomial kriging prediction", pred);
@@ -84,16 +86,18 @@ export default function QuickDemos({ onError }) {
         nBins,
         variogramType,
       );
-      const ordinaryModel = new OrdinaryKriging(
-        sampleLats,
-        sampleLons,
+      const ordinaryModel = new OrdinaryKriging({
+        lats: sampleLats,
+        lons: sampleLons,
         values,
-        ordinaryFit.variogramType,
-        ordinaryFit.nugget,
-        ordinaryFit.sill,
-        ordinaryFit.range,
-        ordinaryFit.shape,
-      );
+        variogram: {
+          variogramType: ordinaryFit.variogramType,
+          nugget: ordinaryFit.nugget,
+          sill: ordinaryFit.sill,
+          range: ordinaryFit.range,
+          shape: ordinaryFit.shape,
+        },
+      });
       const ordinaryOut = ordinaryModel.predictBatch(predLats, predLons);
       ordinaryModel.free();
 
@@ -113,19 +117,20 @@ export default function QuickDemos({ onError }) {
         nBins,
         variogramType,
       );
-      const binomialModel = BinomialKriging.newWithPrior(
-        sampleLats,
-        sampleLons,
-        sampleSuccesses,
-        sampleTrials,
-        binomialFit.variogramType,
-        binomialFit.nugget,
-        binomialFit.sill,
-        binomialFit.range,
-        alpha,
-        beta,
-        binomialFit.shape,
-      );
+      const binomialModel = BinomialKriging.newWithPrior({
+        lats: sampleLats,
+        lons: sampleLons,
+        successes: sampleSuccesses,
+        trials: sampleTrials,
+        variogram: {
+          variogramType: binomialFit.variogramType,
+          nugget: binomialFit.nugget,
+          sill: binomialFit.sill,
+          range: binomialFit.range,
+          shape: binomialFit.shape,
+        },
+        prior: { alpha, beta },
+      });
       const binomialOut = binomialModel.predictBatch(predLats, predLons);
       binomialModel.free();
       write("Fitted pipeline output", {

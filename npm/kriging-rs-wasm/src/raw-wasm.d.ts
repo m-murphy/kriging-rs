@@ -3,38 +3,10 @@ declare module "../pkg/kriging_rs.js" {
   export default init;
 
   export const initSync: (module: unknown) => unknown;
-  export const WasmOrdinaryKriging: new (
-    lats: Float64Array,
-    lons: Float64Array,
-    values: Float64Array,
-    variogram_type: string,
-    nugget: number,
-    sill: number,
-    range: number
-  ) => unknown;
+  export const WasmOrdinaryKriging: new (options: unknown) => unknown;
   export const WasmBinomialKriging: {
-    new (
-      lats: Float64Array,
-      lons: Float64Array,
-      successes: Uint32Array,
-      trials: Uint32Array,
-      variogram_type: string,
-      nugget: number,
-      sill: number,
-      range: number
-    ): unknown;
-    newWithPrior(
-      lats: Float64Array,
-      lons: Float64Array,
-      successes: Uint32Array,
-      trials: Uint32Array,
-      variogram_type: string,
-      nugget: number,
-      sill: number,
-      range: number,
-      alpha: number,
-      beta: number
-    ): unknown;
+    new (options: unknown): unknown;
+    newWithPrior(options: unknown): unknown;
   };
   export const WasmVariogramType: {
     readonly Spherical: number;

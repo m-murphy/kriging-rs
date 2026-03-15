@@ -18,15 +18,12 @@ const lats = new Float64Array([0, 1, 2]);
 const lons = new Float64Array([0, 1, 2]);
 const values = new Float64Array([3, 4, 5]);
 
-const ordinary = new OrdinaryKriging(
+const ordinary = new OrdinaryKriging({
   lats,
   lons,
   values,
-  variogram,
-  0.01,
-  1.0,
-  100
-);
+  variogram: { variogramType: variogram, nugget: 0.01, sill: 1.0, range: 100 },
+});
 const pred = ordinary.predict(0.5, 0.5);
 const batch = ordinary.predictBatch(lats, lons);
 const batchArrays = ordinary.predictBatchArrays(lats, lons);
@@ -47,15 +44,18 @@ const fit = fitOrdinaryVariogram(
   VariogramType.Gaussian
 );
 const _fitVariogramType: VariogramTypeName = fit.variogramType;
-const fittedOrdinary = new OrdinaryKriging(
+const fittedOrdinary = new OrdinaryKriging({
   lats,
   lons,
   values,
-  fit.variogramType,
-  fit.nugget,
-  fit.sill,
-  fit.range
-);
+  variogram: {
+    variogramType: fit.variogramType,
+    nugget: fit.nugget,
+    sill: fit.sill,
+    range: fit.range,
+    shape: fit.shape,
+  },
+});
 const fittedBatch = fittedOrdinary.predictBatch(lats, lons);
 const _fittedBatchItemType: OrdinaryPrediction = fittedBatch[0];
 const fittedBatchArrays = fittedOrdinary.predictBatchArrays(lats, lons);
@@ -63,16 +63,13 @@ const _fittedBatchArrayType: OrdinaryBatchArrayOutput = fittedBatchArrays;
 
 const successes = new Uint32Array([2, 4, 6]);
 const trials = new Uint32Array([10, 10, 10]);
-const binomial = new BinomialKriging(
+const binomial = new BinomialKriging({
   lats,
   lons,
   successes,
   trials,
-  "exponential",
-  0.01,
-  1.0,
-  100
-);
+  variogram: { variogramType: "exponential", nugget: 0.01, sill: 1.0, range: 100 },
+});
 const bPred = binomial.predict(0.4, 0.4);
 const _bPredType: BinomialPrediction = bPred;
 const _bPredNotAny: AssertNotAny<typeof bPred> = true;

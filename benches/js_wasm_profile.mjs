@@ -126,15 +126,18 @@ function profileWasm(rounds = 10, warmup = 3) {
     const fitMs = t1 - t0;
 
     t0 = performance.now();
-    const model = new WasmOrdinaryKriging(
-      sample.lats,
-      sample.lons,
-      sample.values,
-      fitted.variogramType ?? fitted.variogram_type,
-      fitted.nugget,
-      fitted.sill,
-      fitted.range,
-    );
+    const model = new WasmOrdinaryKriging({
+      lats: Array.from(sample.lats),
+      lons: Array.from(sample.lons),
+      values: Array.from(sample.values),
+      variogram: {
+        variogramType: fitted.variogramType ?? fitted.variogram_type,
+        nugget: fitted.nugget,
+        sill: fitted.sill,
+        range: fitted.range,
+        shape: fitted.shape,
+      },
+    });
     t1 = performance.now();
     const modelBuildMs = t1 - t0;
 
@@ -158,15 +161,18 @@ function profileWasm(rounds = 10, warmup = 3) {
       12,
       variogramType,
     );
-    const pipelineModel = new WasmOrdinaryKriging(
-      sample.lats,
-      sample.lons,
-      sample.values,
-      pipelineFit.variogramType ?? pipelineFit.variogram_type,
-      pipelineFit.nugget,
-      pipelineFit.sill,
-      pipelineFit.range,
-    );
+    const pipelineModel = new WasmOrdinaryKriging({
+      lats: Array.from(sample.lats),
+      lons: Array.from(sample.lons),
+      values: Array.from(sample.values),
+      variogram: {
+        variogramType: pipelineFit.variogramType ?? pipelineFit.variogram_type,
+        nugget: pipelineFit.nugget,
+        sill: pipelineFit.sill,
+        range: pipelineFit.range,
+        shape: pipelineFit.shape,
+      },
+    });
     const pipelineOut = pipelineModel.predictBatch(grid.predLats, grid.predLons);
     pipelineModel.free();
     t1 = performance.now();

@@ -1,20 +1,20 @@
 #![cfg(feature = "wasm")]
 
 use js_sys::{Float64Array, Object, Reflect};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
 use crate::distance::GeoCoord;
+use crate::geo_dataset::GeoDataset;
 #[cfg(feature = "gpu")]
 use crate::gpu::detect_gpu_support;
 use crate::kriging::binomial::{BinomialKrigingModel, BinomialObservation, BinomialPrior};
 use crate::kriging::ordinary::OrdinaryKrigingModel;
-use std::num::NonZeroUsize;
-use crate::geo_dataset::GeoDataset;
 use crate::variogram::empirical::{PositiveReal, VariogramConfig};
 use crate::variogram::fitting::fit_variogram;
 use crate::variogram::models::{VariogramModel, VariogramType};
 use crate::{Real, compute_empirical_variogram};
+use std::num::NonZeroUsize;
 
 /// WASM-exposed variogram type enum; maps to crate's VariogramType.
 #[wasm_bindgen]
@@ -67,7 +67,9 @@ fn parse_variogram(
             )
             .map_err(err_to_js)
         }
-        _ => VariogramModel::new(nugget as Real, sill as Real, range as Real, vt).map_err(err_to_js),
+        _ => {
+            VariogramModel::new(nugget as Real, sill as Real, range as Real, vt).map_err(err_to_js)
+        }
     }
 }
 
@@ -77,9 +79,7 @@ fn to_coords(lats: &[f64], lons: &[f64]) -> Result<Vec<GeoCoord>, JsValue> {
     }
     let mut out = Vec::with_capacity(lats.len());
     for i in 0..lats.len() {
-        out.push(
-            GeoCoord::try_new(lats[i] as Real, lons[i] as Real).map_err(err_to_js)?,
-        );
+        out.push(GeoCoord::try_new(lats[i] as Real, lons[i] as Real).map_err(err_to_js)?);
     }
     Ok(out)
 }
@@ -100,9 +100,7 @@ fn build_observations(
     let mut out = Vec::with_capacity(lats.len());
     for i in 0..lats.len() {
         let coord = GeoCoord::try_new(lats[i] as Real, lons[i] as Real).map_err(err_to_js)?;
-        out.push(
-            BinomialObservation::new(coord, successes[i], trials[i]).map_err(err_to_js)?,
-        );
+        out.push(BinomialObservation::new(coord, successes[i], trials[i]).map_err(err_to_js)?);
     }
     Ok(out)
 }
@@ -192,6 +190,59 @@ fn set_object_field(obj: &Object, key: &str, value: &JsValue) -> Result<(), JsVa
     Reflect::set(obj, &JsValue::from_str(key), value).map(|_| ())
 }
 
+/// Options for ordinary kriging model construction (JS: single object argument).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OrdinaryKrigingOptions {
+    lats: Vec<f64>,
+    lons: Vec<f64>,
+    values: Vec<f64>,
+    variogram: VariogramParams,
+}
+
+/// Variogram parameters (nugget, sill, range, optional shape).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VariogramParams {
+    variogram_type: String,
+    nugget: f64,
+    sill: f64,
+    range: f64,
+    #[serde(default)]
+    shape: Option<f64>,
+}
+
+/// Options for binomial kriging model construction (JS: single object argument).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinomialKrigingOptions {
+    lats: Vec<f64>,
+    lons: Vec<f64>,
+    successes: Vec<u32>,
+    trials: Vec<u32>,
+    variogram: VariogramParams,
+}
+
+/// Prior parameters for binomial kriging (Beta(alpha, beta)).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinomialPriorParams {
+    alpha: f64,
+    beta: f64,
+}
+
+/// Options for binomial kriging with prior (JS: single object argument).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinomialKrigingWithPriorOptions {
+    lats: Vec<f64>,
+    lons: Vec<f64>,
+    successes: Vec<u32>,
+    trials: Vec<u32>,
+    variogram: VariogramParams,
+    prior: BinomialPriorParams,
+}
+
 #[wasm_bindgen]
 pub struct WasmOrdinaryKriging {
     inner: OrdinaryKrigingModel,
@@ -200,19 +251,18 @@ pub struct WasmOrdinaryKriging {
 #[wasm_bindgen]
 impl WasmOrdinaryKriging {
     #[wasm_bindgen(constructor)]
-    pub fn new(
-        lats: &[f64],
-        lons: &[f64],
-        values: &[f64],
-        variogram_type: String,
-        nugget: f64,
-        sill: f64,
-        range: f64,
-        shape: Option<f64>,
-    ) -> Result<WasmOrdinaryKriging, JsValue> {
-        let coords = to_coords(lats, lons)?;
-        let model = parse_variogram(&variogram_type, nugget, sill, range, shape)?;
-        let values_real = values.iter().map(|v| *v as Real).collect::<Vec<_>>();
+    pub fn new(options: JsValue) -> Result<WasmOrdinaryKriging, JsValue> {
+        let opts: OrdinaryKrigingOptions =
+            serde_wasm_bindgen::from_value(options).map_err(err_to_js)?;
+        let coords = to_coords(&opts.lats, &opts.lons)?;
+        let model = parse_variogram(
+            &opts.variogram.variogram_type,
+            opts.variogram.nugget,
+            opts.variogram.sill,
+            opts.variogram.range,
+            opts.variogram.shape,
+        )?;
+        let values_real = opts.values.iter().map(|v| *v as Real).collect::<Vec<_>>();
         let dataset = GeoDataset::new(coords, values_real).map_err(err_to_js)?;
         let inner = OrdinaryKrigingModel::new(dataset, model).map_err(err_to_js)?;
         Ok(Self { inner })
@@ -269,40 +319,37 @@ pub struct WasmBinomialKriging {
 #[wasm_bindgen]
 impl WasmBinomialKriging {
     #[wasm_bindgen(constructor)]
-    pub fn new(
-        lats: &[f64],
-        lons: &[f64],
-        successes: &[u32],
-        trials: &[u32],
-        variogram_type: String,
-        nugget: f64,
-        sill: f64,
-        range: f64,
-        shape: Option<f64>,
-    ) -> Result<WasmBinomialKriging, JsValue> {
-        let observations = build_observations(lats, lons, successes, trials)?;
-        let model = parse_variogram(&variogram_type, nugget, sill, range, shape)?;
+    pub fn new(options: JsValue) -> Result<WasmBinomialKriging, JsValue> {
+        let opts: BinomialKrigingOptions =
+            serde_wasm_bindgen::from_value(options).map_err(err_to_js)?;
+        let observations =
+            build_observations(&opts.lats, &opts.lons, &opts.successes, &opts.trials)?;
+        let model = parse_variogram(
+            &opts.variogram.variogram_type,
+            opts.variogram.nugget,
+            opts.variogram.sill,
+            opts.variogram.range,
+            opts.variogram.shape,
+        )?;
         let inner = BinomialKrigingModel::new(observations, model).map_err(err_to_js)?;
         Ok(Self { inner })
     }
 
     #[wasm_bindgen(js_name = newWithPrior)]
-    pub fn new_with_prior(
-        lats: &[f64],
-        lons: &[f64],
-        successes: &[u32],
-        trials: &[u32],
-        variogram_type: String,
-        nugget: f64,
-        sill: f64,
-        range: f64,
-        shape: Option<f64>,
-        alpha: f64,
-        beta: f64,
-    ) -> Result<WasmBinomialKriging, JsValue> {
-        let observations = build_observations(lats, lons, successes, trials)?;
-        let model = parse_variogram(&variogram_type, nugget, sill, range, shape)?;
-        let prior = BinomialPrior::new(alpha as Real, beta as Real).map_err(err_to_js)?;
+    pub fn new_with_prior(options: JsValue) -> Result<WasmBinomialKriging, JsValue> {
+        let opts: BinomialKrigingWithPriorOptions =
+            serde_wasm_bindgen::from_value(options).map_err(err_to_js)?;
+        let observations =
+            build_observations(&opts.lats, &opts.lons, &opts.successes, &opts.trials)?;
+        let model = parse_variogram(
+            &opts.variogram.variogram_type,
+            opts.variogram.nugget,
+            opts.variogram.sill,
+            opts.variogram.range,
+            opts.variogram.shape,
+        )?;
+        let prior = BinomialPrior::new(opts.prior.alpha as Real, opts.prior.beta as Real)
+            .map_err(err_to_js)?;
         let inner =
             BinomialKrigingModel::new_with_prior(observations, model, prior).map_err(err_to_js)?;
         Ok(Self { inner })
@@ -364,13 +411,17 @@ pub fn wasm_fit_ordinary_variogram(
     variogram_type: WasmVariogramType,
 ) -> Result<JsValue, JsValue> {
     let sample_coords = to_coords(sample_lats, sample_lons)?;
-    let n_bins = NonZeroUsize::new(n_bins)
-        .ok_or_else(|| JsValue::from_str("n_bins must be at least 1"))?;
+    let n_bins =
+        NonZeroUsize::new(n_bins).ok_or_else(|| JsValue::from_str("n_bins must be at least 1"))?;
     let max_distance = match max_distance {
         Some(v) if v > 0.0 && v.is_finite() => {
             Some(PositiveReal::try_new(v as Real).map_err(err_to_js)?)
         }
-        Some(_) => return Err(JsValue::from_str("max_distance must be finite and positive")),
+        Some(_) => {
+            return Err(JsValue::from_str(
+                "max_distance must be finite and positive",
+            ));
+        }
         None => None,
     };
     let config = VariogramConfig {
