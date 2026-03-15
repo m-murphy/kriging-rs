@@ -2,6 +2,9 @@ use crate::{KrigingError, Real};
 
 const EARTH_RADIUS_KM: Real = 6_371.0;
 
+/// Geographic coordinate in degrees: latitude in [-90, 90], longitude in [-180, 180].
+///
+/// Use [`try_new`](Self::try_new) to construct; distances are computed with Haversine (km).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GeoCoord {
     lat: Real,

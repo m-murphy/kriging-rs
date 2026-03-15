@@ -6,6 +6,9 @@ use crate::kriging::ordinary::OrdinaryKrigingModel;
 use crate::utils::{Probability, logistic, logit};
 use crate::variogram::models::VariogramModel;
 
+/// A single binomial observation at a location: number of successes and trials.
+///
+/// Use with [`BinomialKrigingModel`] to build a prevalence surface from count data.
 #[derive(Debug, Clone, Copy)]
 pub struct BinomialObservation {
     coord: GeoCoord,
@@ -69,6 +72,10 @@ impl BinomialObservation {
     }
 }
 
+/// Beta(alpha, beta) prior for smoothing binomial observations.
+///
+/// Used by [`BinomialObservation::smoothed_probability_with_prior`] and
+/// [`BinomialKrigingModel::new_with_prior`]. Default is Beta(0.5, 0.5).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BinomialPrior {
     alpha: Real,
@@ -111,13 +118,22 @@ impl BinomialPrior {
     }
 }
 
+/// Result of a binomial kriging prediction: prevalence (0–1), logit value, and variance.
 #[derive(Debug, Clone, Copy)]
 pub struct BinomialPrediction {
+    /// Estimated prevalence at the target location (probability in (0, 1)).
     pub prevalence: Real,
+    /// Logit of the prevalence (unbounded).
     pub logit_value: Real,
+    /// Kriging variance of the logit prediction.
     pub variance: Real,
 }
 
+/// Fitted binomial kriging model for prevalence surface estimation.
+///
+/// Build from [`BinomialObservation`]s and a [`VariogramModel`] with
+/// [`new`](Self::new) or [`new_with_prior`](Self::new_with_prior); then use [`predict`](Self::predict)
+/// or [`predict_batch`](Self::predict_batch). See also the `binomial_kriging` example.
 #[derive(Debug, Clone)]
 pub struct BinomialKrigingModel {
     ordinary_model: OrdinaryKrigingModel,

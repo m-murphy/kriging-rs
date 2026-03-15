@@ -1,3 +1,5 @@
+//! Coordinate–value datasets for kriging (pairs of locations and observed values).
+
 use crate::Real;
 use crate::distance::GeoCoord;
 use crate::error::KrigingError;

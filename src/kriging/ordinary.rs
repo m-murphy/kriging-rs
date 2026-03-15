@@ -8,12 +8,20 @@ use crate::error::KrigingError;
 use crate::geo_dataset::GeoDataset;
 use crate::variogram::models::{VariogramModel, VariogramType};
 
+/// Result of a single kriging prediction: the interpolated value and the kriging variance.
 #[derive(Debug, Clone, Copy)]
 pub struct Prediction {
+    /// The predicted (interpolated) value at the target location.
     pub value: Real,
+    /// The kriging variance at the target location.
     pub variance: Real,
 }
 
+/// Fitted ordinary kriging model for spatial interpolation.
+///
+/// Build from a [`GeoDataset`] and a [`VariogramModel`]
+/// with [`new`](Self::new), then call [`predict`](Self::predict) for a single location or
+/// [`predict_batch`](Self::predict_batch) for many. See also the `ordinary_kriging` example.
 #[derive(Debug)]
 pub struct OrdinaryKrigingModel {
     coords: Vec<GeoCoord>,

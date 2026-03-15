@@ -1,6 +1,7 @@
 use crate::Real;
 use thiserror::Error;
 
+/// Errors returned by kriging, variogram, and dataset operations in this crate.
 #[derive(Error, Debug)]
 pub enum KrigingError {
     #[error("Insufficient data: need at least {0} observations")]

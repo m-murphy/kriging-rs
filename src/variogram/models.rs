@@ -18,16 +18,24 @@ fn matern_semivariance(d: Real, nugget: Real, partial_sill: Real, range: Real, n
     nugget + partial_sill * (1.0 - (correlation as Real))
 }
 
+/// Parametric variogram family used to construct a [`VariogramModel`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VariogramType {
     Spherical,
     Exponential,
     Gaussian,
     Cubic,
+    /// Power-law family; requires shape parameter `alpha` in (0, 2].
     Stable,
+    /// Matérn family; requires smoothness parameter `nu` > 0.
     Matern,
 }
 
+/// Parametric variogram (nugget, sill, range, and optional shape).
+///
+/// Build with [`VariogramModel::new`] from a [`VariogramType`]; use with
+/// [`OrdinaryKrigingModel::new`](crate::OrdinaryKrigingModel::new) or
+/// [`BinomialKrigingModel::new`](crate::BinomialKrigingModel::new).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VariogramModel {
     Spherical {
