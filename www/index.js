@@ -3,6 +3,7 @@ import init, * as wasm from "./pkg/kriging_rs.js";
 const {
   WasmOrdinaryKriging,
   WasmBinomialKriging,
+  WasmVariogramType,
   fitOrdinaryVariogram,
   webgpuAvailable,
 } = wasm;
@@ -19,9 +20,7 @@ const residualRmse = document.getElementById("residualRmse");
 const gridResolution = document.getElementById("gridResolution");
 const nBins = document.getElementById("nBins");
 const maxDistanceKm = document.getElementById("maxDistanceKm");
-const modelSpherical = document.getElementById("modelSpherical");
-const modelExponential = document.getElementById("modelExponential");
-const modelGaussian = document.getElementById("modelGaussian");
+const variogramModel = document.getElementById("variogramModel");
 const binomialAlpha = document.getElementById("binomialAlpha");
 const binomialBeta = document.getElementById("binomialBeta");
 const surfaceKrigingType = document.getElementById("surfaceKrigingType");
@@ -33,28 +32,13 @@ const webgpuStatus = document.getElementById("webgpuStatus");
 let webGpuAvailableFlag = false;
 let webGpuDetectionMessage = "not checked";
 
-function selectedVariogramTypes() {
-  const selected = [];
-  if (modelSpherical.checked) {
-    selected.push("spherical");
-  }
-  if (modelExponential.checked) {
-    selected.push("exponential");
-  }
-  if (modelGaussian.checked) {
-    selected.push("gaussian");
-  }
-  if (selected.length === 0) {
-    throw new Error("Select at least one variogram candidate");
-  }
-  return selected;
-}
-
 function readQuickOptions() {
   const nBinsValue = Number(nBins.value);
   const maxDistanceValue = maxDistanceKm.value.trim();
   const maxDistance = maxDistanceValue === "" ? undefined : Number(maxDistanceValue);
-  const variogramTypes = selectedVariogramTypes();
+  const selectedValue = variogramModel.value;
+  const variogramType = WasmVariogramType[selectedValue];
+  const variogramTypeName = selectedValue.toLowerCase();
   const alpha = Number(binomialAlpha.value);
   const beta = Number(binomialBeta.value);
   if (!Number.isFinite(nBinsValue) || nBinsValue <= 0) {
@@ -69,7 +53,8 @@ function readQuickOptions() {
   return {
     nBins: nBinsValue,
     maxDistance,
-    variogramTypes,
+    variogramType,
+    variogramTypeName,
     alpha,
     beta,
   };
@@ -225,7 +210,7 @@ async function runOrdinaryPerformanceHarness(options, backendSelection) {
       sampleValues,
       options.maxDistance,
       options.nBins,
-      options.variogramTypes,
+      options.variogramType,
     );
     const variogramType = fitted.variogramType ?? fitted.variogram_type;
     if (typeof variogramType !== "string") {
@@ -243,6 +228,7 @@ async function runOrdinaryPerformanceHarness(options, backendSelection) {
       fitted.nugget,
       fitted.sill,
       fitted.range,
+      fitted.shape,
     );
     t1 = performance.now();
     const modelBuildMs = t1 - t0;
@@ -603,7 +589,7 @@ function computeEmpiricalVariogram(lats, lons, values, binCount = 18) {
     }));
 }
 
-function variogramSemivariance(distance, modelType, nugget, sill, range) {
+function variogramSemivariance(distance, modelType, nugget, sill, range, shape) {
   const r = Math.max(range, 1e-9);
   const partial = Math.max(sill - nugget, 1e-9);
   const h = Math.max(distance, 0);
@@ -616,9 +602,89 @@ function variogramSemivariance(distance, modelType, nugget, sill, range) {
     return nugget + partial * (1.5 * x - 0.5 * x * x * x);
   }
   if (modelType === "gaussian") {
-    return nugget + partial * (1 - Math.exp(-(h * h) / (r * r)));
+    return nugget + partial * (1 - Math.exp(-3 * (h * h) / (r * r)));
   }
-  return nugget + partial * (1 - Math.exp(-h / r));
+  if (modelType === "exponential") {
+    return nugget + partial * (1 - Math.exp(-3 * h / r));
+  }
+  if (modelType === "cubic") {
+    if (h >= r) {
+      return sill;
+    }
+    const x = h / r;
+    const poly = 7 * x * x - 8.5 * x * x * x + 3.5 * Math.pow(x, 5) - 0.5 * Math.pow(x, 7);
+    return nugget + partial * poly;
+  }
+  if (modelType === "stable") {
+    const alpha = typeof shape === "number" && shape > 0 ? shape : 1;
+    const x = Math.pow(h / r, alpha);
+    return nugget + partial * (1 - Math.exp(-x));
+  }
+  if (modelType === "matern") {
+    const nu = typeof shape === "number" && shape > 0 ? shape : 0.5;
+    if (h <= 0) {
+      return nugget;
+    }
+    const x = (h / r) * Math.sqrt(2 * nu);
+    const kNu = besselK(nu, x);
+    const logGammaNu = logGamma(nu);
+    const gammaNu = logGammaNu < -1e10 ? 1 : Math.exp(logGammaNu);
+    const factor = (Math.pow(2, 1 - nu) / gammaNu) * Math.pow(x, nu) * kNu;
+    const correlation = Math.min(Math.max(factor, 0), 1);
+    return nugget + partial * (1 - correlation);
+  }
+  return nugget + partial * (1 - Math.exp(-3 * h / r));
+}
+
+function logGamma(x) {
+  if (x < 0.5) {
+    const s = Math.PI / Math.sin(Math.PI * x);
+    return Math.log(Math.abs(s)) - logGamma(1 - x);
+  }
+  const g = 7;
+  const c = [0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059, 12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7];
+  let xx = x - 1;
+  let t = c[0];
+  for (let i = 1; i < g + 2; i++) {
+    t += c[i] / (xx + i);
+  }
+  t *= Math.sqrt(2 * Math.PI) * Math.pow(xx + g + 0.5, xx + 0.5) * Math.exp(-(xx + g + 0.5));
+  return Math.log(t);
+}
+
+function besselK(nu, x) {
+  if (x <= 0) {
+    return nu === 0 ? Infinity : 0;
+  }
+  if (x > 300) {
+    return 0;
+  }
+  if (nu === 0.5) {
+    return Math.sqrt(Math.PI / (2 * x)) * Math.exp(-x);
+  }
+  const eps = 1e-10;
+  const maxIter = 300;
+  const x2 = x / 2;
+  function besselI(n, xx) {
+    let sum = 0;
+    let term = 1;
+    let k = 0;
+    const logX2 = Math.log(x2);
+    while (Math.abs(term) > eps * (Math.abs(sum) || 1) && k < maxIter) {
+      const logTerm = (n + 2 * k) * logX2 - logGamma(k + 1) - logGamma(n + k + 1);
+      term = Math.exp(logTerm);
+      sum += term;
+      k++;
+    }
+    return sum * Math.pow(x2, n);
+  }
+  const sinPiNu = Math.sin(Math.PI * nu);
+  if (Math.abs(sinPiNu) < 1e-10) {
+    return besselK(0.5, x);
+  }
+  const iNeg = besselI(-nu, x);
+  const iPos = besselI(nu, x);
+  return (Math.PI / 2) * (iNeg - iPos) / sinPiNu;
 }
 
 function renderVariogramPlot(variogramPoints, modelType) {
@@ -870,7 +936,7 @@ async function main() {
         values,
         options.maxDistance,
         options.nBins,
-        options.variogramTypes,
+        options.variogramType,
       );
       const ordinaryModel = new WasmOrdinaryKriging(
         sampleLats,
@@ -880,6 +946,7 @@ async function main() {
         ordinaryFit.nugget,
         ordinaryFit.sill,
         ordinaryFit.range,
+        ordinaryFit.shape,
       );
       const ordinaryOut = ordinaryModel.predictBatch(predLats, predLons);
       ordinaryModel.free();
@@ -898,7 +965,7 @@ async function main() {
         sampleLogits,
         options.maxDistance,
         options.nBins,
-        options.variogramTypes,
+        options.variogramType,
       );
       const binomialModel = WasmBinomialKriging.newWithPrior(
         sampleLats,
@@ -909,6 +976,7 @@ async function main() {
         binomialFit.nugget,
         binomialFit.sill,
         binomialFit.range,
+        binomialFit.shape,
         options.alpha,
         options.beta,
       );
@@ -960,7 +1028,7 @@ async function main() {
           sampleLogits,
           options.maxDistance,
           options.nBins,
-          options.variogramTypes,
+          options.variogramType,
         );
         const variogramType = fitted.variogramType ?? fitted.variogram_type;
         if (typeof variogramType !== "string") {
@@ -975,6 +1043,7 @@ async function main() {
           fitted.nugget,
           fitted.sill,
           fitted.range,
+          fitted.shape,
           options.alpha,
           options.beta,
         );
@@ -1000,7 +1069,7 @@ async function main() {
           sampleValues,
           options.maxDistance,
           options.nBins,
-          options.variogramTypes,
+          options.variogramType,
         );
         const variogramType = fitted.variogramType ?? fitted.variogram_type;
         if (typeof variogramType !== "string") {
@@ -1014,6 +1083,7 @@ async function main() {
           fitted.nugget,
           fitted.sill,
           fitted.range,
+          fitted.shape,
         );
         predictions = backend.useGpu
           ? await model.predictBatchGpu(grid.predLats, grid.predLons)
@@ -1056,13 +1126,13 @@ async function main() {
         observedValues,
         options.nBins,
       );
-      const variogramStats = renderVariogramPlot(variogramPoints, options.variogramTypes[0]);
+      const variogramStats = renderVariogramPlot(variogramPoints, options.variogramTypeName);
       write("2D kriging surface", {
         krigingType,
         metric: metricLabel,
         layerMode,
         residualMode: residualDisplayMode,
-        variogramCandidates: options.variogramTypes,
+        variogramType: options.variogramTypeName,
         nBins: options.nBins,
         maxDistanceKm: options.maxDistance ?? "auto",
         backendSelection: surfaceBackend.value,
