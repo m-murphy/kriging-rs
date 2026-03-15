@@ -8,6 +8,16 @@ description = "Geostatistical kriging library with WASM support"
 keywords = ["kriging", "geostatistics", "wasm", "interpolation", "spatial"]
 categories = ["science", "wasm"]
 repository = "https://github.com/m-murphy/kriging-rs"
+exclude = [
+  ".cursor/",
+  ".github/",
+  "bench-results/",
+  "docs/",
+  "npm/",
+  "www/",
+  "Cargo.toml.orig",
+  "benches/js_wasm_profile.mjs",
+]
 
 [dependencies]
 console_error_panic_hook = { version = "0.1.7", optional = true }
@@ -16,7 +26,6 @@ js-sys = { version = "0.3.91", optional = true }
 rayon = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde-wasm-bindgen = { version = "0.6.5", optional = true }
-serde_json = "1.0.149"
 thiserror = "2.0.18"
 wasm-bindgen = { version = "0.2.114", optional = true }
 wgpu = { version = "28.0.0", optional = true }
@@ -43,7 +52,7 @@ gpu-blocking = ["gpu", "dep:pollster"]
 
 [dev-dependencies]
 approx = "0.5.1"
-rand = "0.9.2"
+rand = "0.10.0"
 wasm-bindgen-test = "0.3.64"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

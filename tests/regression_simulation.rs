@@ -6,7 +6,7 @@ use kriging_rs::{
     BinomialKrigingModel, BinomialObservation, BinomialPrior, GeoCoord, OrdinaryKrigingModel, Real,
 };
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::num::NonZeroUsize;
 
 const SEEDS: [u64; 4] = [7, 17, 29, 53];
