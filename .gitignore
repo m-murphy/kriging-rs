@@ -7,3 +7,14 @@ pkg/
 wasm-pack.log
 dist/
 .DS_Store
+
+*.log
+.cursor/debug-*.log
+
+# LaTeX build artifacts
+*.aux
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+docs/*.out
+docs/pdf/
