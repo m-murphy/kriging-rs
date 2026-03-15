@@ -29,7 +29,7 @@ struct VariogramGpuParams {
     nugget: f32,
     sill: f32,
     range: f32,
-    _pad1: f32,
+    shape: f32,
 }
 
 const COVARIANCE_SHADER: &str = r#"
@@ -41,7 +41,7 @@ struct Params {
     nugget: f32,
     sill: f32,
     range: f32,
-    _pad1: f32,
+    shape: f32,
 };
 
 @group(0) @binding(0)
@@ -53,7 +53,7 @@ var<storage, read_write> out_covariances: array<f32>;
 @group(0) @binding(3)
 var<uniform> params: Params;
 
-fn semivariance(distance: f32, variogram_type: u32, nugget: f32, sill: f32, range_in: f32) -> f32 {
+fn semivariance(distance: f32, variogram_type: u32, nugget: f32, sill: f32, range_in: f32, shape_in: f32) -> f32 {
     let d = max(distance, 0.0);
     let r = max(range_in, 1e-6);
     let partial = max(sill - nugget, 0.0);
@@ -67,6 +67,22 @@ fn semivariance(distance: f32, variogram_type: u32, nugget: f32, sill: f32, rang
     }
     if variogram_type == 1u {
         return nugget + partial * (1.0 - exp(-3.0 * d / r));
+    }
+    if variogram_type == 2u {
+        return nugget + partial * (1.0 - exp(-3.0 * d * d / (r * r)));
+    }
+    if variogram_type == 3u {
+        if d >= r {
+            return sill;
+        }
+        let x = d / r;
+        let poly = 7.0 * x * x - 8.5 * x * x * x + 3.5 * pow(x, 5.0) - 0.5 * pow(x, 7.0);
+        return nugget + partial * poly;
+    }
+    if variogram_type == 4u {
+        let alpha = max(shape_in, 1e-6);
+        let x = pow(d / r, alpha);
+        return nugget + partial * (1.0 - exp(-x));
     }
     return nugget + partial * (1.0 - exp(-3.0 * d * d / (r * r)));
 }
@@ -97,7 +113,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let d = haversine_km(train_coords[train_idx], pred_coords[pred_idx]);
-    let semi = semivariance(d, params.variogram_type, params.nugget, params.sill, params.range);
+    let semi = semivariance(d, params.variogram_type, params.nugget, params.sill, params.range, params.shape);
     let idx = pred_idx * params.n_train + train_idx;
     out_covariances[idx] = max(params.sill - semi, 0.0);
 }
@@ -151,14 +167,19 @@ fn encode_variogram_params(
     variogram: VariogramModel,
     n_train: usize,
     n_pred: usize,
-) -> VariogramGpuParams {
+) -> Result<VariogramGpuParams, String> {
     let (nugget, sill, range) = variogram.params();
-    let variogram_type = match variogram.variogram_type() {
-        VariogramType::Spherical => 0,
-        VariogramType::Exponential => 1,
-        VariogramType::Gaussian => 2,
+    let (variogram_type, shape) = match variogram.variogram_type() {
+        VariogramType::Spherical => (0u32, 0.0f32),
+        VariogramType::Exponential => (1, 0.0),
+        VariogramType::Gaussian => (2, 0.0),
+        VariogramType::Cubic => (3, 0.0),
+        VariogramType::Stable => (4, variogram.shape().unwrap_or(1.0)),
+        VariogramType::Matern => {
+            return Err("Matérn variogram is not supported on GPU; use CPU path".to_string())
+        }
     };
-    VariogramGpuParams {
+    Ok(VariogramGpuParams {
         n_train: n_train as u32,
         n_pred: n_pred as u32,
         variogram_type,
@@ -166,8 +187,8 @@ fn encode_variogram_params(
         nugget,
         sill,
         range,
-        _pad1: 0.0,
-    }
+        shape,
+    })
 }
 
 async fn read_buffer_f32(
@@ -220,13 +241,13 @@ pub async fn build_rhs_covariances_gpu(
 
     let train_flat = train_coords
         .iter()
-        .flat_map(|c| [c.lat, c.lon])
+        .flat_map(|c| [c.lat(), c.lon()])
         .collect::<Vec<_>>();
     let pred_flat = pred_coords
         .iter()
-        .flat_map(|c| [c.lat, c.lon])
+        .flat_map(|c| [c.lat(), c.lon()])
         .collect::<Vec<_>>();
-    let params = encode_variogram_params(variogram, train_coords.len(), pred_coords.len());
+    let params = encode_variogram_params(variogram, train_coords.len(), pred_coords.len())?;
 
     let train_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("kriging_train_coords"),

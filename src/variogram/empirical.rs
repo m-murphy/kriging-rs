@@ -1,6 +1,38 @@
+use std::num::NonZeroUsize;
+
+use crate::geo_dataset::GeoDataset;
 use crate::Real;
-use crate::distance::{GeoCoord, haversine_distance};
+use crate::distance::haversine_distance;
 use crate::error::KrigingError;
+
+/// A positive real number (> 0), enforced at construction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PositiveReal(Real);
+
+impl PositiveReal {
+    pub fn try_new(x: Real) -> Result<Self, KrigingError> {
+        if x > 0.0 && x.is_finite() {
+            Ok(Self(x))
+        } else {
+            Err(KrigingError::FittingError(
+                "value must be finite and positive".to_string(),
+            ))
+        }
+    }
+
+    #[inline]
+    pub fn get(self) -> Real {
+        self.0
+    }
+}
+
+impl std::ops::Deref for PositiveReal {
+    type Target = Real;
+    #[inline]
+    fn deref(&self) -> &Real {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct EmpiricalVariogram {
@@ -11,50 +43,34 @@ pub struct EmpiricalVariogram {
 
 #[derive(Debug, Clone)]
 pub struct VariogramConfig {
-    pub max_distance: Option<Real>,
-    pub n_bins: usize,
+    pub max_distance: Option<PositiveReal>,
+    pub n_bins: NonZeroUsize,
 }
 
 impl Default for VariogramConfig {
     fn default() -> Self {
         Self {
             max_distance: None,
-            n_bins: 12,
+            n_bins: NonZeroUsize::new(12).expect("12 != 0"),
         }
     }
 }
 
 pub fn compute_empirical_variogram(
-    coords: &[GeoCoord],
-    values: &[Real],
+    dataset: &GeoDataset,
     config: &VariogramConfig,
 ) -> Result<EmpiricalVariogram, KrigingError> {
-    if coords.len() != values.len() {
-        return Err(KrigingError::DimensionMismatch(
-            "coords and values length must match".to_string(),
-        ));
-    }
-    if coords.len() < 2 {
-        return Err(KrigingError::InsufficientData(2));
-    }
-    if config.n_bins == 0 {
-        return Err(KrigingError::FittingError(
-            "n_bins must be at least 1".to_string(),
-        ));
-    }
-
+    let coords = dataset.coords();
+    let values = dataset.values();
     let n = coords.len();
-    let mut dist_sums = vec![0.0; config.n_bins];
-    let mut semi_sums = vec![0.0; config.n_bins];
-    let mut counts = vec![0usize; config.n_bins];
+    let n_bins = config.n_bins.get();
+    let mut dist_sums = vec![0.0; n_bins];
+    let mut semi_sums = vec![0.0; n_bins];
+    let mut counts = vec![0usize; n_bins];
 
     if let Some(max_dist) = config.max_distance {
-        if max_dist <= 0.0 {
-            return Err(KrigingError::FittingError(
-                "max distance must be positive".to_string(),
-            ));
-        }
-        let bin_width = max_dist / config.n_bins as Real;
+        let max_dist = max_dist.get();
+        let bin_width = max_dist / n_bins as Real;
         for i in 0..n {
             for j in (i + 1)..n {
                 let d = haversine_distance(coords[i], coords[j]);
@@ -63,8 +79,8 @@ pub fn compute_empirical_variogram(
                 }
                 let g = 0.5 * (values[i] - values[j]).powi(2);
                 let mut bin = (d / bin_width).floor() as usize;
-                if bin >= config.n_bins {
-                    bin = config.n_bins - 1;
+                if bin >= n_bins {
+                    bin = n_bins - 1;
                 }
                 dist_sums[bin] += d;
                 semi_sums[bin] += g;
@@ -87,11 +103,11 @@ pub fn compute_empirical_variogram(
                 "max distance must be positive".to_string(),
             ));
         }
-        let bin_width = max_observed / config.n_bins as Real;
+        let bin_width = max_observed / n_bins as Real;
         for (d, g) in pairs {
             let mut bin = (d / bin_width).floor() as usize;
-            if bin >= config.n_bins {
-                bin = config.n_bins - 1;
+            if bin >= n_bins {
+                bin = n_bins - 1;
             }
             dist_sums[bin] += d;
             semi_sums[bin] += g;
@@ -102,7 +118,7 @@ pub fn compute_empirical_variogram(
     let mut distances = Vec::new();
     let mut semivariances = Vec::new();
     let mut n_pairs = Vec::new();
-    for i in 0..config.n_bins {
+    for i in 0..n_bins {
         if counts[i] == 0 {
             continue;
         }
@@ -127,22 +143,23 @@ pub fn compute_empirical_variogram(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::distance::GeoCoord;
 
     #[test]
     fn empirical_variogram_has_non_empty_bins() {
         let coords = vec![
-            GeoCoord { lat: 0.0, lon: 0.0 },
-            GeoCoord { lat: 0.0, lon: 1.0 },
-            GeoCoord { lat: 1.0, lon: 0.0 },
-            GeoCoord { lat: 1.0, lon: 1.0 },
+            GeoCoord::try_new(0.0, 0.0).unwrap(),
+            GeoCoord::try_new(0.0, 1.0).unwrap(),
+            GeoCoord::try_new(1.0, 0.0).unwrap(),
+            GeoCoord::try_new(1.0, 1.0).unwrap(),
         ];
         let values = vec![1.0, 2.0, 2.0, 3.0];
+        let dataset = GeoDataset::new(coords, values).unwrap();
         let out = compute_empirical_variogram(
-            &coords,
-            &values,
+            &dataset,
             &VariogramConfig {
                 max_distance: None,
-                n_bins: 6,
+                n_bins: NonZeroUsize::new(6).unwrap(),
             },
         )
         .expect("empirical variogram should compute");
@@ -154,29 +171,29 @@ mod tests {
     #[test]
     fn empirical_variogram_preserves_pair_accounting_with_fixed_max_distance() {
         let coords = vec![
-            GeoCoord { lat: 0.0, lon: 0.0 },
-            GeoCoord { lat: 0.0, lon: 0.5 },
-            GeoCoord { lat: 0.5, lon: 0.0 },
-            GeoCoord { lat: 0.5, lon: 0.5 },
-            GeoCoord { lat: 1.0, lon: 1.0 },
+            GeoCoord::try_new(0.0, 0.0).unwrap(),
+            GeoCoord::try_new(0.0, 0.5).unwrap(),
+            GeoCoord::try_new(0.5, 0.0).unwrap(),
+            GeoCoord::try_new(0.5, 0.5).unwrap(),
+            GeoCoord::try_new(1.0, 1.0).unwrap(),
         ];
         let values = vec![1.0, 1.5, 2.0, 2.5, 3.0];
-        let max_distance = 500.0;
-        let n_bins = 8;
+        let max_distance = PositiveReal::try_new(500.0).unwrap();
+        let dataset = GeoDataset::new(coords, values).unwrap();
         let out = compute_empirical_variogram(
-            &coords,
-            &values,
+            &dataset,
             &VariogramConfig {
                 max_distance: Some(max_distance),
-                n_bins,
+                n_bins: NonZeroUsize::new(8).unwrap(),
             },
         )
         .expect("empirical variogram should compute");
 
         let mut expected_pair_count = 0usize;
+        let coords = dataset.coords();
         for i in 0..coords.len() {
             for j in (i + 1)..coords.len() {
-                if haversine_distance(coords[i], coords[j]) <= max_distance {
+                if haversine_distance(coords[i], coords[j]) <= max_distance.get() {
                     expected_pair_count += 1;
                 }
             }
@@ -188,7 +205,7 @@ mod tests {
         assert!(
             out.distances
                 .iter()
-                .all(|d| *d >= 0.0 && *d <= max_distance)
+                .all(|d| *d >= 0.0 && *d <= max_distance.get())
         );
         assert!(out.semivariances.iter().all(|g| g.is_finite() && *g >= 0.0));
     }
