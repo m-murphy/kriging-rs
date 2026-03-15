@@ -1,4 +1,6 @@
-use kriging_rs::{BinomialKrigingModel, BinomialObservation, GeoCoord, VariogramModel, VariogramType};
+use kriging_rs::{
+    BinomialKrigingModel, BinomialObservation, GeoCoord, VariogramModel, VariogramType,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let observations = vec![

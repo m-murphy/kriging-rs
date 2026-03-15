@@ -176,7 +176,7 @@ fn encode_variogram_params(
         VariogramType::Cubic => (3, 0.0),
         VariogramType::Stable => (4, variogram.shape().unwrap_or(1.0)),
         VariogramType::Matern => {
-            return Err("Matérn variogram is not supported on GPU; use CPU path".to_string())
+            return Err("Matérn variogram is not supported on GPU; use CPU path".to_string());
         }
     };
     Ok(VariogramGpuParams {
@@ -202,7 +202,7 @@ async fn read_buffer_f32(
             .map_err(|e| format!("failed to map GPU output: {e}"))
             .and_then(|download| {
                 let bytes: &[u8] = &download;
-                if bytes.len() % std::mem::size_of::<Real>() != 0 {
+                if !bytes.len().is_multiple_of(std::mem::size_of::<Real>()) {
                     return Err("mapped GPU output had invalid byte length".to_string());
                 }
                 Ok(bytemuck::cast_slice::<u8, Real>(bytes).to_vec())

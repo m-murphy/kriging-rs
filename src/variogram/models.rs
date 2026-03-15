@@ -1,5 +1,5 @@
-use crate::error::KrigingError;
 use crate::Real;
+use crate::error::KrigingError;
 
 /// Matérn semivariance: γ(h) = nugget + partial_sill * (1 - (2^(1-ν)/Γ(ν)) * x^ν * K_ν(x)) with x = h√(2ν)/range.
 fn matern_semivariance(d: Real, nugget: Real, partial_sill: Real, range: Real, nu: Real) -> Real {
@@ -14,7 +14,7 @@ fn matern_semivariance(d: Real, nugget: Real, partial_sill: Real, range: Real, n
     let (_i_nu, k_nu) = puruspe::bessel::Inu_Knu(nu_f64, x_f64);
     let gamma_nu = puruspe::gamma::gamma(nu_f64);
     let factor = (2.0_f64).powf(1.0 - nu_f64) / gamma_nu * x_f64.powf(nu_f64) * k_nu;
-    let correlation = factor.min(1.0).max(0.0);
+    let correlation = factor.clamp(0.0, 1.0);
     nugget + partial_sill * (1.0 - (correlation as Real))
 }
 
@@ -270,9 +270,7 @@ impl VariogramModel {
                     nugget + partial_sill * (1.5 * x - 0.5 * x.powi(3))
                 }
             }
-            Self::Exponential { .. } => {
-                nugget + partial_sill * (1.0 - (-3.0 * d / r).exp())
-            }
+            Self::Exponential { .. } => nugget + partial_sill * (1.0 - (-3.0 * d / r).exp()),
             Self::Gaussian { .. } => {
                 nugget + partial_sill * (1.0 - (-3.0 * (d * d) / (r * r)).exp())
             }
@@ -356,7 +354,10 @@ mod tests {
         let mut prev = nugget;
         for d in [1.0, 3.0, 5.0, 10.0, 20.0] {
             let g = stable.semivariance(d);
-            assert!(g >= prev && g <= sill, "stable semivariance should increase toward sill");
+            assert!(
+                g >= prev && g <= sill,
+                "stable semivariance should increase toward sill"
+            );
             prev = g;
         }
         assert_relative_eq!(stable.semivariance(100.0), sill, epsilon = 1e-4);

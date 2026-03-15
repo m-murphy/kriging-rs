@@ -9,9 +9,7 @@ use kriging_rs::{
 
 fn build_model(point_count: usize) -> OrdinaryKrigingModel {
     let coords = (0..point_count)
-        .map(|i| {
-            GeoCoord::try_new(35.0 + (i as Real) * 0.01, -120.0 + (i as Real) * 0.01).unwrap()
-        })
+        .map(|i| GeoCoord::try_new(35.0 + (i as Real) * 0.01, -120.0 + (i as Real) * 0.01).unwrap())
         .collect::<Vec<_>>();
     let values = (0..point_count)
         .map(|i| 10.0 + (i as Real) * 0.2)
@@ -31,11 +29,7 @@ fn build_observations(point_count: usize) -> Vec<BinomialObservation> {
             let trials = 100;
             let successes = (p.min(0.95) * trials as Real).round() as u32;
             BinomialObservation::new(
-                GeoCoord::try_new(
-                    35.0 + (i as Real) * 0.01,
-                    -120.0 + (i as Real) * 0.01,
-                )
-                .unwrap(),
+                GeoCoord::try_new(35.0 + (i as Real) * 0.01, -120.0 + (i as Real) * 0.01).unwrap(),
                 successes,
                 trials,
             )
@@ -46,9 +40,7 @@ fn build_observations(point_count: usize) -> Vec<BinomialObservation> {
 
 fn build_prediction_grid(count: usize, step: Real) -> Vec<GeoCoord> {
     (0..count)
-        .map(|i| {
-            GeoCoord::try_new(35.0 + (i as Real) * step, -120.0 + (i as Real) * step).unwrap()
-        })
+        .map(|i| GeoCoord::try_new(35.0 + (i as Real) * step, -120.0 + (i as Real) * step).unwrap())
         .collect::<Vec<_>>()
 }
 
@@ -60,10 +52,13 @@ fn run_ordinary_pipeline(
     variogram_type: VariogramType,
 ) {
     let dataset = GeoDataset::new(coords.to_vec(), values.to_vec()).expect("dataset");
-    let empirical = compute_empirical_variogram(&dataset, variogram_config).expect("empirical variogram");
+    let empirical =
+        compute_empirical_variogram(&dataset, variogram_config).expect("empirical variogram");
     let fit = fit_variogram(&empirical, variogram_type).expect("fit variogram");
     let model = OrdinaryKrigingModel::new(dataset, fit.model).expect("ordinary pipeline model");
-    let _ = model.predict_batch(prediction_coords).expect("ordinary predict");
+    let _ = model
+        .predict_batch(prediction_coords)
+        .expect("ordinary predict");
 }
 
 #[cfg(all(feature = "gpu-blocking", not(target_arch = "wasm32")))]
@@ -75,7 +70,8 @@ fn run_ordinary_pipeline_gpu(
     variogram_type: VariogramType,
 ) {
     let dataset = GeoDataset::new(coords.to_vec(), values.to_vec()).expect("dataset");
-    let empirical = compute_empirical_variogram(&dataset, variogram_config).expect("empirical variogram");
+    let empirical =
+        compute_empirical_variogram(&dataset, variogram_config).expect("empirical variogram");
     let fit = fit_variogram(&empirical, variogram_type).expect("fit variogram");
     let model = OrdinaryKrigingModel::new(dataset, fit.model).expect("ordinary pipeline model");
     let _ = model
@@ -100,7 +96,9 @@ fn run_binomial_pipeline(
     let fit = fit_variogram(&empirical, variogram_type).expect("fit variogram");
     let model = BinomialKrigingModel::new_with_prior(observations.to_vec(), fit.model, prior)
         .expect("binomial pipeline model");
-    let _ = model.predict_batch(prediction_coords).expect("binomial predict");
+    let _ = model
+        .predict_batch(prediction_coords)
+        .expect("binomial predict");
 }
 
 #[cfg(all(feature = "gpu-blocking", not(target_arch = "wasm32")))]
@@ -269,7 +267,8 @@ fn bench_quick_phase_profile(c: &mut Criterion) {
             .expect("empirical variogram");
         let fit = fit_variogram(&empirical, variogram_type).expect("fit");
         b.iter(|| {
-            let dataset = GeoDataset::new(coords_1000.clone(), values_1000.clone()).expect("dataset");
+            let dataset =
+                GeoDataset::new(coords_1000.clone(), values_1000.clone()).expect("dataset");
             let _ = OrdinaryKrigingModel::new(dataset, fit.model);
         })
     });

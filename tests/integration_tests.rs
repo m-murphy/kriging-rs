@@ -1,11 +1,13 @@
-use std::num::NonZeroUsize;
-use kriging_rs::variogram::empirical::{PositiveReal, VariogramConfig, compute_empirical_variogram};
+use kriging_rs::variogram::empirical::{
+    PositiveReal, VariogramConfig, compute_empirical_variogram,
+};
 use kriging_rs::variogram::fitting::fit_variogram;
 use kriging_rs::variogram::models::{VariogramModel, VariogramType};
 use kriging_rs::{
     BinomialKrigingModel, BinomialObservation, BinomialPrior, GeoCoord, GeoDataset,
     OrdinaryKrigingModel,
 };
+use std::num::NonZeroUsize;
 
 fn coord(lat: f32, lon: f32) -> GeoCoord {
     GeoCoord::try_new(lat, lon).unwrap()
@@ -41,7 +43,11 @@ fn ordinary_pipeline_with_variogram_fit_runs_end_to_end() {
     let values = vec![2.0, 3.0, 4.0];
     let predictions = vec![coord(0.75, 0.75)];
     let dataset = GeoDataset::new(coords, values).expect("dataset");
-    let model = fit_variogram_for_type(&dataset, &VariogramConfig::default(), VariogramType::Exponential);
+    let model = fit_variogram_for_type(
+        &dataset,
+        &VariogramConfig::default(),
+        VariogramType::Exponential,
+    );
     let ordinary = OrdinaryKrigingModel::new(dataset, model).expect("ordinary model should build");
     let out = ordinary
         .predict_batch(&predictions)
@@ -64,7 +70,11 @@ fn binomial_pipeline_with_variogram_fit_runs_end_to_end() {
         .map(BinomialObservation::smoothed_logit)
         .collect::<Vec<_>>();
     let dataset = GeoDataset::new(coords, logits).expect("dataset");
-    let model = fit_variogram_for_type(&dataset, &VariogramConfig::default(), VariogramType::Exponential);
+    let model = fit_variogram_for_type(
+        &dataset,
+        &VariogramConfig::default(),
+        VariogramType::Exponential,
+    );
     let binomial = BinomialKrigingModel::new(obs, model).expect("binomial model should build");
     let out = binomial
         .predict_batch(&[coord(0.5, 0.5)])
@@ -75,7 +85,12 @@ fn binomial_pipeline_with_variogram_fit_runs_end_to_end() {
 
 #[test]
 fn explicit_variogram_config_accepts_custom_settings() {
-    let coords = vec![coord(0.0, 0.0), coord(0.5, 0.5), coord(1.0, 1.0), coord(1.0, 0.0)];
+    let coords = vec![
+        coord(0.0, 0.0),
+        coord(0.5, 0.5),
+        coord(1.0, 1.0),
+        coord(1.0, 0.0),
+    ];
     let values = vec![2.0, 3.0, 4.0, 3.5];
     let predictions = vec![coord(0.75, 0.75)];
     let dataset = GeoDataset::new(coords, values).expect("dataset");
@@ -116,10 +131,11 @@ fn binomial_prior_changes_prevalence_with_fitted_model() {
         &VariogramConfig::default(),
         VariogramType::Exponential,
     );
-    let out_default = BinomialKrigingModel::new_with_prior(obs.clone(), default_model, default_prior)
-        .expect("default prior model")
-        .predict_batch(&pred_coord)
-        .expect("default prior prediction");
+    let out_default =
+        BinomialKrigingModel::new_with_prior(obs.clone(), default_model, default_prior)
+            .expect("default prior model")
+            .predict_batch(&pred_coord)
+            .expect("default prior prediction");
 
     let heavy_prior = BinomialPrior::new(5.0, 5.0).unwrap();
     let heavy_logits = obs

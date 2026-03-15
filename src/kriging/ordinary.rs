@@ -2,10 +2,10 @@ use nalgebra::{DMatrix, DVector, Dyn, linalg::LU};
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
-use crate::geo_dataset::GeoDataset;
 use crate::Real;
 use crate::distance::{GeoCoord, PreparedGeoCoord, haversine_distance_prepared, prepare_geo_coord};
 use crate::error::KrigingError;
+use crate::geo_dataset::GeoDataset;
 use crate::variogram::models::{VariogramModel, VariogramType};
 
 #[derive(Debug, Clone, Copy)]
@@ -42,10 +42,7 @@ impl Clone for OrdinaryKrigingModel {
 }
 
 impl OrdinaryKrigingModel {
-    pub fn new(
-        dataset: GeoDataset,
-        variogram: VariogramModel,
-    ) -> Result<Self, KrigingError> {
+    pub fn new(dataset: GeoDataset, variogram: VariogramModel) -> Result<Self, KrigingError> {
         let (coords, values) = dataset.into_parts();
         let prepared_coords = coords
             .iter()
@@ -83,13 +80,13 @@ impl OrdinaryKrigingModel {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let n = self.coords.len();
-            return coords
+            coords
                 .par_iter()
                 .map(|coord| {
                     let mut rhs = DVector::from_element(n + 1, 0.0);
                     self.predict_with_rhs(*coord, &mut rhs)
                 })
-                .collect();
+                .collect()
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -207,12 +204,8 @@ fn build_ordinary_system(coords: &[PreparedGeoCoord], variogram: VariogramModel)
     let scale = (n as Real).sqrt().max(1.0);
     let nugget_floor = (0.01_f32 * nugget).max(1e-10);
     let diag_eps = match variogram.variogram_type() {
-        VariogramType::Gaussian => {
-            (1e-5_f32 * sill * scale).max(nugget_floor)
-        }
-        VariogramType::Cubic => {
-            (1e-4_f32 * sill * scale).max(nugget_floor)
-        }
+        VariogramType::Gaussian => (1e-5_f32 * sill * scale).max(nugget_floor),
+        VariogramType::Cubic => (1e-4_f32 * sill * scale).max(nugget_floor),
         _ => 1e-10,
     };
     let mut m = DMatrix::from_element(n + 1, n + 1, 0.0);
@@ -246,8 +239,7 @@ mod tests {
             GeoCoord::try_new(1.0, 0.0).unwrap(),
         ];
         let values = vec![10.0, 20.0, 15.0];
-        let variogram =
-            VariogramModel::new(0.01, 5.0, 300.0, VariogramType::Exponential).unwrap();
+        let variogram = VariogramModel::new(0.01, 5.0, 300.0, VariogramType::Exponential).unwrap();
         let dataset = GeoDataset::new(coords.clone(), values).unwrap();
         let model = OrdinaryKrigingModel::new(dataset, variogram).expect("model");
         let pred = model.predict(coords[0]).expect("prediction");

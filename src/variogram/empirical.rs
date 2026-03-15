@@ -1,9 +1,9 @@
 use std::num::NonZeroUsize;
 
-use crate::geo_dataset::GeoDataset;
 use crate::Real;
 use crate::distance::haversine_distance;
 use crate::error::KrigingError;
+use crate::geo_dataset::GeoDataset;
 
 /// A positive real number (> 0), enforced at construction.
 #[derive(Debug, Clone, Copy, PartialEq)]

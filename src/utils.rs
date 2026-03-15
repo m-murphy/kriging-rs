@@ -18,7 +18,10 @@ impl Probability {
     /// For callers that have already ensured the value is in (0, 1) (e.g. from smoothed probability).
     #[inline]
     pub fn from_known_in_range(p: Real) -> Self {
-        debug_assert!(p.is_finite() && p > 0.0 && p < 1.0, "probability must be in (0, 1)");
+        debug_assert!(
+            p.is_finite() && p > 0.0 && p < 1.0,
+            "probability must be in (0, 1)"
+        );
         Self(p)
     }
 

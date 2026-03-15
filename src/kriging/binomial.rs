@@ -1,9 +1,9 @@
-use crate::geo_dataset::GeoDataset;
 use crate::Real;
 use crate::distance::GeoCoord;
 use crate::error::KrigingError;
+use crate::geo_dataset::GeoDataset;
 use crate::kriging::ordinary::OrdinaryKrigingModel;
-use crate::utils::{logistic, logit, Probability};
+use crate::utils::{Probability, logistic, logit};
 use crate::variogram::models::VariogramModel;
 
 #[derive(Debug, Clone, Copy)]
@@ -15,11 +15,7 @@ pub struct BinomialObservation {
 
 impl BinomialObservation {
     /// Creates an observation with validated `trials > 0` and `successes <= trials`.
-    pub fn new(
-        coord: GeoCoord,
-        successes: u32,
-        trials: u32,
-    ) -> Result<Self, KrigingError> {
+    pub fn new(coord: GeoCoord, successes: u32, trials: u32) -> Result<Self, KrigingError> {
         if trials == 0 {
             return Err(KrigingError::InvalidBinomialData(
                 "trials must be greater than 0".to_string(),

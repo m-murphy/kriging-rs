@@ -6,11 +6,7 @@ use kriging_rs::{GeoCoord, Real, VariogramModel, VariogramType};
 fn build_coords(count: usize, lat0: Real, lon0: Real, step: Real) -> Vec<GeoCoord> {
     (0..count)
         .map(|i| {
-            GeoCoord::try_new(
-                lat0 + (i as Real) * step,
-                lon0 + (i as Real) * step * 0.7,
-            )
-            .unwrap()
+            GeoCoord::try_new(lat0 + (i as Real) * step, lon0 + (i as Real) * step * 0.7).unwrap()
         })
         .collect()
 }

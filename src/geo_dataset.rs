@@ -1,6 +1,6 @@
+use crate::Real;
 use crate::distance::GeoCoord;
 use crate::error::KrigingError;
-use crate::Real;
 
 /// Coord–value pairs with matching length and at least two points, enforced at construction.
 #[derive(Debug, Clone)]
@@ -36,6 +36,11 @@ impl GeoDataset {
     #[inline]
     pub fn len(&self) -> usize {
         self.coords.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.coords.is_empty()
     }
 
     /// Consumes the dataset and returns coords and values.

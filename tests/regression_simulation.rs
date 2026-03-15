@@ -1,6 +1,5 @@
-use std::num::NonZeroUsize;
-use kriging_rs::variogram::empirical::{VariogramConfig, compute_empirical_variogram};
 use kriging_rs::GeoDataset;
+use kriging_rs::variogram::empirical::{VariogramConfig, compute_empirical_variogram};
 use kriging_rs::variogram::fitting::fit_variogram;
 use kriging_rs::variogram::models::VariogramType;
 use kriging_rs::{
@@ -8,6 +7,7 @@ use kriging_rs::{
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::num::NonZeroUsize;
 
 const SEEDS: [u64; 4] = [7, 17, 29, 53];
 const TRAIN_POINTS: usize = 36;
@@ -105,7 +105,8 @@ fn ordinary_pipeline_meets_regression_error_budget() {
             &VariogramConfig::default(),
             VariogramType::Exponential,
         );
-        let ordinary = OrdinaryKrigingModel::new(train_dataset, best_model).expect("ordinary model");
+        let ordinary =
+            OrdinaryKrigingModel::new(train_dataset, best_model).expect("ordinary model");
         let preds = ordinary
             .predict_batch(&test_coords)
             .expect("ordinary batch predict");
@@ -140,12 +141,7 @@ fn binomial_pipeline_meets_regression_error_budget() {
             .iter()
             .map(|point| {
                 let p = logistic(binomial_logit_field(point.x, point.y));
-                BinomialObservation::new(
-                    point.coord,
-                    binomial_draws(&mut rng, 40, p),
-                    40,
-                )
-                .unwrap()
+                BinomialObservation::new(point.coord, binomial_draws(&mut rng, 40, p), 40).unwrap()
             })
             .collect::<Vec<_>>();
         let test_coords: Vec<_> = test.iter().map(|p| p.coord).collect();
@@ -223,12 +219,7 @@ fn binomial_pipeline_350_point_accuracy_regression_budget() {
         .iter()
         .map(|point| {
             let p = logistic(binomial_logit_field(point.x, point.y));
-            BinomialObservation::new(
-                point.coord,
-                binomial_draws(&mut rng, 50, p),
-                50,
-            )
-            .unwrap()
+            BinomialObservation::new(point.coord, binomial_draws(&mut rng, 50, p), 50).unwrap()
         })
         .collect::<Vec<_>>();
     let test_coords: Vec<_> = test.iter().map(|p| p.coord).collect();
@@ -269,12 +260,7 @@ fn binomial_pipeline_matches_manual_pipeline_at_fixed_seed() {
         .iter()
         .map(|point| {
             let p = logistic(binomial_logit_field(point.x, point.y));
-            BinomialObservation::new(
-                point.coord,
-                binomial_draws(&mut rng, 40, p),
-                40,
-            )
-            .unwrap()
+            BinomialObservation::new(point.coord, binomial_draws(&mut rng, 40, p), 40).unwrap()
         })
         .collect::<Vec<_>>();
     let test_coords = test.iter().map(|p| p.coord).collect::<Vec<_>>();

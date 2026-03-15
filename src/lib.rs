@@ -11,7 +11,7 @@ pub mod kriging;
 pub mod matrix;
 pub mod utils;
 
-pub use utils::{logit, logit_clamped, clamp_probability, logistic, Probability};
+pub use utils::{Probability, clamp_probability, logistic, logit, logit_clamped};
 pub mod variogram;
 
 #[cfg(feature = "wasm")]

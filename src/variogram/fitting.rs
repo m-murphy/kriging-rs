@@ -130,7 +130,12 @@ mod tests {
         assert!(fit.residuals.is_finite());
         let (nugget, sill, range) = fit.model.params();
         assert!(nugget >= 0.0, "nugget {} should be non-negative", nugget);
-        assert!(sill > nugget, "sill {} should exceed nugget {}", sill, nugget);
+        assert!(
+            sill > nugget,
+            "sill {} should exceed nugget {}",
+            sill,
+            nugget
+        );
         assert!(range > 0.0, "range {} should be positive", range);
     }
 
