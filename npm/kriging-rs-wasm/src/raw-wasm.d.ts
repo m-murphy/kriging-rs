@@ -36,6 +36,21 @@ declare module "../pkg/kriging_rs.js" {
       beta: number
     ): unknown;
   };
-  export const fitOrdinaryVariogram: (...args: unknown[]) => unknown;
+  export const WasmVariogramType: {
+    readonly Spherical: number;
+    readonly Exponential: number;
+    readonly Gaussian: number;
+    readonly Cubic: number;
+    readonly Stable: number;
+    readonly Matern: number;
+  };
+  export const fitOrdinaryVariogram: (
+    sampleLats: Float64Array,
+    sampleLons: Float64Array,
+    values: Float64Array,
+    maxDistance: number | undefined,
+    nBins: number,
+    variogramType: number
+  ) => unknown;
   export const webgpuAvailable: (...args: unknown[]) => Promise<unknown>;
 }

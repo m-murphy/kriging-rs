@@ -3,6 +3,15 @@
   "version": "0.1.0",
   "description": "TypeScript-first WebAssembly bindings for kriging-rs",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/m-murphy/kriging-rs.git",
+    "directory": "npm/kriging-rs-wasm"
+  },
+  "homepage": "https://github.com/m-murphy/kriging-rs#readme",
+  "bugs": {
+    "url": "https://github.com/m-murphy/kriging-rs/issues"
+  },
   "type": "module",
   "sideEffects": false,
   "files": [
@@ -26,9 +35,19 @@
     "build": "npm run build:wasm && npm run build:ts",
     "typecheck:contracts": "tsc -p tsconfig.contracts.json --noEmit",
     "smoke": "node scripts/smoke.mjs",
-    "verify": "npm run typecheck:contracts && npm run build && npm run smoke"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src tests --max-warnings 0",
+    "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\" \"*.js\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\" \"*.js\"",
+    "verify": "npm run typecheck:contracts && npm run lint && npm run build && npm run smoke && npm test"
   },
   "devDependencies": {
-    "typescript": "^5.9.2"
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.0.3",
+    "prettier": "^3.8.1",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.57.0",
+    "vitest": "^2.1.0"
   }
 }

@@ -1,6 +1,6 @@
 #![cfg(feature = "wasm")]
 
-use js_sys::{Array, Float64Array, Object, Reflect};
+use js_sys::{Float64Array, Object, Reflect};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -9,40 +9,66 @@ use crate::distance::GeoCoord;
 use crate::gpu::detect_gpu_support;
 use crate::kriging::binomial::{BinomialKrigingModel, BinomialObservation, BinomialPrior};
 use crate::kriging::ordinary::OrdinaryKrigingModel;
-use crate::variogram::empirical::VariogramConfig;
+use std::num::NonZeroUsize;
+use crate::geo_dataset::GeoDataset;
+use crate::variogram::empirical::{PositiveReal, VariogramConfig};
 use crate::variogram::fitting::fit_variogram;
 use crate::variogram::models::{VariogramModel, VariogramType};
 use crate::{Real, compute_empirical_variogram};
+
+/// WASM-exposed variogram type enum; maps to crate's VariogramType.
+#[wasm_bindgen]
+pub enum WasmVariogramType {
+    Spherical,
+    Exponential,
+    Gaussian,
+    Cubic,
+    Stable,
+    Matern,
+}
+
+impl From<WasmVariogramType> for VariogramType {
+    fn from(w: WasmVariogramType) -> Self {
+        match w {
+            WasmVariogramType::Spherical => VariogramType::Spherical,
+            WasmVariogramType::Exponential => VariogramType::Exponential,
+            WasmVariogramType::Gaussian => VariogramType::Gaussian,
+            WasmVariogramType::Cubic => VariogramType::Cubic,
+            WasmVariogramType::Stable => VariogramType::Stable,
+            WasmVariogramType::Matern => VariogramType::Matern,
+        }
+    }
+}
 
 fn parse_variogram(
     variogram_type: &str,
     nugget: f64,
     sill: f64,
     range: f64,
+    shape: Option<f64>,
 ) -> Result<VariogramModel, JsValue> {
     let vt = match variogram_type.to_ascii_lowercase().as_str() {
         "spherical" => VariogramType::Spherical,
         "exponential" => VariogramType::Exponential,
         "gaussian" => VariogramType::Gaussian,
+        "cubic" => VariogramType::Cubic,
+        "stable" => VariogramType::Stable,
+        "matern" => VariogramType::Matern,
         _ => return Err(JsValue::from_str("unknown variogram_type")),
     };
-    Ok(match vt {
-        VariogramType::Spherical => VariogramModel::Spherical {
-            nugget: nugget as Real,
-            sill: sill as Real,
-            range: range as Real,
-        },
-        VariogramType::Exponential => VariogramModel::Exponential {
-            nugget: nugget as Real,
-            sill: sill as Real,
-            range: range as Real,
-        },
-        VariogramType::Gaussian => VariogramModel::Gaussian {
-            nugget: nugget as Real,
-            sill: sill as Real,
-            range: range as Real,
-        },
-    })
+    match (vt, shape) {
+        (VariogramType::Stable, Some(s)) | (VariogramType::Matern, Some(s)) => {
+            VariogramModel::new_with_shape(
+                nugget as Real,
+                sill as Real,
+                range as Real,
+                vt,
+                s as Real,
+            )
+            .map_err(err_to_js)
+        }
+        _ => VariogramModel::new(nugget as Real, sill as Real, range as Real, vt).map_err(err_to_js),
+    }
 }
 
 fn to_coords(lats: &[f64], lons: &[f64]) -> Result<Vec<GeoCoord>, JsValue> {
@@ -51,37 +77,15 @@ fn to_coords(lats: &[f64], lons: &[f64]) -> Result<Vec<GeoCoord>, JsValue> {
     }
     let mut out = Vec::with_capacity(lats.len());
     for i in 0..lats.len() {
-        out.push(GeoCoord {
-            lat: lats[i] as Real,
-            lon: lons[i] as Real,
-        });
+        out.push(
+            GeoCoord::try_new(lats[i] as Real, lons[i] as Real).map_err(err_to_js)?,
+        );
     }
     Ok(out)
 }
 
 fn err_to_js(err: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&err.to_string())
-}
-
-fn parse_variogram_types(variogram_types: &Array) -> Result<Vec<VariogramType>, JsValue> {
-    let mut out = Vec::with_capacity(variogram_types.length() as usize);
-    for value in variogram_types.iter() {
-        let text = value
-            .as_string()
-            .ok_or_else(|| JsValue::from_str("variogram type entries must be strings"))?;
-        let vt = match text.to_ascii_lowercase().as_str() {
-            "spherical" => VariogramType::Spherical,
-            "exponential" => VariogramType::Exponential,
-            "gaussian" => VariogramType::Gaussian,
-            _ => {
-                return Err(JsValue::from_str(
-                    "unknown variogram type in variogram_types",
-                ));
-            }
-        };
-        out.push(vt);
-    }
-    Ok(out)
 }
 
 fn build_observations(
@@ -95,14 +99,10 @@ fn build_observations(
     }
     let mut out = Vec::with_capacity(lats.len());
     for i in 0..lats.len() {
-        out.push(BinomialObservation {
-            coord: GeoCoord {
-                lat: lats[i] as Real,
-                lon: lons[i] as Real,
-            },
-            successes: successes[i],
-            trials: trials[i],
-        });
+        let coord = GeoCoord::try_new(lats[i] as Real, lons[i] as Real).map_err(err_to_js)?;
+        out.push(
+            BinomialObservation::new(coord, successes[i], trials[i]).map_err(err_to_js)?,
+        );
     }
     Ok(out)
 }
@@ -120,6 +120,8 @@ struct JsFittedVariogram {
     nugget: f64,
     sill: f64,
     range: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shape: Option<f64>,
     residuals: f64,
 }
 
@@ -135,6 +137,9 @@ fn variogram_type_name(variogram_type: VariogramType) -> &'static str {
         VariogramType::Spherical => "spherical",
         VariogramType::Exponential => "exponential",
         VariogramType::Gaussian => "gaussian",
+        VariogramType::Cubic => "cubic",
+        VariogramType::Stable => "stable",
+        VariogramType::Matern => "matern",
     }
 }
 
@@ -203,22 +208,19 @@ impl WasmOrdinaryKriging {
         nugget: f64,
         sill: f64,
         range: f64,
+        shape: Option<f64>,
     ) -> Result<WasmOrdinaryKriging, JsValue> {
         let coords = to_coords(lats, lons)?;
-        let model = parse_variogram(&variogram_type, nugget, sill, range)?;
+        let model = parse_variogram(&variogram_type, nugget, sill, range, shape)?;
         let values_real = values.iter().map(|v| *v as Real).collect::<Vec<_>>();
-        let inner = OrdinaryKrigingModel::new(coords, values_real, model).map_err(err_to_js)?;
+        let dataset = GeoDataset::new(coords, values_real).map_err(err_to_js)?;
+        let inner = OrdinaryKrigingModel::new(dataset, model).map_err(err_to_js)?;
         Ok(Self { inner })
     }
 
     pub fn predict(&self, lat: f64, lon: f64) -> Result<JsValue, JsValue> {
-        let pred = self
-            .inner
-            .predict(GeoCoord {
-                lat: lat as Real,
-                lon: lon as Real,
-            })
-            .map_err(err_to_js)?;
+        let coord = GeoCoord::try_new(lat as Real, lon as Real).map_err(err_to_js)?;
+        let pred = self.inner.predict(coord).map_err(err_to_js)?;
         serde_wasm_bindgen::to_value(&JsPrediction {
             value: pred.value as f64,
             variance: pred.variance as f64,
@@ -276,9 +278,10 @@ impl WasmBinomialKriging {
         nugget: f64,
         sill: f64,
         range: f64,
+        shape: Option<f64>,
     ) -> Result<WasmBinomialKriging, JsValue> {
         let observations = build_observations(lats, lons, successes, trials)?;
-        let model = parse_variogram(&variogram_type, nugget, sill, range)?;
+        let model = parse_variogram(&variogram_type, nugget, sill, range, shape)?;
         let inner = BinomialKrigingModel::new(observations, model).map_err(err_to_js)?;
         Ok(Self { inner })
     }
@@ -293,28 +296,21 @@ impl WasmBinomialKriging {
         nugget: f64,
         sill: f64,
         range: f64,
+        shape: Option<f64>,
         alpha: f64,
         beta: f64,
     ) -> Result<WasmBinomialKriging, JsValue> {
         let observations = build_observations(lats, lons, successes, trials)?;
-        let model = parse_variogram(&variogram_type, nugget, sill, range)?;
-        let prior = BinomialPrior {
-            alpha: alpha as Real,
-            beta: beta as Real,
-        };
+        let model = parse_variogram(&variogram_type, nugget, sill, range, shape)?;
+        let prior = BinomialPrior::new(alpha as Real, beta as Real).map_err(err_to_js)?;
         let inner =
             BinomialKrigingModel::new_with_prior(observations, model, prior).map_err(err_to_js)?;
         Ok(Self { inner })
     }
 
     pub fn predict(&self, lat: f64, lon: f64) -> Result<JsValue, JsValue> {
-        let pred = self
-            .inner
-            .predict(GeoCoord {
-                lat: lat as Real,
-                lon: lon as Real,
-            })
-            .map_err(err_to_js)?;
+        let coord = GeoCoord::try_new(lat as Real, lon as Real).map_err(err_to_js)?;
+        let pred = self.inner.predict(coord).map_err(err_to_js)?;
         serde_wasm_bindgen::to_value(&JsBinomialPrediction {
             prevalence: pred.prevalence as f64,
             logit_value: pred.logit_value as f64,
@@ -365,38 +361,35 @@ pub fn wasm_fit_ordinary_variogram(
     values: &[f64],
     max_distance: Option<f64>,
     n_bins: usize,
-    variogram_types: Array,
+    variogram_type: WasmVariogramType,
 ) -> Result<JsValue, JsValue> {
     let sample_coords = to_coords(sample_lats, sample_lons)?;
+    let n_bins = NonZeroUsize::new(n_bins)
+        .ok_or_else(|| JsValue::from_str("n_bins must be at least 1"))?;
+    let max_distance = match max_distance {
+        Some(v) if v > 0.0 && v.is_finite() => {
+            Some(PositiveReal::try_new(v as Real).map_err(err_to_js)?)
+        }
+        Some(_) => return Err(JsValue::from_str("max_distance must be finite and positive")),
+        None => None,
+    };
     let config = VariogramConfig {
-        max_distance: max_distance.map(|v| v as Real),
+        max_distance,
         n_bins,
     };
     let values_real = values.iter().map(|v| *v as Real).collect::<Vec<_>>();
-    let empirical =
-        compute_empirical_variogram(&sample_coords, &values_real, &config).map_err(err_to_js)?;
-    let types = parse_variogram_types(&variogram_types)?;
-    let mut types_iter = types.iter().copied();
-    let first = types_iter
-        .next()
-        .ok_or_else(|| JsValue::from_str("at least one variogram type must be provided"))?;
-
-    let mut best = fit_variogram(&empirical, first).map_err(err_to_js)?;
-    let mut best_type = first;
-    for variogram_type in types_iter {
-        let candidate = fit_variogram(&empirical, variogram_type).map_err(err_to_js)?;
-        if candidate.residuals < best.residuals {
-            best = candidate;
-            best_type = variogram_type;
-        }
-    }
-    let (nugget, sill, range) = best.model.params();
+    let dataset = GeoDataset::new(sample_coords, values_real).map_err(err_to_js)?;
+    let empirical = compute_empirical_variogram(&dataset, &config).map_err(err_to_js)?;
+    let crate_type = VariogramType::from(variogram_type);
+    let fit = fit_variogram(&empirical, crate_type).map_err(err_to_js)?;
+    let (nugget, sill, range) = fit.model.params();
     serde_wasm_bindgen::to_value(&JsFittedVariogram {
-        variogram_type: variogram_type_name(best_type).to_string(),
+        variogram_type: variogram_type_name(crate_type).to_string(),
         nugget: nugget as f64,
         sill: sill as f64,
         range: range as f64,
-        residuals: best.residuals as f64,
+        shape: fit.model.shape().map(|s| s as f64),
+        residuals: fit.residuals as f64,
     })
     .map_err(err_to_js)
 }

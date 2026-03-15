@@ -13,7 +13,7 @@ const fit = kriging.fitOrdinaryVariogram(
   sampleValues,
   undefined,
   12,
-  ["spherical", "exponential", "gaussian"]
+  kriging.VariogramType.Exponential
 );
 const model = new kriging.OrdinaryKriging(
   sampleLats,
