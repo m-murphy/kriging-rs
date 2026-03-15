@@ -61,6 +61,8 @@ Browser demo: [www/README.md](www/README.md).
 
 ## Development
 
+Install [pre-commit](https://pre-commit.com/) and run `pre-commit install` so fmt and clippy run before each commit and match CI.
+
 ```bash
 cargo test
 cargo fmt

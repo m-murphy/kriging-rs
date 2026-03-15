@@ -1,5 +1,3 @@
-#![cfg(feature = "wasm")]
-
 use js_sys::{Float64Array, Object, Reflect};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
