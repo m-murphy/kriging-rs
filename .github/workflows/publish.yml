@@ -1,0 +1,78 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write  # Required for npm trusted publishing (OIDC)
+
+jobs:
+  validate-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Get version from tag
+        id: version
+        run: |
+          ref="${{ github.ref }}"
+          if [[ "$ref" =~ ^refs/tags/v(.+)$ ]]; then
+            echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Tag ref must match v* (e.g. v0.1.0), got $ref"
+            exit 1
+          fi
+      - name: Check Cargo.toml version
+        run: |
+          want="${{ steps.version.outputs.version }}"
+          got=$(grep '^version = ' Cargo.toml | sed -n 's/^version = "\(.*\)"$/\1/p')
+          if [[ "$got" != "$want" ]]; then
+            echo "::error::Cargo.toml version is $got, tag is $want"
+            exit 1
+          fi
+      - name: Check package.json version
+        run: |
+          want="${{ steps.version.outputs.version }}"
+          got=$(jq -r '.version' npm/kriging-rs-wasm/package.json)
+          if [[ "$got" != "$want" ]]; then
+            echo "::error::npm/kriging-rs-wasm/package.json version is $got, tag is $want"
+            exit 1
+          fi
+
+  publish-crate:
+    needs: validate-versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tests
+        run: cargo test --all-features
+      - name: Publish to crates.io
+        run: cargo publish --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+
+  publish-npm:
+    needs: validate-versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"  # 22.14+ required for npm trusted publishing
+          cache: npm
+          cache-dependency-path: npm/kriging-rs-wasm/package-lock.json
+          registry-url: "https://registry.npmjs.org"
+      - uses: jetli/wasm-pack-action@v0.4.0
+      - name: Install and publish npm package
+        working-directory: npm/kriging-rs-wasm
+        run: npm ci && npm publish
+        env:
+          # Initial publish: set NPM_TOKEN secret so first run creates the package. After adding trusted publisher (package Settings on npmjs.com), remove the secret; OIDC will be used.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
