@@ -44,3 +44,6 @@ jobs:
       - name: Verify TypeScript WASM package
         working-directory: npm/kriging-rs-wasm
         run: npm ci && npm run verify
+      - name: Dry-run npm publish
+        working-directory: npm/kriging-rs-wasm
+        run: npm publish --dry-run
