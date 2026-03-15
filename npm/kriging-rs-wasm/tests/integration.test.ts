@@ -8,7 +8,7 @@ import {
   KrigingError,
   OrdinaryKriging,
   BinomialKriging,
-  fitOrdinaryVariogram,
+  fitVariogram,
   VariogramType,
   type OrdinaryPrediction,
   type BinomialPrediction,
@@ -37,15 +37,14 @@ describe("Ordinary kriging", () => {
   const sill = 1.5;
   const range = 5.0;
 
-  test("fitOrdinaryVariogram returns valid FittedVariogram", () => {
-    const fit = fitOrdinaryVariogram(
-      lats,
-      lons,
+  test("fitVariogram returns valid FittedVariogram (enum)", () => {
+    const fit = fitVariogram({
+      sampleLats: lats,
+      sampleLons: lons,
       values,
-      undefined,
-      12,
-      VariogramType.Exponential
-    );
+      variogramType: VariogramType.Exponential,
+      nBins: 12,
+    });
     expect(fit).toMatchObject({
       variogramType: "exponential",
       nugget: expect.any(Number),
@@ -53,6 +52,19 @@ describe("Ordinary kriging", () => {
       range: expect.any(Number),
       residuals: expect.any(Number),
     });
+    expect(fit.nugget).toBeGreaterThanOrEqual(0);
+    expect(fit.sill).toBeGreaterThanOrEqual(0);
+    expect(fit.range).toBeGreaterThanOrEqual(0);
+  });
+
+  test("fitVariogram accepts string variogramType", () => {
+    const fit = fitVariogram({
+      sampleLats: lats,
+      sampleLons: lons,
+      values,
+      variogramType: "gaussian",
+    });
+    expect(fit.variogramType).toBe("gaussian");
     expect(fit.nugget).toBeGreaterThanOrEqual(0);
     expect(fit.sill).toBeGreaterThanOrEqual(0);
     expect(fit.range).toBeGreaterThanOrEqual(0);
@@ -114,15 +126,14 @@ describe("Ordinary kriging", () => {
     model.free();
   });
 
-  test("model from fitOrdinaryVariogram produces consistent predictions", () => {
-    const fit = fitOrdinaryVariogram(
-      lats,
-      lons,
+  test("model from fitVariogram produces consistent predictions", () => {
+    const fit = fitVariogram({
+      sampleLats: lats,
+      sampleLons: lons,
       values,
-      undefined,
-      12,
-      VariogramType.Gaussian
-    );
+      variogramType: VariogramType.Gaussian,
+      nBins: 12,
+    });
     const model = new OrdinaryKriging({
       lats,
       lons,
@@ -134,6 +145,26 @@ describe("Ordinary kriging", () => {
         range: fit.range,
         shape: fit.shape,
       },
+    });
+    const pred = model.predict(0.5, 0.5);
+    expect(Number.isFinite(pred.value)).toBe(true);
+    expect(pred.variance).toBeGreaterThanOrEqual(0);
+    model.free();
+  });
+
+  test("OrdinaryKriging.fromFitted produces same predictions as constructor with fitted variogram", () => {
+    const fit = fitVariogram({
+      sampleLats: lats,
+      sampleLons: lons,
+      values,
+      variogramType: VariogramType.Gaussian,
+      nBins: 12,
+    });
+    const model = OrdinaryKriging.fromFitted({
+      lats,
+      lons,
+      values,
+      fittedVariogram: fit,
     });
     const pred = model.predict(0.5, 0.5);
     expect(Number.isFinite(pred.value)).toBe(true);
@@ -224,19 +255,62 @@ describe("Binomial kriging", () => {
     expect(pred.prevalence).toBeLessThanOrEqual(1);
     model.free();
   });
+
+  test("BinomialKriging.fromFittedVariogram produces valid predictions", () => {
+    const fit = fitVariogram({
+      sampleLats: lats,
+      sampleLons: lons,
+      values: lats.map((_, i) => successes[i] / trials[i]),
+      variogramType: "exponential",
+      nBins: 12,
+    });
+    const model = BinomialKriging.fromFittedVariogram({
+      lats,
+      lons,
+      successes,
+      trials,
+      fittedVariogram: fit,
+    });
+    const pred = model.predict(0.5, 0.5);
+    expect(Number.isFinite(pred.prevalence)).toBe(true);
+    expect(pred.prevalence).toBeGreaterThanOrEqual(0);
+    expect(pred.prevalence).toBeLessThanOrEqual(1);
+    model.free();
+  });
+
+  test("BinomialKriging.fromFittedVariogramWithPrior produces valid predictions", () => {
+    const fit = fitVariogram({
+      sampleLats: lats,
+      sampleLons: lons,
+      values: lats.map((_, i) => successes[i] / trials[i]),
+      variogramType: "exponential",
+      nBins: 12,
+    });
+    const model = BinomialKriging.fromFittedVariogramWithPrior({
+      lats,
+      lons,
+      successes,
+      trials,
+      fittedVariogram: fit,
+      prior: { alpha: 1, beta: 1 },
+    });
+    const pred = model.predict(0.5, 0.5);
+    expect(Number.isFinite(pred.prevalence)).toBe(true);
+    expect(pred.prevalence).toBeGreaterThanOrEqual(0);
+    expect(pred.prevalence).toBeLessThanOrEqual(1);
+    model.free();
+  });
 });
 
 describe("Error handling", () => {
-  test("fitOrdinaryVariogram with mismatched array lengths throws KrigingError", () => {
+  test("fitVariogram with mismatched array lengths throws KrigingError", () => {
     expect(() =>
-      fitOrdinaryVariogram(
-        [0, 1],
-        [0, 1, 2],
-        [1, 2, 3],
-        undefined,
-        12,
-        VariogramType.Gaussian
-      )
+      fitVariogram({
+        sampleLats: [0, 1],
+        sampleLons: [0, 1, 2],
+        values: [1, 2, 3],
+        variogramType: VariogramType.Gaussian,
+      })
     ).toThrow(KrigingError);
   });
 

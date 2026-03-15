@@ -13,7 +13,7 @@
     "url": "https://github.com/m-murphy/kriging-rs/issues"
   },
   "type": "module",
-  "sideEffects": false,
+  "sideEffects": true,
   "files": [
     "dist",
     "pkg",

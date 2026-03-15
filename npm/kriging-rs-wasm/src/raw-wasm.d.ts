@@ -16,7 +16,7 @@ declare module "../pkg/kriging_rs.js" {
     readonly Stable: number;
     readonly Matern: number;
   };
-  export const fitOrdinaryVariogram: (
+  export const fitVariogram: (
     sampleLats: Float64Array,
     sampleLons: Float64Array,
     values: Float64Array,

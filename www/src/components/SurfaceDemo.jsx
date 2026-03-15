@@ -3,7 +3,7 @@ import {
   OrdinaryKriging,
   BinomialKriging,
   VariogramType,
-  fitOrdinaryVariogram,
+  fitVariogram,
 } from "kriging-rs-wasm";
 import {
   generateSurfaceSamples,
@@ -82,30 +82,23 @@ async function runOrdinaryPerformanceHarness(options, backendSelection, webgpuAv
     const dataPrepMs = t1 - t0;
 
     t0 = performance.now();
-    const fitted = fitOrdinaryVariogram(
+    const fitted = fitVariogram({
       sampleLats,
       sampleLons,
-      sampleValues,
-      options.maxDistance,
-      options.nBins,
-      options.variogramType,
-    );
-    const variogramType = fitted.variogramType;
+      values: sampleValues,
+      variogramType: options.variogramType,
+      maxDistance: options.maxDistance,
+      nBins: options.nBins,
+    });
     t1 = performance.now();
     const variogramFitMs = t1 - t0;
 
     t0 = performance.now();
-    const model = new OrdinaryKriging({
+    const model = OrdinaryKriging.fromFitted({
       lats: sampleLats,
       lons: sampleLons,
       values: sampleValues,
-      variogram: {
-        variogramType,
-        nugget: fitted.nugget,
-        sill: fitted.sill,
-        range: fitted.range,
-        shape: fitted.shape,
-      },
+      fittedVariogram: fitted,
     });
     t1 = performance.now();
     const modelBuildMs = t1 - t0;
@@ -239,27 +232,20 @@ export default function SurfaceDemo({ uploadedData, onError, webgpuStatus }) {
           options.alpha,
           options.beta,
         );
-        const fitted = fitOrdinaryVariogram(
+        const fitted = fitVariogram({
           sampleLats,
           sampleLons,
-          sampleLogits,
-          options.maxDistance,
-          options.nBins,
-          options.variogramType,
-        );
-        const vt = fitted.variogramType;
-        const model = BinomialKriging.newWithPrior({
+          values: sampleLogits,
+          variogramType: options.variogramType,
+          maxDistance: options.maxDistance,
+          nBins: options.nBins,
+        });
+        const model = BinomialKriging.fromFittedVariogramWithPrior({
           lats: sampleLats,
           lons: sampleLons,
           successes: sampleSuccesses,
           trials: sampleTrials,
-          variogram: {
-            variogramType: vt,
-            nugget: fitted.nugget,
-            sill: fitted.sill,
-            range: fitted.range,
-            shape: fitted.shape,
-          },
+          fittedVariogram: fitted,
           prior: { alpha: options.alpha, beta: options.beta },
         });
         predictions = backendResolved.useGpu
@@ -275,26 +261,19 @@ export default function SurfaceDemo({ uploadedData, onError, webgpuStatus }) {
         const sampleLats = Float64Array.from(sample.lats);
         const sampleLons = Float64Array.from(sample.lons);
         const sampleValues = Float64Array.from(sample.values);
-        const fitted = fitOrdinaryVariogram(
+        const fitted = fitVariogram({
           sampleLats,
           sampleLons,
-          sampleValues,
-          options.maxDistance,
-          options.nBins,
-          options.variogramType,
-        );
-        const vt = fitted.variogramType;
-        const model = new OrdinaryKriging({
+          values: sampleValues,
+          variogramType: options.variogramType,
+          maxDistance: options.maxDistance,
+          nBins: options.nBins,
+        });
+        const model = OrdinaryKriging.fromFitted({
           lats: sampleLats,
           lons: sampleLons,
           values: sampleValues,
-          variogram: {
-            variogramType: vt,
-            nugget: fitted.nugget,
-            sill: fitted.sill,
-            range: fitted.range,
-            shape: fitted.shape,
-          },
+          fittedVariogram: fitted,
         });
         predictions = backendResolved.useGpu
           ? await model.predictBatchGpu(grid.predLats, grid.predLons)

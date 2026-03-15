@@ -3,7 +3,7 @@ import {
   OrdinaryKriging,
   BinomialKriging,
   VariogramType,
-  fitOrdinaryVariogram,
+  fitVariogram,
 } from "kriging-rs-wasm";
 import { buildBinomialLogits } from "../lib/sampleData";
 
@@ -78,25 +78,19 @@ export default function QuickDemos({ onError }) {
       const predLats = [0.75, 0.25];
       const predLons = [0.75, 0.25];
 
-      const ordinaryFit = fitOrdinaryVariogram(
+      const ordinaryFit = fitVariogram({
         sampleLats,
         sampleLons,
         values,
+        variogramType,
         maxDistance,
         nBins,
-        variogramType,
-      );
-      const ordinaryModel = new OrdinaryKriging({
+      });
+      const ordinaryModel = OrdinaryKriging.fromFitted({
         lats: sampleLats,
         lons: sampleLons,
         values,
-        variogram: {
-          variogramType: ordinaryFit.variogramType,
-          nugget: ordinaryFit.nugget,
-          sill: ordinaryFit.sill,
-          range: ordinaryFit.range,
-          shape: ordinaryFit.shape,
-        },
+        fittedVariogram: ordinaryFit,
       });
       const ordinaryOut = ordinaryModel.predictBatch(predLats, predLons);
       ordinaryModel.free();
@@ -109,26 +103,20 @@ export default function QuickDemos({ onError }) {
         alpha,
         beta,
       );
-      const binomialFit = fitOrdinaryVariogram(
+      const binomialFit = fitVariogram({
         sampleLats,
         sampleLons,
-        sampleLogits,
+        values: sampleLogits,
+        variogramType,
         maxDistance,
         nBins,
-        variogramType,
-      );
-      const binomialModel = BinomialKriging.newWithPrior({
+      });
+      const binomialModel = BinomialKriging.fromFittedVariogramWithPrior({
         lats: sampleLats,
         lons: sampleLons,
         successes: sampleSuccesses,
         trials: sampleTrials,
-        variogram: {
-          variogramType: binomialFit.variogramType,
-          nugget: binomialFit.nugget,
-          sill: binomialFit.sill,
-          range: binomialFit.range,
-          shape: binomialFit.shape,
-        },
+        fittedVariogram: binomialFit,
         prior: { alpha, beta },
       });
       const binomialOut = binomialModel.predictBatch(predLats, predLons);

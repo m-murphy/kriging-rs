@@ -401,7 +401,7 @@ impl WasmBinomialKriging {
     }
 }
 
-#[wasm_bindgen(js_name = fitOrdinaryVariogram)]
+#[wasm_bindgen(js_name = fitVariogram)]
 pub fn wasm_fit_ordinary_variogram(
     sample_lats: &[f64],
     sample_lons: &[f64],

@@ -7,14 +7,13 @@ await kriging.init(wasmBytes);
 const sampleLats = [0.0, 0.0, 1.0];
 const sampleLons = [0.0, 1.0, 0.0];
 const sampleValues = [1.0, 2.0, 1.5];
-const fit = kriging.fitOrdinaryVariogram(
-  sampleLats,
-  sampleLons,
-  sampleValues,
-  undefined,
-  12,
-  kriging.VariogramType.Exponential
-);
+const fit = kriging.fitVariogram({
+  sampleLats: sampleLats,
+  sampleLons: sampleLons,
+  values: sampleValues,
+  variogramType: "exponential",
+  nBins: 12,
+});
 const model = new kriging.OrdinaryKriging({
   lats: sampleLats,
   lons: sampleLons,

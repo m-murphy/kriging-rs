@@ -62,7 +62,7 @@ npm run verify
 - TS contract typechecks (`tsc --noEmit`)
 - WASM package generation (`wasm-pack`)
 - TS facade compilation
-- runtime smoke test (`import + init + fitOrdinaryVariogram + predictBatch`)
+- runtime smoke test (`import + init + fitVariogram + predictBatch`)
 
 ## Simple web app demo
 
@@ -105,7 +105,7 @@ Run `cargo bench` for current numbers; see `bench-results/README.md` for logging
 
 ## WASM batch and typed-array APIs
 
-For large prediction batches and typed-array usage (`predictBatchArrays`, `fitOrdinaryVariogram`, `VariogramType`), see the [npm package README](npm/kriging-rs-wasm/README.md).
+For large prediction batches and typed-array usage (`predictBatchArrays`, `fitVariogram`, `VariogramType`), see the [npm package README](npm/kriging-rs-wasm/README.md).
 
 ## License
 

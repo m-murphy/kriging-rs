@@ -5,7 +5,8 @@
 import * as kriging from "../dist/index.js";
 
 try {
-  kriging.fitOrdinaryVariogram([0], [0], [1], undefined, 1, 2);
+  // variogramType: 2 is an arbitrary enum value; only used to trigger the "module not loaded" path
+  kriging.fitVariogram({ sampleLats: [0], sampleLons: [0], values: [1], variogramType: 2 });
   process.exit(1);
 } catch (err) {
   const msg = err?.message ?? String(err);

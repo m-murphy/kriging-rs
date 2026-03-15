@@ -11,7 +11,7 @@ const wasm = await import(pkgPath);
 const {
   WasmOrdinaryKriging,
   WasmVariogramType,
-  fitOrdinaryVariogram,
+  fitVariogram,
 } = wasm;
 
 function mulberry32(seed) {
@@ -114,7 +114,7 @@ function profileWasm(rounds = 10, warmup = 3) {
     const measured = run >= warmup;
 
     let t0 = performance.now();
-    const fitted = fitOrdinaryVariogram(
+    const fitted = fitVariogram(
       sample.lats,
       sample.lons,
       sample.values,
@@ -153,7 +153,7 @@ function profileWasm(rounds = 10, warmup = 3) {
     model.free();
 
     t0 = performance.now();
-    const pipelineFit = fitOrdinaryVariogram(
+    const pipelineFit = fitVariogram(
       sample.lats,
       sample.lons,
       sample.values,

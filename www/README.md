@@ -51,7 +51,7 @@ The demo imports only the **kriging-rs-wasm** package (no raw WASM in `www`). It
 
 - `init()` and `webgpuAvailable()` for one-time setup
 - `OrdinaryKriging` and `BinomialKriging` for models
-- `fitOrdinaryVariogram` for variogram fitting
+- `fitVariogram` for variogram fitting
 - `VariogramType` for the variogram enum
 
 ## Features

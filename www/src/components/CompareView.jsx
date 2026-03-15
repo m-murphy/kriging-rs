@@ -2,7 +2,7 @@ import { useState, useRef } from "react";
 import {
   OrdinaryKriging,
   VariogramType,
-  fitOrdinaryVariogram,
+  fitVariogram,
 } from "kriging-rs-wasm";
 import { generateSurfaceSamples, buildPredictionGrid, resolveBackendMode } from "../lib/sampleData";
 import { renderSurface } from "../lib/canvas";
@@ -43,26 +43,18 @@ export default function CompareView({ onError, webgpuAvailable = false }) {
 
     try {
       const runOne = async (variogramModelName) => {
-        const variogramType = VariogramType[variogramModelName];
-        const fitted = fitOrdinaryVariogram(
+        const fitted = fitVariogram({
           sampleLats,
           sampleLons,
-          sampleValues,
-          undefined,
+          values: sampleValues,
+          variogramType: VariogramType[variogramModelName],
           nBins,
-          variogramType,
-        );
-        const model = new OrdinaryKriging({
+        });
+        const model = OrdinaryKriging.fromFitted({
           lats: sampleLats,
           lons: sampleLons,
           values: sampleValues,
-          variogram: {
-            variogramType: fitted.variogramType,
-            nugget: fitted.nugget,
-            sill: fitted.sill,
-            range: fitted.range,
-            shape: fitted.shape,
-          },
+          fittedVariogram: fitted,
         });
         const predictions = backend.useGpu
           ? await model.predictBatchGpu(grid.predLats, grid.predLons)

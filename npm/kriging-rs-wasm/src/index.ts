@@ -1,4 +1,14 @@
 /**
+ * TypeScript-first WebAssembly bindings for kriging-rs: ordinary kriging (continuous values)
+ * and binomial kriging (prevalence from count data), with optional WebGPU batch prediction.
+ * Call and await {@link init} once before using any other API. Use {@link OrdinaryKriging}
+ * for spatial interpolation of continuous measurements; use {@link BinomialKriging} for
+ * proportion/prevalence surfaces from success/trial counts.
+ *
+ * @module
+ */
+
+/**
  * Supported variogram model type names (string form, e.g. in {@link FittedVariogram}).
  */
 export type VariogramTypeName =
@@ -16,6 +26,7 @@ export type NumericArrayInput = number[] | ArrayLike<number>;
 
 /**
  * Input type for integer counts (e.g. successes, trials); accepts plain arrays or typed arrays.
+ * Values represent counts and should be non-negative integers (semantic only; no runtime check).
  */
 export type IntegerArrayInput = number[] | ArrayLike<number>;
 
@@ -61,7 +72,7 @@ export interface BinomialBatchArrayOutput {
 }
 
 /**
- * Fitted variogram parameters from {@link fitOrdinaryVariogram}.
+ * Fitted variogram parameters from {@link fitVariogram}.
  * Use these to construct an {@link OrdinaryKriging} model.
  */
 export interface FittedVariogram {
@@ -72,6 +83,25 @@ export interface FittedVariogram {
   /** Shape parameter (alpha for stable, nu for matern); present only for stable/matern. */
   shape?: number;
   residuals: number;
+}
+
+/**
+ * Options for {@link fitVariogram}. Pass a single object with sample data and
+ * variogram model type; optional settings control binning for the empirical variogram.
+ */
+export interface FitVariogramOptions {
+  /** Sample latitudes in degrees. */
+  sampleLats: NumericArrayInput;
+  /** Sample longitudes in degrees. */
+  sampleLons: NumericArrayInput;
+  /** Sample values (same length as sampleLats/sampleLons). */
+  values: NumericArrayInput;
+  /** Variogram model type: string (e.g. `"exponential"`) or {@link VariogramType} enum value. */
+  variogramType: VariogramTypeName | number;
+  /** Optional maximum distance for binning; omit for automatic choice. */
+  maxDistance?: number;
+  /** Number of distance bins for the empirical variogram (default 12). */
+  nBins?: number;
 }
 
 /**
@@ -127,6 +157,42 @@ export interface BinomialKrigingWithPriorOptions {
   successes: IntegerArrayInput;
   trials: IntegerArrayInput;
   variogram: VariogramParams;
+  prior: BinomialPriorParams;
+}
+
+/**
+ * Options for {@link OrdinaryKriging.fromFitted}: sample data plus a fitted variogram
+ * (e.g. from {@link fitVariogram}) to build the model without manually spreading variogram fields.
+ */
+export interface OrdinaryKrigingFromFittedOptions {
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  values: NumericArrayInput;
+  fittedVariogram: FittedVariogram;
+}
+
+/**
+ * Options for {@link BinomialKriging.fromFittedVariogram}: count data plus a fitted variogram
+ * (e.g. from fitting on logits or reusing ordinary-fit params) to build the model.
+ */
+export interface BinomialKrigingFromFittedVariogramOptions {
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  successes: IntegerArrayInput;
+  trials: IntegerArrayInput;
+  fittedVariogram: FittedVariogram;
+}
+
+/**
+ * Options for {@link BinomialKriging.fromFittedVariogramWithPrior}: count data, fitted variogram,
+ * and Beta prior to build a binomial kriging model with a prior.
+ */
+export interface BinomialKrigingFromFittedVariogramWithPriorOptions {
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  successes: IntegerArrayInput;
+  trials: IntegerArrayInput;
+  fittedVariogram: FittedVariogram;
   prior: BinomialPriorParams;
 }
 
@@ -197,7 +263,7 @@ type RawModule = {
     readonly Stable: number;
     readonly Matern: number;
   };
-  fitOrdinaryVariogram: (
+  fitVariogram: (
     sampleLats: Float64Array,
     sampleLons: Float64Array,
     values: Float64Array,
@@ -231,7 +297,12 @@ function requireLoadedModule(): RawModule {
   return rawModuleLoaded;
 }
 
-/** Variogram type enum (use e.g. VariogramType.Exponential). Available after {@link init}. */
+/**
+ * Variogram type enum (use e.g. `VariogramType.Exponential`). Only safe to use **after**
+ * you have called and awaited {@link init}. Accessing a property before init() will throw
+ * when the value is used (e.g. when calling {@link fitVariogram} with
+ * `VariogramType.Exponential`). You can pass string names like `"exponential"` instead.
+ */
 export const VariogramType: RawModule["WasmVariogramType"] = new Proxy(
   {} as RawModule["WasmVariogramType"],
   {
@@ -248,6 +319,10 @@ export const VariogramType: RawModule["WasmVariogramType"] = new Proxy(
  *
  * @param input - Optional: `ArrayBuffer` or `Response` of WASM bytes; omit to use default loader
  * @returns Promise that resolves when initialization is complete
+ * @example
+ * await init();
+ * const model = new OrdinaryKriging({ lats, lons, values, variogram: { variogramType: "gaussian", nugget: 0.01, sill: 1, range: 100 } });
+ * const pred = model.predict(37.7, -122.4);
  */
 export async function init(input?: unknown): Promise<unknown> {
   const mod = await loadRawModule();
@@ -256,6 +331,16 @@ export async function init(input?: unknown): Promise<unknown> {
 }
 
 export default init;
+
+function fittedToVariogramParams(f: FittedVariogram): VariogramParams {
+  return {
+    variogramType: f.variogramType,
+    nugget: f.nugget,
+    sill: f.sill,
+    range: f.range,
+    shape: f.shape,
+  };
+}
 
 function toOrdinaryOptionsWasm(opts: OrdinaryKrigingOptions): OrdinaryKrigingOptionsWasm {
   return {
@@ -306,11 +391,21 @@ function toBinomialWithPriorOptionsWasm(
 /**
  * Ordinary kriging model for spatial interpolation of continuous values.
  * Coordinates are in degrees (latitude, longitude); distances use Haversine (great-circle).
- * Pass a single options object with data and variogram parameters.
+ * Pass a single options object with data and variogram parameters. For the common
+ * "fit variogram then build model" flow, use {@link OrdinaryKriging.fromFitted}.
+ *
+ * @throws {KrigingError} When the WASM module is not loaded, or when inputs are invalid
+ * (e.g. mismatched array lengths, singular covariance).
  */
 export class OrdinaryKriging {
   private readonly inner: WasmOrdinaryInstance;
 
+  /**
+   * Build an ordinary kriging model from sample locations, values, and variogram parameters.
+   *
+   * @param options - Sample coordinates, values, and variogram (nugget, sill, range, type, optional shape).
+   * @throws {KrigingError} When the WASM module is not loaded or when inputs are invalid.
+   */
   constructor(options: OrdinaryKrigingOptions) {
     const mod = requireLoadedModule();
     try {
@@ -322,19 +417,51 @@ export class OrdinaryKriging {
     }
   }
 
-  /** Release WASM-held resources. Call when the model is no longer needed. */
+  /**
+   * Build an ordinary kriging model from sample data and a fitted variogram (e.g. from
+   * {@link fitVariogram}). Avoids manually spreading nugget, sill, range, and shape.
+   *
+   * @param options - Sample lats, lons, values, and a {@link FittedVariogram}.
+   * @returns A new OrdinaryKriging instance.
+   * @throws {KrigingError} When the WASM module is not loaded or when inputs are invalid.
+   */
+  static fromFitted(options: OrdinaryKrigingFromFittedOptions): OrdinaryKriging {
+    return new OrdinaryKriging({
+      lats: options.lats,
+      lons: options.lons,
+      values: options.values,
+      variogram: fittedToVariogramParams(options.fittedVariogram),
+    });
+  }
+
+  /**
+   * Release WASM-held resources. Call when the model is no longer needed.
+   */
   free(): void {
     if (typeof this.inner.free === "function") {
       this.inner.free();
     }
   }
 
-  /** Single-point prediction at (lat, lon) in degrees. */
+  /**
+   * Single-point prediction at (lat, lon) in degrees.
+   *
+   * @param lat - Latitude in degrees.
+   * @param lon - Longitude in degrees.
+   * @returns Interpolated value and kriging variance at the location.
+   */
   predict(lat: number, lon: number): OrdinaryPrediction {
     return mapOrdinaryPrediction(this.inner.predict(lat, lon));
   }
 
-  /** Batch prediction at multiple (lat, lon) pairs; returns an array of {@link OrdinaryPrediction}. */
+  /**
+   * Batch prediction at multiple (lat, lon) pairs. For large grids, prefer
+   * {@link OrdinaryKriging.predictBatchArrays} to avoid per-point object allocation.
+   *
+   * @param lats - Latitudes in degrees (same length as lons).
+   * @param lons - Longitudes in degrees (same length as lats).
+   * @returns Array of predictions (value and variance) for each location.
+   */
   predictBatch(
     lats: NumericArrayInput,
     lons: NumericArrayInput
@@ -347,8 +474,12 @@ export class OrdinaryKriging {
   }
 
   /**
-   * Batch prediction returning typed arrays (values, variances). Prefer over predictBatch
-   * for large grids to avoid per-point object allocation.
+   * Batch prediction returning typed arrays (values, variances). Prefer over
+   * {@link OrdinaryKriging.predictBatch} for large grids to avoid per-point object allocation.
+   *
+   * @param lats - Latitudes in degrees (same length as lons).
+   * @param lons - Longitudes in degrees (same length as lats).
+   * @returns Object with `values` and `variances` Float64Arrays, each of length lats.length.
    */
   predictBatchArrays(
     lats: NumericArrayInput,
@@ -363,7 +494,11 @@ export class OrdinaryKriging {
 
   /**
    * Batch prediction using WebGPU when available. Requires building with `npm run build:wasm:gpu`.
-   * Throws if the GPU feature was not included in the build.
+   *
+   * @param lats - Latitudes in degrees (same length as lons).
+   * @param lons - Longitudes in degrees (same length as lats).
+   * @returns Promise resolving to an array of predictions (value and variance) for each location.
+   * @throws If the package was not built with the `gpu` feature.
    */
   async predictBatchGpu(
     lats: NumericArrayInput,
@@ -385,11 +520,20 @@ export class OrdinaryKriging {
 /**
  * Binomial kriging model for prevalence (proportion) surfaces from count data (successes/trials).
  * Coordinates are in degrees; distances use Haversine. Use {@link BinomialKriging.newWithPrior}
- * to supply a Beta(alpha, beta) prior for stabilization.
+ * to supply a Beta(alpha, beta) prior for stabilization. For building from a fitted variogram,
+ * use {@link BinomialKriging.fromFittedVariogram} or {@link BinomialKriging.fromFittedVariogramWithPrior}.
+ *
+ * @throws {KrigingError} When the WASM module is not loaded, or when inputs are invalid.
  */
 export class BinomialKriging {
   private inner: WasmBinomialInstance;
 
+  /**
+   * Build a binomial kriging model from locations, success/trial counts, and variogram parameters.
+   *
+   * @param options - Sample coordinates, successes, trials, and variogram (nugget, sill, range, type, optional shape).
+   * @throws {KrigingError} When the WASM module is not loaded or when inputs are invalid.
+   */
   constructor(options: BinomialKrigingOptions) {
     const mod = requireLoadedModule();
     try {
@@ -404,6 +548,10 @@ export class BinomialKriging {
   /**
    * Create a binomial kriging model with a Beta(alpha, beta) prior on prevalence.
    * Useful when counts are small or some locations have zero trials.
+   *
+   * @param options - Sample coordinates, successes, trials, variogram, and prior { alpha, beta }.
+   * @returns A new BinomialKriging instance.
+   * @throws {KrigingError} When the WASM module is not loaded or when inputs are invalid.
    */
   static newWithPrior(options: BinomialKrigingWithPriorOptions): BinomialKriging {
     const mod = requireLoadedModule();
@@ -422,19 +570,75 @@ export class BinomialKriging {
     return instance;
   }
 
-  /** Release WASM-held resources. Call when the model is no longer needed. */
+  /**
+   * Build a binomial kriging model from count data and a fitted variogram (e.g. from
+   * fitting on logits or reusing ordinary-fit params). Avoids manually spreading
+   * variogram fields.
+   *
+   * @param options - Sample lats, lons, successes, trials, and a {@link FittedVariogram}.
+   * @returns A new BinomialKriging instance.
+   * @throws {KrigingError} When the WASM module is not loaded or when inputs are invalid.
+   */
+  static fromFittedVariogram(
+    options: BinomialKrigingFromFittedVariogramOptions
+  ): BinomialKriging {
+    return new BinomialKriging({
+      lats: options.lats,
+      lons: options.lons,
+      successes: options.successes,
+      trials: options.trials,
+      variogram: fittedToVariogramParams(options.fittedVariogram),
+    });
+  }
+
+  /**
+   * Build a binomial kriging model with a Beta prior from count data and a fitted variogram.
+   *
+   * @param options - Sample lats, lons, successes, trials, a {@link FittedVariogram}, and prior { alpha, beta }.
+   * @returns A new BinomialKriging instance.
+   * @throws {KrigingError} When the WASM module is not loaded or when inputs are invalid.
+   */
+  static fromFittedVariogramWithPrior(
+    options: BinomialKrigingFromFittedVariogramWithPriorOptions
+  ): BinomialKriging {
+    return BinomialKriging.newWithPrior({
+      lats: options.lats,
+      lons: options.lons,
+      successes: options.successes,
+      trials: options.trials,
+      variogram: fittedToVariogramParams(options.fittedVariogram),
+      prior: options.prior,
+    });
+  }
+
+  /**
+   * Release WASM-held resources.
+   */
   free(): void {
     if (typeof this.inner.free === "function") {
       this.inner.free();
     }
   }
 
-  /** Single-point prevalence prediction at (lat, lon) in degrees. */
+  /**
+   * Single-point prevalence prediction at (lat, lon) in degrees.
+   *
+   * @param lat - Latitude in degrees.
+   * @param lon - Longitude in degrees.
+   * @returns Prevalence in [0, 1], logit value, and kriging variance.
+   */
   predict(lat: number, lon: number): BinomialPrediction {
     return mapBinomialPrediction(this.inner.predict(lat, lon));
   }
 
-  /** Batch prevalence prediction; returns an array of {@link BinomialPrediction}. */
+  /**
+   * Batch prevalence prediction at multiple (lat, lon) pairs. For large grids, prefer
+   * {@link BinomialKriging.predictBatchArrays}.
+   *
+   * @param lats - Latitudes in degrees (same length as lons).
+   * @param lons - Longitudes in degrees (same length as lats).
+   * @returns Array of prevalence predictions for each location.
+   */
   predictBatch(
     lats: NumericArrayInput,
     lons: NumericArrayInput
@@ -447,7 +651,12 @@ export class BinomialKriging {
   }
 
   /**
-   * Batch prevalence prediction returning typed arrays. Prefer for large grids.
+   * Batch prevalence prediction returning typed arrays. Prefer over
+   * {@link BinomialKriging.predictBatch} for large grids.
+   *
+   * @param lats - Latitudes in degrees (same length as lons).
+   * @param lons - Longitudes in degrees (same length as lats).
+   * @returns Object with `prevalences`, `logitValues`, and `variances` Float64Arrays.
    */
   predictBatchArrays(
     lats: NumericArrayInput,
@@ -462,6 +671,11 @@ export class BinomialKriging {
 
   /**
    * Batch prevalence prediction using WebGPU when available. Requires build with GPU feature.
+   *
+   * @param lats - Latitudes in degrees (same length as lons).
+   * @param lons - Longitudes in degrees (same length as lats).
+   * @returns Promise resolving to an array of prevalence predictions for each location.
+   * @throws If the package was not built with the `gpu` feature.
    */
   async predictBatchGpu(
     lats: NumericArrayInput,
@@ -480,37 +694,64 @@ export class BinomialKriging {
   }
 }
 
+const VariogramTypeNameToKey: Record<VariogramTypeName, keyof RawModule["WasmVariogramType"]> = {
+  spherical: "Spherical",
+  exponential: "Exponential",
+  gaussian: "Gaussian",
+  cubic: "Cubic",
+  stable: "Stable",
+  matern: "Matern",
+};
+
+function variogramTypeToNumber(variogramType: VariogramTypeName | number): number {
+  if (typeof variogramType === "number" && Number.isFinite(variogramType)) {
+    return variogramType;
+  }
+  const name = variogramType as VariogramTypeName;
+  const key = VariogramTypeNameToKey[name];
+  if (!key) {
+    throw new Error(`Unknown variogram type: ${String(variogramType)}`);
+  }
+  return requireLoadedModule().WasmVariogramType[key];
+}
+
 /**
  * Fit a variogram model to sample data by computing an empirical variogram and fitting
  * the specified model type. Use the returned {@link FittedVariogram} to construct an
  * {@link OrdinaryKriging} model.
  *
- * @param sampleLats - Sample latitudes (degrees)
- * @param sampleLons - Sample longitudes (degrees)
- * @param values - Sample values (same length as lats/lons)
- * @param maxDistance - Optional maximum distance for binning (same units as range); omit for auto
- * @param nBins - Number of distance bins for the empirical variogram
- * @param variogramType - Variogram model type (e.g. {@link VariogramType}.Exponential)
+ * @param options - Single options object with sample data and variogram type
  * @returns Fitted variogram parameters
+ * @example
+ * const lats = [37.7, 37.71, 37.72];
+ * const lons = [-122.45, -122.44, -122.43];
+ * const values = [10, 12, 11];
+ * const fitted = fitVariogram({ sampleLats: lats, sampleLons: lons, values, variogramType: "exponential" });
+ * const model = new OrdinaryKriging({
+ *   lats, lons, values,
+ *   variogram: { variogramType: fitted.variogramType, nugget: fitted.nugget, sill: fitted.sill, range: fitted.range, shape: fitted.shape },
+ * });
  */
-export function fitOrdinaryVariogram(
-  sampleLats: NumericArrayInput,
-  sampleLons: NumericArrayInput,
-  values: NumericArrayInput,
-  maxDistance: number | undefined,
-  nBins: number,
-  variogramType: number
-): FittedVariogram {
+export function fitVariogram(options: FitVariogramOptions): FittedVariogram {
+  const {
+    sampleLats,
+    sampleLons,
+    values,
+    variogramType,
+    maxDistance,
+    nBins = 12,
+  } = options;
   const mod = requireLoadedModule();
+  const variogramTypeNum = variogramTypeToNumber(variogramType);
   let out: unknown;
   try {
-    out = mod.fitOrdinaryVariogram(
+    out = mod.fitVariogram(
       toFloat64Array(sampleLats),
       toFloat64Array(sampleLons),
       toFloat64Array(values),
       maxDistance,
       nBins,
-      variogramType
+      variogramTypeNum
     );
   } catch (e) {
     throw new KrigingError(e instanceof Error ? e.message : String(e), {
@@ -532,8 +773,10 @@ export function fitOrdinaryVariogram(
 }
 
 /**
- * Check whether WebGPU-backed batch prediction is available. Returns false if the package
- * was built without the `gpu` feature or if the environment does not support WebGPU.
+ * Check whether WebGPU-backed batch prediction is available.
+ *
+ * @returns `true` if the package was built with the `gpu` feature and the environment
+ * supports WebGPU; otherwise `false`.
  */
 export async function webgpuAvailable(): Promise<boolean> {
   if (!rawModuleLoaded) {

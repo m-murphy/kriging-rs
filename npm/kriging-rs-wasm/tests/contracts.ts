@@ -1,7 +1,7 @@
 import {
   BinomialKriging,
   OrdinaryKriging,
-  fitOrdinaryVariogram,
+  fitVariogram,
   VariogramType,
   type BinomialBatchArrayOutput,
   type BinomialPrediction,
@@ -35,14 +35,20 @@ const _predType: OrdinaryPrediction = pred;
 const _batchItemType: OrdinaryPrediction = batch[0];
 const _batchArraysType: OrdinaryBatchArrayOutput = batchArrays;
 
-const fit = fitOrdinaryVariogram(
-  lats,
-  lons,
+const fit = fitVariogram({
+  sampleLats: lats,
+  sampleLons: lons,
   values,
-  undefined,
-  12,
-  VariogramType.Gaussian
-);
+  variogramType: VariogramType.Gaussian,
+  nBins: 12,
+});
+const fitWithString = fitVariogram({
+  sampleLats: lats,
+  sampleLons: lons,
+  values,
+  variogramType: "exponential",
+});
+const _fitWithStringType: VariogramTypeName = fitWithString.variogramType;
 const _fitVariogramType: VariogramTypeName = fit.variogramType;
 const fittedOrdinary = new OrdinaryKriging({
   lats,
@@ -56,6 +62,13 @@ const fittedOrdinary = new OrdinaryKriging({
     shape: fit.shape,
   },
 });
+const fromFittedOrdinary = OrdinaryKriging.fromFitted({
+  lats,
+  lons,
+  values,
+  fittedVariogram: fit,
+});
+const _fromFittedPred: OrdinaryPrediction = fromFittedOrdinary.predict(0.5, 0.5);
 const fittedBatch = fittedOrdinary.predictBatch(lats, lons);
 const _fittedBatchItemType: OrdinaryPrediction = fittedBatch[0];
 const fittedBatchArrays = fittedOrdinary.predictBatchArrays(lats, lons);
@@ -75,3 +88,23 @@ const _bPredType: BinomialPrediction = bPred;
 const _bPredNotAny: AssertNotAny<typeof bPred> = true;
 const bArrayOut = binomial.predictBatchArrays(lats, lons);
 const _bArrayType: BinomialBatchArrayOutput = bArrayOut;
+
+const binomialFromFitted = BinomialKriging.fromFittedVariogram({
+  lats,
+  lons,
+  successes,
+  trials,
+  fittedVariogram: fit,
+});
+const _binomialFromFittedPred: BinomialPrediction = binomialFromFitted.predict(0.4, 0.4);
+
+const binomialFromFittedPrior = BinomialKriging.fromFittedVariogramWithPrior({
+  lats,
+  lons,
+  successes,
+  trials,
+  fittedVariogram: fit,
+  prior: { alpha: 1, beta: 1 },
+});
+const _binomialFromFittedPriorPred: BinomialPrediction =
+  binomialFromFittedPrior.predict(0.4, 0.4);

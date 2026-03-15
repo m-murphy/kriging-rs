@@ -2,7 +2,42 @@
 
 TypeScript-first WebAssembly package for [kriging-rs](https://github.com/m-murphy/kriging-rs): ordinary and binomial kriging with optional WebGPU acceleration.
 
-Supported variogram types: `"spherical"`, `"exponential"`, `"gaussian"`, `"cubic"`, `"stable"`, `"matern"`. Pass the model type to `fitOrdinaryVariogram` as the **enum** (e.g. `VariogramType.Exponential`). For `stable` and `matern`, pass an optional `shape` parameter when constructing a model; `fitOrdinaryVariogram` returns a `shape` field when the fitted model is stable or Matérn.
+## Quick start
+
+1. Install: `npm install kriging-rs-wasm`
+2. Initialize once: `await init()`
+3. Build a model and predict:
+
+```ts
+import init, { OrdinaryKriging } from "kriging-rs-wasm";
+await init();
+
+const model = new OrdinaryKriging({
+  lats: [37.7, 37.71, 37.72],
+  lons: [-122.45, -122.44, -122.43],
+  values: [10, 12, 11],
+  variogram: { variogramType: "gaussian", nugget: 0.01, sill: 1.5, range: 5.0 },
+});
+const pred = model.predict(37.705, -122.435);
+```
+
+## Requirements
+
+- Browser or Node.js; ES2022. For custom WASM loading you can pass pre-fetched bytes to `init(wasmArrayBuffer)`.
+
+## API overview
+
+| Export | Purpose |
+|--------|---------|
+| `init` | Initialize the WASM module (call and await once before any other API). |
+| `OrdinaryKriging` | Spatial interpolation of **continuous** values (e.g. temperature, elevation). |
+| `BinomialKriging` | **Prevalence/proportion** surfaces from count data (successes out of trials). |
+| `fitVariogram` | Fit a variogram model to sample data; use the result to build an `OrdinaryKriging` model. |
+| `VariogramType` | Enum for variogram model type (optional; you can pass string names like `"exponential"` instead). |
+| `KrigingError` | Error class thrown on invalid inputs or model build failure; `cause` holds the underlying error. |
+| `webgpuAvailable` | Check if WebGPU-backed batch prediction is available (requires GPU build). |
+
+**When to use which:** Use **ordinary kriging** when you have continuous measurements at locations (e.g. sensor values, elevations). Use **binomial kriging** when you have counts (successes and trials) and want to estimate a proportion or prevalence surface.
 
 ## Build
 
@@ -40,15 +75,16 @@ This checks:
 
 ## Usage
 
-Call and await `init()` once before using any other API.
+Call and await `init()` once before using any other API. **VariogramType** (e.g. `VariogramType.Exponential`) is only safe to use after `init()` has been awaited; accessing it before init will throw when the value is used. You can pass string names like `"exponential"` instead.
+
+Supported variogram types: `"spherical"`, `"exponential"`, `"gaussian"`, `"cubic"`, `"stable"`, `"matern"`. You can pass the model type as a string (e.g. `"exponential"`) or as `VariogramType.Exponential`. For `stable` and `matern`, pass an optional `shape` when constructing a model; `fitVariogram` returns a `shape` field when the fitted model is stable or Matérn.
 
 ### Ordinary kriging
 
 ```ts
 import init, {
   OrdinaryKriging,
-  fitOrdinaryVariogram,
-  VariogramType,
+  fitVariogram,
 } from "kriging-rs-wasm";
 
 await init();
@@ -62,19 +98,21 @@ const model = new OrdinaryKriging({
 
 const prediction = model.predict(37.705, -122.435);
 
-// Fit variogram from data (specify model type as enum), then build model
-const fitted = fitOrdinaryVariogram(
-  [37.7, 37.71, 37.72],
-  [-122.45, -122.44, -122.43],
-  [10, 12, 11],
-  undefined,
-  12,
-  VariogramType.Exponential
-);
+// Fit variogram from data (options object; variogramType can be string or VariogramType enum)
+const lats = [37.7, 37.71, 37.72];
+const lons = [-122.45, -122.44, -122.43];
+const values = [10, 12, 11];
+const fitted = fitVariogram({
+  sampleLats: lats,
+  sampleLons: lons,
+  values,
+  variogramType: "exponential",
+  nBins: 12,  // optional; default 12
+});
 const fittedModel = new OrdinaryKriging({
-  lats: [37.7, 37.71, 37.72],
-  lons: [-122.45, -122.44, -122.43],
-  values: [10, 12, 11],
+  lats,
+  lons,
+  values,
   variogram: {
     variogramType: fitted.variogramType,
     nugget: fitted.nugget,
@@ -84,6 +122,26 @@ const fittedModel = new OrdinaryKriging({
   },
 });
 const batch = fittedModel.predictBatch(lats, lons);
+```
+
+**Convenience factories (fit → model):** To avoid manually spreading `fitted` fields, use the static factories:
+
+- **Ordinary:** `OrdinaryKriging.fromFitted({ lats, lons, values, fittedVariogram: fitted })`
+- **Binomial:** `BinomialKriging.fromFittedVariogram({ lats, lons, successes, trials, fittedVariogram })`
+- **Binomial with prior:** `BinomialKriging.fromFittedVariogramWithPrior({ lats, lons, successes, trials, fittedVariogram, prior: { alpha, beta } })`
+
+Example:
+
+```ts
+const fitted = fitVariogram({
+  sampleLats: lats,
+  sampleLons: lons,
+  values,
+  variogramType: "exponential",
+  nBins: 12,
+});
+const model = OrdinaryKriging.fromFitted({ lats, lons, values, fittedVariogram: fitted });
+const pred = model.predict(37.705, -122.435);
 ```
 
 ### Binomial kriging (prevalence surfaces)
@@ -152,7 +210,7 @@ If `predictBatchGpu` is called without a GPU build, it throws.
 
 ## Error handling
 
-Constructors (`OrdinaryKriging`, `BinomialKriging`, `BinomialKriging.newWithPrior`) and `fitOrdinaryVariogram` throw on invalid inputs or model build failure (e.g. singular covariance). Errors are rethrown as `KrigingError` with the underlying cause attached as `cause`. Typical causes:
+Constructors (`OrdinaryKriging`, `BinomialKriging`, `BinomialKriging.newWithPrior`) and `fitVariogram` throw on invalid inputs or model build failure (e.g. singular covariance). Errors are rethrown as `KrigingError` with the underlying cause attached as `cause`. Typical causes:
 
 - Mismatched array lengths (lats, lons, values or successes/trials)
 - Invalid coordinates or variogram parameters
@@ -184,3 +242,4 @@ From `npm/kriging-rs-wasm`, run `npm run verify`, then `npm publish` (dry-run: `
 - Call and await `init(...)` once before invoking model constructors or variogram-fitting APIs. You can pass pre-fetched WASM bytes: `await init(wasmArrayBuffer)`.
 - Coordinates are in degrees (latitude, longitude); distances use Haversine (great-circle).
 - For GPU-enabled exports, build with `npm run build:wasm:gpu`.
+- **Resource management:** When a model is no longer needed, call `model.free()` to release WASM-held memory. This is optional but recommended in long-lived applications.
