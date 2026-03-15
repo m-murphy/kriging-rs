@@ -7,6 +7,7 @@ license = "MIT"
 description = "Geostatistical kriging library with WASM support"
 keywords = ["kriging", "geostatistics", "wasm", "interpolation", "spatial"]
 categories = ["science", "wasm"]
+repository = "https://github.com/m-murphy/kriging-rs"
 
 [dependencies]
 console_error_panic_hook = { version = "0.1.7", optional = true }
