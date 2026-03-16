@@ -62,9 +62,30 @@ if [[ "$DRY_RUN" == true ]]; then
   echo "---"
   cat "$notes_file"
   echo "---"
-  echo "[DRY RUN] Skipping gh release create."
+  echo "[DRY RUN] Skipping push check and gh release create."
   exit 0
 fi
+
+# Ensure current branch is pushed so the release (and tag push → publish workflow) see the right commit
+branch="$(git symbolic-ref --short HEAD 2>/dev/null)" || true
+if [[ -z "$branch" ]]; then
+  echo "Error: not on a branch (detached HEAD). Check out the branch you want to release (e.g. main) and push it first." >&2
+  exit 1
+fi
+upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)" || true
+if [[ -z "$upstream" ]]; then
+  echo "Error: branch '$branch' has no upstream. Push first: git push -u origin $branch" >&2
+  exit 1
+fi
+echo "Checking that $branch is pushed to $upstream..."
+git fetch --quiet origin
+ahead="$(git rev-list --count "$upstream..HEAD" 2>/dev/null)" || true
+if [[ -n "$ahead" && "$ahead" -gt 0 ]]; then
+  echo "Error: $branch is $ahead commit(s) ahead of $upstream. Push first, then run this script:" >&2
+  echo "  git push origin $branch" >&2
+  exit 1
+fi
+
 echo "Creating release $TAG with notes from CHANGELOG.md..."
-gh release create "$TAG" --notes-file "$notes_file"
+gh release create "$TAG" --target "$branch" --notes-file "$notes_file"
 echo "Done."

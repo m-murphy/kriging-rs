@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2025-03-15
+
+### Fixed
+
+- **npm package (kriging-rs-wasm)** – The published tarball now includes the `pkg/` directory (wasm-pack output: `kriging_rs.js`, `kriging_rs_bg.wasm`, etc.). Previously `build:wasm` used `--out-dir npm/kriging-rs-wasm/pkg`, which from the package directory resolved to a nested path, so the top-level `pkg/` listed in `files` was never created. Build scripts now use `--out-dir pkg`. `prepublishOnly` also verifies that `pkg/` exists and contains the expected files before publishing.
+
 ## [0.2.0] - 2025-03-15
 
 ### Added
@@ -43,5 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `KrigingError` (JS class with `cause`); `webgpuAvailable` when built with GPU support.
   - Batch and typed-array prediction APIs.
 
+[0.2.1]: https://github.com/m-murphy/kriging-rs/releases/tag/v0.2.1
 [0.2.0]: https://github.com/m-murphy/kriging-rs/releases/tag/v0.2.0
 [0.1.0]: https://github.com/m-murphy/kriging-rs/releases/tag/v0.1.0
