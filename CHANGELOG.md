@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2025-03-15
+
+### Added
+
+- **npm package (kriging-rs-wasm)**
+  - `predictGrid(options)` on `OrdinaryKriging` and `BinomialKriging`: rectangular grid prediction from bounds and cell counts; returns 2D value/variance (and prevalence/logit) grids. Types: `PredictGridOptions`, `OrdinaryGridOutput`, `BinomialGridOutput`.
+  - One-shot helpers: `interpolateOrdinaryToGrid(options)` and `interpolateBinomialToGrid(options)` (fit → build model → predict grid → free). Types: `InterpolateOrdinaryToGridOptions`, `InterpolateBinomialToGridOptions`.
+  - `KrigingError.code` and `KrigingErrorCode` for UI-friendly error handling.
+
+### Changed
+
+- **npm package (kriging-rs-wasm)**
+  - `init()` now returns `Promise<void>` (was `Promise<unknown>`) so callers can use it directly without a wrapper.
+  - Optional `nuggetOverride` on `OrdinaryKrigingFromFittedOptions`, `BinomialKrigingFromFittedVariogramOptions`, and `BinomialKrigingFromFittedVariogramWithPriorOptions` to override the fitted variogram nugget when building the model.
+  - `model.free()` is idempotent: safe to call multiple times; subsequent calls are no-ops. The TypeScript wrapper clears its reference after the first call so use-after-free throws a clear error. Documented in README and JSDoc.
+
 ## [0.1.0] - 2025-03-15
 
 ### Added
@@ -27,4 +43,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `KrigingError` (JS class with `cause`); `webgpuAvailable` when built with GPU support.
   - Batch and typed-array prediction APIs.
 
+[0.2.0]: https://github.com/m-murphy/kriging-rs/releases/tag/v0.2.0
 [0.1.0]: https://github.com/m-murphy/kriging-rs/releases/tag/v0.1.0
