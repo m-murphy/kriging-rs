@@ -2,6 +2,7 @@ import {
   BinomialKriging,
   OrdinaryKriging,
   fitVariogram,
+  init,
   VariogramType,
   type BinomialBatchArrayOutput,
   type BinomialPrediction,
@@ -9,6 +10,10 @@ import {
   type OrdinaryPrediction,
   type VariogramTypeName,
 } from "../src/index.js";
+
+// Contract: init() must return Promise<void>
+type _InitReturn = ReturnType<typeof init>;
+const _initReturnsVoid: _InitReturn extends Promise<void> ? true : false = true;
 
 type IsAny<T> = 0 extends 1 & T ? true : false;
 type AssertNotAny<T> = IsAny<T> extends true ? never : true;

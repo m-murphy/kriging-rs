@@ -201,6 +201,18 @@ describe("Ordinary kriging", () => {
     expect(Number.isFinite(predOverride.variance)).toBe(true);
     expect(predOverride.variance).not.toBe(predNoOverride.variance);
   });
+
+  test("OrdinaryKriging free() is idempotent", () => {
+    const model = new OrdinaryKriging({
+      lats,
+      lons,
+      values,
+      variogram: { variogramType, nugget, sill, range },
+    });
+    model.free();
+    model.free();
+    expect(() => model.predict(0.5, 0.5)).toThrow(KrigingError);
+  });
 });
 
 describe("Binomial kriging", () => {
@@ -284,6 +296,19 @@ describe("Binomial kriging", () => {
     expect(pred.prevalence).toBeGreaterThanOrEqual(0);
     expect(pred.prevalence).toBeLessThanOrEqual(1);
     model.free();
+  });
+
+  test("BinomialKriging free() is idempotent", () => {
+    const model = new BinomialKriging({
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram: { variogramType, nugget, sill, range },
+    });
+    model.free();
+    model.free();
+    expect(() => model.predict(0.5, 0.5)).toThrow(KrigingError);
   });
 
   test("BinomialKriging.fromFittedVariogram produces valid predictions", () => {

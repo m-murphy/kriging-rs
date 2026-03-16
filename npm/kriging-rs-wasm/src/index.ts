@@ -324,16 +324,16 @@ export const VariogramType: RawModule["WasmVariogramType"] = new Proxy(
  * WASM bytes (e.g. from a custom URL or bundler) for offline or custom loading.
  *
  * @param input - Optional: `ArrayBuffer` or `Response` of WASM bytes; omit to use default loader
- * @returns Promise that resolves when initialization is complete
+ * @returns Promise that resolves with `undefined` when initialization is complete
  * @example
  * await init();
  * const model = new OrdinaryKriging({ lats, lons, values, variogram: { variogramType: "gaussian", nugget: 0.01, sill: 1, range: 100 } });
  * const pred = model.predict(37.7, -122.4);
  */
-export async function init(input?: unknown): Promise<unknown> {
+export async function init(input?: unknown): Promise<void> {
   const mod = await loadRawModule();
   rawModuleLoaded = mod;
-  return mod.default(input);
+  await mod.default(input);
 }
 
 export default init;
@@ -406,8 +406,10 @@ function toBinomialWithPriorOptionsWasm(
  * @throws {KrigingError} When the WASM module is not loaded, or when inputs are invalid
  * (e.g. mismatched array lengths, singular covariance).
  */
+const ORDINARY_FREED = "OrdinaryKriging model has been freed";
+
 export class OrdinaryKriging {
-  private readonly inner: WasmOrdinaryInstance;
+  private inner: WasmOrdinaryInstance | null;
 
   /**
    * Build an ordinary kriging model from sample locations, values, and variogram parameters.
@@ -424,6 +426,13 @@ export class OrdinaryKriging {
         cause: e,
       });
     }
+  }
+
+  private requireInner(): WasmOrdinaryInstance {
+    if (this.inner === null) {
+      throw new KrigingError(ORDINARY_FREED);
+    }
+    return this.inner;
   }
 
   /**
@@ -448,11 +457,15 @@ export class OrdinaryKriging {
 
   /**
    * Release WASM-held resources. Call when the model is no longer needed.
+   * Safe to call multiple times; subsequent calls are no-ops. You can call
+   * free() in a finally block after creating a model.
    */
   free(): void {
+    if (this.inner === null) return;
     if (typeof this.inner.free === "function") {
       this.inner.free();
     }
+    this.inner = null;
   }
 
   /**
@@ -463,7 +476,7 @@ export class OrdinaryKriging {
    * @returns Interpolated value and kriging variance at the location.
    */
   predict(lat: number, lon: number): OrdinaryPrediction {
-    return mapOrdinaryPrediction(this.inner.predict(lat, lon));
+    return mapOrdinaryPrediction(this.requireInner().predict(lat, lon));
   }
 
   /**
@@ -478,7 +491,7 @@ export class OrdinaryKriging {
     lats: NumericArrayInput,
     lons: NumericArrayInput
   ): OrdinaryPrediction[] {
-    const out = this.inner.predictBatch(
+    const out = this.requireInner().predictBatch(
       toFloat64Array(lats),
       toFloat64Array(lons)
     );
@@ -497,7 +510,7 @@ export class OrdinaryKriging {
     lats: NumericArrayInput,
     lons: NumericArrayInput
   ): OrdinaryBatchArrayOutput {
-    const out = this.inner.predictBatchArrays(
+    const out = this.requireInner().predictBatchArrays(
       toFloat64Array(lats),
       toFloat64Array(lons)
     );
@@ -516,18 +529,21 @@ export class OrdinaryKriging {
     lats: NumericArrayInput,
     lons: NumericArrayInput
   ): Promise<OrdinaryPrediction[]> {
-    if (typeof this.inner.predictBatchGpu !== "function") {
+    const inner = this.requireInner();
+    if (typeof inner.predictBatchGpu !== "function") {
       throw new Error(
         'predictBatchGpu not available; rebuild WASM package with feature "gpu"'
       );
     }
-    const out = await this.inner.predictBatchGpu(
+    const out = await inner.predictBatchGpu(
       toFloat64Array(lats),
       toFloat64Array(lons)
     );
     return mapOrdinaryPredictionArray(out);
   }
 }
+
+const BINOMIAL_FREED = "BinomialKriging model has been freed";
 
 /**
  * Binomial kriging model for prevalence (proportion) surfaces from count data (successes/trials).
@@ -538,7 +554,7 @@ export class OrdinaryKriging {
  * @throws {KrigingError} When the WASM module is not loaded, or when inputs are invalid.
  */
 export class BinomialKriging {
-  private inner: WasmBinomialInstance;
+  private inner: WasmBinomialInstance | null;
 
   /**
    * Build a binomial kriging model from locations, success/trial counts, and variogram parameters.
@@ -557,6 +573,13 @@ export class BinomialKriging {
     }
   }
 
+  private requireInner(): WasmBinomialInstance {
+    if (this.inner === null) {
+      throw new KrigingError(BINOMIAL_FREED);
+    }
+    return this.inner;
+  }
+
   /**
    * Create a binomial kriging model with a Beta(alpha, beta) prior on prevalence.
    * Useful when counts are small or some locations have zero trials.
@@ -571,9 +594,10 @@ export class BinomialKriging {
       BinomialKriging.prototype
     ) as BinomialKriging;
     try {
-      instance.inner = mod.WasmBinomialKriging.newWithPrior(
-        toBinomialWithPriorOptionsWasm(options)
-      );
+      (instance as unknown as { inner: WasmBinomialInstance | null }).inner =
+        mod.WasmBinomialKriging.newWithPrior(
+          toBinomialWithPriorOptionsWasm(options)
+        );
     } catch (e) {
       throw new KrigingError(e instanceof Error ? e.message : String(e), {
         cause: e,
@@ -630,12 +654,15 @@ export class BinomialKriging {
   }
 
   /**
-   * Release WASM-held resources.
+   * Release WASM-held resources. Safe to call multiple times; subsequent calls are no-ops.
+   * You can call free() in a finally block after creating a model.
    */
   free(): void {
+    if (this.inner === null) return;
     if (typeof this.inner.free === "function") {
       this.inner.free();
     }
+    this.inner = null;
   }
 
   /**
@@ -646,7 +673,7 @@ export class BinomialKriging {
    * @returns Prevalence in [0, 1], logit value, and kriging variance.
    */
   predict(lat: number, lon: number): BinomialPrediction {
-    return mapBinomialPrediction(this.inner.predict(lat, lon));
+    return mapBinomialPrediction(this.requireInner().predict(lat, lon));
   }
 
   /**
@@ -661,7 +688,7 @@ export class BinomialKriging {
     lats: NumericArrayInput,
     lons: NumericArrayInput
   ): BinomialPrediction[] {
-    const out = this.inner.predictBatch(
+    const out = this.requireInner().predictBatch(
       toFloat64Array(lats),
       toFloat64Array(lons)
     );
@@ -680,7 +707,7 @@ export class BinomialKriging {
     lats: NumericArrayInput,
     lons: NumericArrayInput
   ): BinomialBatchArrayOutput {
-    const out = this.inner.predictBatchArrays(
+    const out = this.requireInner().predictBatchArrays(
       toFloat64Array(lats),
       toFloat64Array(lons)
     );
@@ -699,12 +726,13 @@ export class BinomialKriging {
     lats: NumericArrayInput,
     lons: NumericArrayInput
   ): Promise<BinomialPrediction[]> {
-    if (typeof this.inner.predictBatchGpu !== "function") {
+    const inner = this.requireInner();
+    if (typeof inner.predictBatchGpu !== "function") {
       throw new Error(
         'predictBatchGpu not available; rebuild WASM package with feature "gpu"'
       );
     }
-    const out = await this.inner.predictBatchGpu(
+    const out = await inner.predictBatchGpu(
       toFloat64Array(lats),
       toFloat64Array(lons)
     );
