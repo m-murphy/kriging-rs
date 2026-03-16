@@ -203,17 +203,53 @@ export interface BinomialKrigingFromFittedVariogramWithPriorOptions {
 }
 
 /**
+ * Stable error codes for UI-friendly handling. When present, `KrigingError.code` is one of these.
+ * Not every error has a code; the library may add new codes in minor releases.
+ */
+export type KrigingErrorCode =
+  | "not_loaded"
+  | "model_freed"
+  | "mismatched_arrays"
+  | "invalid_variogram"
+  | "invalid_bins"
+  | "singular_covariance"
+  | "too_few_points"
+  | "unknown_variogram"
+  | "invalid_input";
+
+/**
  * Error thrown by the library when WASM operations fail (invalid inputs, model build failure, etc.).
- * The underlying cause is attached as `cause` when available.
+ * The underlying cause is attached as `cause` when available. Optional `code` is a stable string
+ * for UI-friendly messages (e.g. "singular_covariance", "mismatched_arrays").
  */
 export class KrigingError extends Error {
-  constructor(message: string, options?: { cause?: unknown }) {
+  /** Stable code for this error type, when known; use for UI messages or branching. */
+  readonly code?: KrigingErrorCode;
+
+  constructor(message: string, options?: { cause?: unknown; code?: KrigingErrorCode }) {
     super(message);
     this.name = "KrigingError";
     if (options?.cause !== undefined) {
       (this as Error & { cause?: unknown }).cause = options.cause;
     }
+    if (options?.code !== undefined) {
+      this.code = options.code;
+    }
   }
+}
+
+function inferErrorCode(message: string): KrigingErrorCode | undefined {
+  const m = message.toLowerCase();
+  if (m.includes("not loaded") || m.includes("init()")) return "not_loaded";
+  if (m.includes("has been freed")) return "model_freed";
+  if (m.includes("same length") || m.includes("mismatch")) return "mismatched_arrays";
+  if (m.includes("sill") && m.includes("nugget")) return "invalid_variogram";
+  if (m.includes("n_bins") || m.includes("nbins")) return "invalid_bins";
+  if (m.includes("singular")) return "singular_covariance";
+  if (m.includes("too few") || m.includes("at least")) return "too_few_points";
+  if (m.includes("unknown variogram")) return "unknown_variogram";
+  if (m.includes("invalid") || m.includes("must be") || m.includes("finite")) return "invalid_input";
+  return undefined;
 }
 
 /** Internal: WASM ordinary kriging instance shape */
@@ -422,15 +458,14 @@ export class OrdinaryKriging {
     try {
       this.inner = new mod.WasmOrdinaryKriging(toOrdinaryOptionsWasm(options));
     } catch (e) {
-      throw new KrigingError(e instanceof Error ? e.message : String(e), {
-        cause: e,
-      });
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new KrigingError(msg, { cause: e, code: inferErrorCode(msg) });
     }
   }
 
   private requireInner(): WasmOrdinaryInstance {
     if (this.inner === null) {
-      throw new KrigingError(ORDINARY_FREED);
+      throw new KrigingError(ORDINARY_FREED, { code: "model_freed" });
     }
     return this.inner;
   }
@@ -567,15 +602,14 @@ export class BinomialKriging {
     try {
       this.inner = new mod.WasmBinomialKriging(toBinomialOptionsWasm(options));
     } catch (e) {
-      throw new KrigingError(e instanceof Error ? e.message : String(e), {
-        cause: e,
-      });
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new KrigingError(msg, { cause: e, code: inferErrorCode(msg) });
     }
   }
 
   private requireInner(): WasmBinomialInstance {
     if (this.inner === null) {
-      throw new KrigingError(BINOMIAL_FREED);
+      throw new KrigingError(BINOMIAL_FREED, { code: "model_freed" });
     }
     return this.inner;
   }
@@ -599,8 +633,10 @@ export class BinomialKriging {
           toBinomialWithPriorOptionsWasm(options)
         );
     } catch (e) {
-      throw new KrigingError(e instanceof Error ? e.message : String(e), {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new KrigingError(msg, {
         cause: e,
+        code: inferErrorCode(msg),
       });
     }
     return instance;
@@ -800,8 +836,10 @@ export function fitVariogram(options: FitVariogramOptions): FittedVariogram {
       variogramTypeNum
     );
   } catch (e) {
-    throw new KrigingError(e instanceof Error ? e.message : String(e), {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new KrigingError(msg, {
       cause: e,
+      code: inferErrorCode(msg),
     });
   }
   const result = asRecord(out);

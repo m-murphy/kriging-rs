@@ -213,6 +213,24 @@ describe("Ordinary kriging", () => {
     model.free();
     expect(() => model.predict(0.5, 0.5)).toThrow(KrigingError);
   });
+
+  test("KrigingError has code model_freed after free()", () => {
+    const model = new OrdinaryKriging({
+      lats,
+      lons,
+      values,
+      variogram: { variogramType, nugget, sill, range },
+    });
+    model.free();
+    try {
+      model.predict(0.5, 0.5);
+    } catch (e) {
+      expect(e).toBeInstanceOf(KrigingError);
+      expect((e as KrigingError).code).toBe("model_freed");
+      return;
+    }
+    expect.fail("should have thrown");
+  });
 });
 
 describe("Binomial kriging", () => {
@@ -358,15 +376,20 @@ describe("Binomial kriging", () => {
 });
 
 describe("Error handling", () => {
-  test("fitVariogram with mismatched array lengths throws KrigingError", () => {
-    expect(() =>
+  test("fitVariogram with mismatched array lengths throws KrigingError with code", () => {
+    try {
       fitVariogram({
         sampleLats: [0, 1],
         sampleLons: [0, 1, 2],
         values: [1, 2, 3],
         variogramType: VariogramType.Gaussian,
-      })
-    ).toThrow(KrigingError);
+      });
+    } catch (e) {
+      expect(e).toBeInstanceOf(KrigingError);
+      expect((e as KrigingError).code).toBe("mismatched_arrays");
+      return;
+    }
+    expect.fail("should have thrown");
   });
 
   test("OrdinaryKriging with mismatched lats/lons throws KrigingError", () => {
