@@ -36,7 +36,8 @@ const pred = model.predict(37.705, -122.435);
 | `interpolateOrdinaryToGrid` | One-shot: fit + build + predict on grid + free; returns value and variance grids. |
 | `interpolateBinomialToGrid` | One-shot: fit + build + predict on grid + free; returns prevalence and variance grids. |
 | `VariogramType` | Enum for variogram model type (optional; you can pass string names like `"exponential"` instead). |
-| `KrigingError` | Error class thrown on invalid inputs or model build failure; `cause` holds the underlying error. |
+| `KrigingError` | Error class thrown on invalid inputs or model build failure; `cause` holds the underlying error; optional `code` for UI (e.g. `singular_covariance`, `mismatched_arrays`). |
+| `KrigingErrorCode` | Type of stable error codes (`not_loaded`, `model_freed`, `mismatched_arrays`, etc.). |
 | `webgpuAvailable` | Check if WebGPU-backed batch prediction is available (requires GPU build). |
 
 **When to use which:** Use **ordinary kriging** when you have continuous measurements at locations (e.g. sensor values, elevations). Use **binomial kriging** when you have counts (successes and trials) and want to estimate a proportion or prevalence surface.
@@ -74,6 +75,13 @@ This checks:
 - WASM + TypeScript build
 - Runtime smoke test
 - Test suite (`npm test`)
+
+## Testing in your app
+
+The library loads WASM synchronously after you call `init()` (optionally with pre-fetched bytes). In test runners:
+
+- **Node:** Call and await `init()` before any test that uses the API. You can pass WASM bytes from disk, e.g. `await init(await readFile(pathToWasm))`.
+- **Vitest / Vite:** Some setups (e.g. Vite 8 with SSR or certain module resolutions) can throw when importing this package (e.g. `__vite_ssr_exportName__ is not defined`). If that happens, try: (1) running tests in Node (Vitest's `pool: 'node'` or `environment: 'node'`), or (2) loading WASM in a setup file and re-exporting a ready flag, or (3) using `vi.mock` to provide a test double for the module. The package's own tests use Vitest with `init(wasmBytes)` in a `beforeAll` and load the built WASM from `pkg/`.
 
 ## Usage
 
@@ -128,9 +136,9 @@ const batch = fittedModel.predictBatch(lats, lons);
 
 **Convenience factories (fit → model):** To avoid manually spreading `fitted` fields, use the static factories:
 
-- **Ordinary:** `OrdinaryKriging.fromFitted({ lats, lons, values, fittedVariogram: fitted })`
-- **Binomial:** `BinomialKriging.fromFittedVariogram({ lats, lons, successes, trials, fittedVariogram })`
-- **Binomial with prior:** `BinomialKriging.fromFittedVariogramWithPrior({ lats, lons, successes, trials, fittedVariogram, prior: { alpha, beta } })`
+- **Ordinary:** `OrdinaryKriging.fromFitted({ lats, lons, values, fittedVariogram: fitted })`. Optional `nuggetOverride` overrides the fitted nugget (e.g. for a UI-tuned sigma²).
+- **Binomial:** `BinomialKriging.fromFittedVariogram({ lats, lons, successes, trials, fittedVariogram })`. Optional `nuggetOverride` overrides the fitted nugget.
+- **Binomial with prior:** `BinomialKriging.fromFittedVariogramWithPrior({ lats, lons, successes, trials, fittedVariogram, prior: { alpha, beta } })`. Optional `nuggetOverride` overrides the fitted nugget.
 
 Example:
 
@@ -148,7 +156,7 @@ const pred = model.predict(37.705, -122.435);
 
 ### Binomial kriging (prevalence surfaces)
 
-For count data (successes out of trials) at locations:
+For count data (successes out of trials) at locations. **For binary 0/1 data** (e.g. presence/absence at each point), use `successes = values` and `trials = 1` at each location.
 
 ```ts
 import init, { BinomialKriging } from "kriging-rs-wasm";
@@ -256,7 +264,9 @@ If `predictBatchGpu` is called without a GPU build, it throws.
 
 ## Error handling
 
-Constructors (`OrdinaryKriging`, `BinomialKriging`, `BinomialKriging.newWithPrior`) and `fitVariogram` throw on invalid inputs or model build failure (e.g. singular covariance). Errors are rethrown as `KrigingError` with the underlying cause attached as `cause`. Typical causes:
+Constructors (`OrdinaryKriging`, `BinomialKriging`, `BinomialKriging.newWithPrior`) and `fitVariogram` throw on invalid inputs or model build failure (e.g. singular covariance). Errors are rethrown as `KrigingError` with the underlying cause attached as `cause`. For UI-friendly messages, use the optional **`code`** property (when present), which is one of: `not_loaded`, `model_freed`, `mismatched_arrays`, `invalid_variogram`, `invalid_bins`, `singular_covariance`, `too_few_points`, `unknown_variogram`, `invalid_input`. Not every error has a code.
+
+Typical causes:
 
 - Mismatched array lengths (lats, lons, values or successes/trials)
 - Invalid coordinates or variogram parameters
@@ -273,7 +283,13 @@ try {
   });
 } catch (e) {
   if (e instanceof KrigingError) {
-    console.error(e.message, e.cause);
+    if (e.code === "singular_covariance") {
+      showMessage("Model failed: singular covariance matrix.");
+    } else if (e.code === "mismatched_arrays") {
+      showMessage("Check that lats, lons, and values have the same length.");
+    } else {
+      console.error(e.message, e.cause);
+    }
   }
   throw e;
 }
@@ -288,4 +304,4 @@ From `npm/kriging-rs-wasm`, run `npm run verify`, then `npm publish` (dry-run: `
 - Call and await `init(...)` once before invoking model constructors or variogram-fitting APIs. You can pass pre-fetched WASM bytes: `await init(wasmArrayBuffer)`.
 - Coordinates are in degrees (latitude, longitude); distances use Haversine (great-circle).
 - For GPU-enabled exports, build with `npm run build:wasm:gpu`.
-- **Resource management:** When a model is no longer needed, call `model.free()` to release WASM-held memory. This is optional but recommended in long-lived applications.
+- **Resource management:** When a model is no longer needed, call `model.free()` to release WASM-held memory. This is optional but recommended in long-lived applications. **`free()` is safe to call multiple times** (subsequent calls are no-ops), so you can call it in a `finally` block without worrying about double-free.
