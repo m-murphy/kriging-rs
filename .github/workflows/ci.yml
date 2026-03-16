@@ -53,3 +53,11 @@ jobs:
       - name: Dry-run npm publish
         working-directory: npm/kriging-rs-wasm
         run: npm publish --dry-run
+      - name: Verify packed tarball includes pkg/
+        working-directory: npm/kriging-rs-wasm
+        run: |
+          npm pack
+          TGZ=$(ls kriging-rs-wasm-*.tgz)
+          tar -tzf "$TGZ" | grep -q 'package/pkg/kriging_rs.js' || (echo "::error::Tarball missing package/pkg/kriging_rs.js" && exit 1)
+          tar -tzf "$TGZ" | grep -q 'package/pkg/kriging_rs_bg.wasm' || (echo "::error::Tarball missing package/pkg/kriging_rs_bg.wasm" && exit 1)
+          echo "Tarball contains pkg/ as required."

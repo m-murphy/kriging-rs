@@ -44,8 +44,40 @@ jobs:
             exit 1
           fi
 
-  publish-crate:
+  validate-publish:
     needs: validate-versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Add WASM target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Cargo tests
+        run: cargo test --all-features
+      - name: Cargo publish dry-run
+        run: cargo publish --dry-run --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: npm/kriging-rs-wasm/package-lock.json
+          registry-url: "https://registry.npmjs.org"
+      - uses: jetli/wasm-pack-action@v0.4.0
+      - name: npm build and verify tarball
+        working-directory: npm/kriging-rs-wasm
+        run: |
+          npm ci
+          npm run build
+          npm pack
+          TGZ=$(ls kriging-rs-wasm-*.tgz)
+          tar -tzf "$TGZ" | grep -q 'package/pkg/kriging_rs.js' || (echo "::error::Tarball missing package/pkg/kriging_rs.js" && exit 1)
+          tar -tzf "$TGZ" | grep -q 'package/pkg/kriging_rs_bg.wasm' || (echo "::error::Tarball missing package/pkg/kriging_rs_bg.wasm" && exit 1)
+          echo "Crate and npm publish checks passed."
+
+  publish-crate:
+    needs: [validate-versions, validate-publish]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,7 +88,7 @@ jobs:
         run: cargo publish --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
 
   publish-npm:
-    needs: validate-versions
+    needs: [validate-versions, validate-publish]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -72,9 +104,16 @@ jobs:
           cache-dependency-path: npm/kriging-rs-wasm/package-lock.json
           registry-url: "https://registry.npmjs.org"
       - uses: jetli/wasm-pack-action@v0.4.0
-      - name: Install and publish npm package
+      - name: Build, verify tarball, and publish npm package
         working-directory: npm/kriging-rs-wasm
-        run: npm ci && npm publish
+        run: |
+          npm ci
+          npm run build
+          npm pack
+          TGZ=$(ls kriging-rs-wasm-*.tgz)
+          tar -tzf "$TGZ" | grep -q 'package/pkg/kriging_rs.js' || (echo "::error::Tarball missing package/pkg/kriging_rs.js; aborting publish" && exit 1)
+          tar -tzf "$TGZ" | grep -q 'package/pkg/kriging_rs_bg.wasm' || (echo "::error::Tarball missing package/pkg/kriging_rs_bg.wasm; aborting publish" && exit 1)
+          npm publish
         env:
           # Initial publish: set NPM_TOKEN secret so first run creates the package. After adding trusted publisher (package Settings on npmjs.com), remove the secret; OIDC will be used.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
