@@ -3,11 +3,16 @@ import {
   OrdinaryKriging,
   fitVariogram,
   init,
+  interpolateOrdinaryToGrid,
+  interpolateBinomialToGrid,
   VariogramType,
   type BinomialBatchArrayOutput,
   type BinomialPrediction,
+  type BinomialGridOutput,
   type OrdinaryBatchArrayOutput,
   type OrdinaryPrediction,
+  type OrdinaryGridOutput,
+  type PredictGridOptions,
   type VariogramTypeName,
 } from "../src/index.js";
 
@@ -75,6 +80,16 @@ const fromFittedOrdinary = OrdinaryKriging.fromFitted({
   nuggetOverride: 0.05,
 });
 const _fromFittedPred: OrdinaryPrediction = fromFittedOrdinary.predict(0.5, 0.5);
+const gridOpts: PredictGridOptions = {
+  west: 0,
+  south: 0,
+  east: 1,
+  north: 1,
+  xCells: 5,
+  yCells: 4,
+};
+const ordinaryGrid: OrdinaryGridOutput = fromFittedOrdinary.predictGrid(gridOpts);
+const _ordinaryGridType: OrdinaryGridOutput = ordinaryGrid;
 const fittedBatch = fittedOrdinary.predictBatch(lats, lons);
 const _fittedBatchItemType: OrdinaryPrediction = fittedBatch[0];
 const fittedBatchArrays = fittedOrdinary.predictBatchArrays(lats, lons);
@@ -115,3 +130,34 @@ const binomialFromFittedPrior = BinomialKriging.fromFittedVariogramWithPrior({
 });
 const _binomialFromFittedPriorPred: BinomialPrediction =
   binomialFromFittedPrior.predict(0.4, 0.4);
+const binomialGrid: BinomialGridOutput = binomialFromFittedPrior.predictGrid(gridOpts);
+const _binomialGridType: BinomialGridOutput = binomialGrid;
+
+const _oneShotOrdinary: OrdinaryGridOutput = interpolateOrdinaryToGrid({
+  lats: Array.from(lats),
+  lons: Array.from(lons),
+  values: Array.from(values),
+  west: 0,
+  south: 0,
+  east: 2,
+  north: 2,
+  xCells: 3,
+  yCells: 3,
+  variogramType: "exponential",
+  nBins: 12,
+});
+
+const _oneShotBinomial: BinomialGridOutput = interpolateBinomialToGrid({
+  lats: Array.from(lats),
+  lons: Array.from(lons),
+  successes: Array.from(successes),
+  trials: Array.from(trials),
+  west: 0,
+  south: 0,
+  east: 2,
+  north: 2,
+  xCells: 3,
+  yCells: 3,
+  variogramType: "exponential",
+  prior: { alpha: 1, beta: 1 },
+});

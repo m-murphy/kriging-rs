@@ -33,6 +33,8 @@ const pred = model.predict(37.705, -122.435);
 | `OrdinaryKriging` | Spatial interpolation of **continuous** values (e.g. temperature, elevation). |
 | `BinomialKriging` | **Prevalence/proportion** surfaces from count data (successes out of trials). |
 | `fitVariogram` | Fit a variogram model to sample data; use the result to build an `OrdinaryKriging` model. |
+| `interpolateOrdinaryToGrid` | One-shot: fit + build + predict on grid + free; returns value and variance grids. |
+| `interpolateBinomialToGrid` | One-shot: fit + build + predict on grid + free; returns prevalence and variance grids. |
 | `VariogramType` | Enum for variogram model type (optional; you can pass string names like `"exponential"` instead). |
 | `KrigingError` | Error class thrown on invalid inputs or model build failure; `cause` holds the underlying error. |
 | `webgpuAvailable` | Check if WebGPU-backed batch prediction is available (requires GPU build). |
@@ -192,6 +194,50 @@ const { values, variances } = model.predictBatchArrays(gridLats, gridLons);
 ```
 
 For ordinary kriging the result is `{ values, variances }`; for binomial it is `{ prevalences, logitValues, variances }`.
+
+### Grid prediction (bounds + resolution)
+
+For a rectangular grid defined by bounds and cell counts, use `predictGrid` so the library handles building cell-center coordinates and reshaping results:
+
+```ts
+const { values, variances } = model.predictGrid({
+  west: -122.5,
+  south: 37.6,
+  east: -122.3,
+  north: 37.8,
+  xCells: 50,
+  yCells: 40,
+});
+```
+
+**Grid layout:** Results are 2D arrays (not flat). Row index = latitude index, column index = longitude index. First row (`j = 0`) = south, last row = north; first column (`i = 0`) = west, last column = east. So `values[j][i]` is the prediction at the cell with latitude row `j` and longitude column `i`. Internally the library uses row-major order (south to north, then west to east within each row). Ordinary kriging returns `{ values, variances }`; binomial returns `{ prevalences, logitValues, variances }`, all with shape `[yCells][xCells]`.
+
+### One-shot interpolate to grid
+
+For the common flow "fit variogram → build model → predict on grid → free", you can use a single call:
+
+```ts
+// Ordinary: sample data + grid spec + variogram type
+const { values, variances } = interpolateOrdinaryToGrid({
+  lats, lons, values: sampleValues,
+  west: -122.5, south: 37.6, east: -122.3, north: 37.8,
+  xCells: 50, yCells: 40,
+  variogramType: "exponential",
+  nBins: 12,
+  nuggetOverride: 0.01,  // optional
+});
+
+// Binomial: count data + grid spec + variogram type; optional prior
+const { prevalences, variances } = interpolateBinomialToGrid({
+  lats, lons, successes, trials,
+  west: -122.5, south: 37.6, east: -122.3, north: 37.8,
+  xCells: 50, yCells: 40,
+  variogramType: "exponential",
+  prior: { alpha: 1, beta: 1 },  // optional
+});
+```
+
+The model is created internally and freed before returning, so you do not need to call `free()`.
 
 ### WebGPU (optional)
 

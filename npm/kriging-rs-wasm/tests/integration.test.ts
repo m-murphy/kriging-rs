@@ -9,6 +9,8 @@ import {
   OrdinaryKriging,
   BinomialKriging,
   fitVariogram,
+  interpolateOrdinaryToGrid,
+  interpolateBinomialToGrid,
   VariogramType,
   type OrdinaryPrediction,
   type BinomialPrediction,
@@ -231,6 +233,72 @@ describe("Ordinary kriging", () => {
     }
     expect.fail("should have thrown");
   });
+
+  test("OrdinaryKriging predictGrid returns 2D arrays matching predictBatchArrays", () => {
+    const model = new OrdinaryKriging({
+      lats,
+      lons,
+      values,
+      variogram: { variogramType, nugget, sill, range },
+    });
+    const gridOpts = {
+      west: 0,
+      south: 0,
+      east: 1,
+      north: 1,
+      xCells: 2,
+      yCells: 3,
+    };
+    const out = model.predictGrid(gridOpts);
+    expect(out.values.length).toBe(3);
+    expect(out.values[0].length).toBe(2);
+    expect(out.variances.length).toBe(3);
+    expect(out.variances[0].length).toBe(2);
+    const { lats: flatLats, lons: flatLons } = (() => {
+      const nRows = 3;
+      const nCols = 2;
+      const latsArr = new Float64Array(nRows * nCols);
+      const lonsArr = new Float64Array(nRows * nCols);
+      let k = 0;
+      for (let j = 0; j < nRows; j++) {
+        const lat = 0 + (j + 0.5) * (1 / nRows);
+        for (let i = 0; i < nCols; i++) {
+          latsArr[k] = lat;
+          lonsArr[k] = 0 + (i + 0.5) * (1 / nCols);
+          k++;
+        }
+      }
+      return { lats: latsArr, lons: lonsArr };
+    })();
+    const batch = model.predictBatchArrays(flatLats, flatLons);
+    for (let j = 0; j < 3; j++) {
+      for (let i = 0; i < 2; i++) {
+        expect(out.values[j][i]).toBe(batch.values[j * 2 + i]);
+        expect(out.variances[j][i]).toBe(batch.variances[j * 2 + i]);
+      }
+    }
+    model.free();
+  });
+
+  test("interpolateOrdinaryToGrid returns grid and frees model", () => {
+    const out = interpolateOrdinaryToGrid({
+      lats,
+      lons,
+      values,
+      west: 0,
+      south: 0,
+      east: 1,
+      north: 1,
+      xCells: 2,
+      yCells: 2,
+      variogramType: "exponential",
+      nBins: 12,
+    });
+    expect(out.values.length).toBe(2);
+    expect(out.values[0].length).toBe(2);
+    expect(out.variances.length).toBe(2);
+    expect(Number.isFinite(out.values[0][0])).toBe(true);
+  });
 });
 
 describe("Binomial kriging", () => {
@@ -327,6 +395,49 @@ describe("Binomial kriging", () => {
     model.free();
     model.free();
     expect(() => model.predict(0.5, 0.5)).toThrow(KrigingError);
+  });
+
+  test("BinomialKriging predictGrid returns 2D arrays", () => {
+    const model = new BinomialKriging({
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram: { variogramType, nugget, sill, range },
+    });
+    const out = model.predictGrid({
+      west: 0,
+      south: 0,
+      east: 1,
+      north: 1,
+      xCells: 2,
+      yCells: 2,
+    });
+    expect(out.prevalences.length).toBe(2);
+    expect(out.prevalences[0].length).toBe(2);
+    expect(out.variances.length).toBe(2);
+    model.free();
+  });
+
+  test("interpolateBinomialToGrid returns grid and frees model", () => {
+    const out = interpolateBinomialToGrid({
+      lats,
+      lons,
+      successes,
+      trials,
+      west: 0,
+      south: 0,
+      east: 1,
+      north: 1,
+      xCells: 2,
+      yCells: 2,
+      variogramType: "exponential",
+      nBins: 12,
+    });
+    expect(out.prevalences.length).toBe(2);
+    expect(out.prevalences[0].length).toBe(2);
+    expect(out.variances.length).toBe(2);
+    expect(Number.isFinite(out.prevalences[0][0])).toBe(true);
   });
 
   test("BinomialKriging.fromFittedVariogram produces valid predictions", () => {

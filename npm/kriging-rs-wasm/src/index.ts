@@ -72,6 +72,100 @@ export interface BinomialBatchArrayOutput {
 }
 
 /**
+ * Options for grid prediction: rectangular bounds in degrees and number of cells.
+ * Cell centers are computed in row-major order (first row = south, last row = north;
+ * within a row, west to east). Result grids have shape [yCells][xCells] (row index = latitude).
+ */
+export interface PredictGridOptions {
+  /** Western longitude in degrees. */
+  west: number;
+  /** Southern latitude in degrees. */
+  south: number;
+  /** Eastern longitude in degrees. */
+  east: number;
+  /** Northern latitude in degrees. */
+  north: number;
+  /** Number of cells in the x (longitude) direction. */
+  xCells: number;
+  /** Number of cells in the y (latitude) direction. */
+  yCells: number;
+}
+
+/**
+ * Ordinary kriging grid output: 2D arrays with shape [yCells][xCells].
+ * values[j][i] and variances[j][i] correspond to row j (latitude), column i (longitude).
+ */
+export interface OrdinaryGridOutput {
+  values: number[][];
+  variances: number[][];
+}
+
+/**
+ * Binomial kriging grid output: 2D arrays with shape [yCells][xCells].
+ */
+export interface BinomialGridOutput {
+  prevalences: number[][];
+  logitValues: number[][];
+  variances: number[][];
+}
+
+/**
+ * Options for one-shot ordinary kriging: fit variogram from sample data, build model, predict on grid, then free.
+ */
+export interface InterpolateOrdinaryToGridOptions {
+  /** Sample latitudes in degrees. */
+  lats: NumericArrayInput;
+  /** Sample longitudes in degrees. */
+  lons: NumericArrayInput;
+  /** Sample values (same length as lats/lons). */
+  values: NumericArrayInput;
+  /** Grid bounds and cell counts. */
+  west: number;
+  south: number;
+  east: number;
+  north: number;
+  xCells: number;
+  yCells: number;
+  /** Variogram model type (e.g. "exponential"). */
+  variogramType: VariogramTypeName | number;
+  /** Optional number of bins for empirical variogram (default 12). */
+  nBins?: number;
+  /** Optional max distance for binning. */
+  maxDistance?: number;
+  /** Optional nugget override when building model from fitted variogram. */
+  nuggetOverride?: number;
+}
+
+/**
+ * Options for one-shot binomial kriging: fit variogram, build model, predict on grid, then free.
+ */
+export interface InterpolateBinomialToGridOptions {
+  /** Sample latitudes in degrees. */
+  lats: NumericArrayInput;
+  /** Sample longitudes in degrees. */
+  lons: NumericArrayInput;
+  /** Success counts (same length as lats/lons). */
+  successes: IntegerArrayInput;
+  /** Trial counts (same length as lats/lons). */
+  trials: IntegerArrayInput;
+  /** Grid bounds and cell counts. */
+  west: number;
+  south: number;
+  east: number;
+  north: number;
+  xCells: number;
+  yCells: number;
+  /** Variogram model type (e.g. "exponential"). */
+  variogramType: VariogramTypeName | number;
+  /** Optional number of bins for empirical variogram (default 12). */
+  nBins?: number;
+  /** Optional nugget override when building model from fitted variogram. */
+  nuggetOverride?: number;
+  /** Optional Beta(alpha, beta) prior for binomial model. */
+  prior?: BinomialPriorParams;
+}
+
+/**
  * Fitted variogram parameters from {@link fitVariogram}.
  * Use these to construct an {@link OrdinaryKriging} model.
  */
@@ -553,6 +647,29 @@ export class OrdinaryKriging {
   }
 
   /**
+   * Predict on a rectangular grid defined by bounds and cell counts. Builds cell-center
+   * coordinates in row-major order, runs batch prediction, and returns 2D arrays
+   * so you avoid manual grid build and reshape. Grid shape is [yCells][xCells];
+   * values[j][i] is the prediction at row j (latitude), column i (longitude).
+   *
+   * @param options - west, south, east, north (degrees), xCells, yCells
+   * @returns Object with `values` and `variances` as number[][], shape [yCells][xCells]
+   */
+  predictGrid(options: PredictGridOptions): OrdinaryGridOutput {
+    const inner = this.requireInner();
+    const { lats, lons } = buildGridLatsLons(options);
+    const nRows = Math.max(1, Math.floor(options.yCells));
+    const nCols = Math.max(1, Math.floor(options.xCells));
+    const out = inner.predictBatchArrays(lats, lons);
+    const { values: valuesFlat, variances: variancesFlat } =
+      mapOrdinaryBatchArrayOutput(out);
+    return {
+      values: reshapeFlatToGrid(valuesFlat, nRows, nCols),
+      variances: reshapeFlatToGrid(variancesFlat, nRows, nCols),
+    };
+  }
+
+  /**
    * Batch prediction using WebGPU when available. Requires building with `npm run build:wasm:gpu`.
    *
    * @param lats - Latitudes in degrees (same length as lons).
@@ -751,6 +868,28 @@ export class BinomialKriging {
   }
 
   /**
+   * Predict prevalence on a rectangular grid. Same as {@link OrdinaryKriging.predictGrid}
+   * but returns prevalences and logit values. Grid shape [yCells][xCells].
+   *
+   * @param options - west, south, east, north (degrees), xCells, yCells
+   * @returns Object with `prevalences`, `logitValues`, and `variances` as number[][]
+   */
+  predictGrid(options: PredictGridOptions): BinomialGridOutput {
+    const inner = this.requireInner();
+    const { lats, lons } = buildGridLatsLons(options);
+    const nRows = Math.max(1, Math.floor(options.yCells));
+    const nCols = Math.max(1, Math.floor(options.xCells));
+    const out = inner.predictBatchArrays(lats, lons);
+    const { prevalences: pFlat, logitValues: lFlat, variances: vFlat } =
+      mapBinomialBatchArrayOutput(out);
+    return {
+      prevalences: reshapeFlatToGrid(pFlat, nRows, nCols),
+      logitValues: reshapeFlatToGrid(lFlat, nRows, nCols),
+      variances: reshapeFlatToGrid(vFlat, nRows, nCols),
+    };
+  }
+
+  /**
    * Batch prevalence prediction using WebGPU when available. Requires build with GPU feature.
    *
    * @param lats - Latitudes in degrees (same length as lons).
@@ -857,6 +996,102 @@ export function fitVariogram(options: FitVariogramOptions): FittedVariogram {
 }
 
 /**
+ * One-shot ordinary kriging: fit variogram from sample data, build model, predict on a
+ * rectangular grid, then free the model. Returns 2D value and variance grids.
+ *
+ * @param options - Sample lats, lons, values; grid bounds and xCells/yCells; variogramType; optional nBins, maxDistance, nuggetOverride
+ * @returns { values, variances } as number[][], shape [yCells][xCells]
+ */
+export function interpolateOrdinaryToGrid(
+  options: InterpolateOrdinaryToGridOptions
+): OrdinaryGridOutput {
+  const fitted = fitVariogram({
+    sampleLats: options.lats,
+    sampleLons: options.lons,
+    values: options.values,
+    variogramType: options.variogramType,
+    nBins: options.nBins,
+    maxDistance: options.maxDistance,
+  });
+  const model = OrdinaryKriging.fromFitted({
+    lats: options.lats,
+    lons: options.lons,
+    values: options.values,
+    fittedVariogram: fitted,
+    nuggetOverride: options.nuggetOverride,
+  });
+  try {
+    return model.predictGrid({
+      west: options.west,
+      south: options.south,
+      east: options.east,
+      north: options.north,
+      xCells: options.xCells,
+      yCells: options.yCells,
+    });
+  } finally {
+    model.free();
+  }
+}
+
+/**
+ * One-shot binomial kriging: fit variogram on logit(prevalence), build model, predict on a
+ * rectangular grid, then free the model. Returns 2D prevalence and variance grids.
+ *
+ * @param options - Sample lats, lons, successes, trials; grid bounds and xCells/yCells; variogramType; optional nBins, nuggetOverride, prior
+ * @returns { prevalences, logitValues, variances } as number[][], shape [yCells][xCells]
+ */
+export function interpolateBinomialToGrid(
+  options: InterpolateBinomialToGridOptions
+): BinomialGridOutput {
+  const s = toUint32Array(options.successes);
+  const t = toUint32Array(options.trials);
+  const logits: number[] = [];
+  for (let i = 0; i < s.length; i++) {
+    const p = t[i] > 0 ? s[i] / t[i] : 0.5;
+    const clamped = Math.max(1e-6, Math.min(1 - 1e-6, p));
+    logits.push(Math.log(clamped / (1 - clamped)));
+  }
+  const fitted = fitVariogram({
+    sampleLats: options.lats,
+    sampleLons: options.lons,
+    values: logits,
+    variogramType: options.variogramType,
+    nBins: options.nBins,
+  });
+  const model = options.prior
+    ? BinomialKriging.fromFittedVariogramWithPrior({
+        lats: options.lats,
+        lons: options.lons,
+        successes: options.successes,
+        trials: options.trials,
+        fittedVariogram: fitted,
+        nuggetOverride: options.nuggetOverride,
+        prior: options.prior,
+      })
+    : BinomialKriging.fromFittedVariogram({
+        lats: options.lats,
+        lons: options.lons,
+        successes: options.successes,
+        trials: options.trials,
+        fittedVariogram: fitted,
+        nuggetOverride: options.nuggetOverride,
+      });
+  try {
+    return model.predictGrid({
+      west: options.west,
+      south: options.south,
+      east: options.east,
+      north: options.north,
+      xCells: options.xCells,
+      yCells: options.yCells,
+    });
+  } finally {
+    model.free();
+  }
+}
+
+/**
  * Check whether WebGPU-backed batch prediction is available.
  *
  * @returns `true` if the package was built with the `gpu` feature and the environment
@@ -879,6 +1114,42 @@ function toFloat64Array(input: NumericArrayInput): Float64Array {
 
 function toUint32Array(input: IntegerArrayInput): Uint32Array {
   return input instanceof Uint32Array ? input : Uint32Array.from(input);
+}
+
+function buildGridLatsLons(options: PredictGridOptions): {
+  lats: Float64Array;
+  lons: Float64Array;
+} {
+  const { west, south, east, north, xCells, yCells } = options;
+  const nRows = Math.max(1, Math.floor(yCells));
+  const nCols = Math.max(1, Math.floor(xCells));
+  const n = nRows * nCols;
+  const lats = new Float64Array(n);
+  const lons = new Float64Array(n);
+  const latStep = (north - south) / nRows;
+  const lonStep = (east - west) / nCols;
+  let k = 0;
+  for (let j = 0; j < nRows; j++) {
+    const lat = south + (j + 0.5) * latStep;
+    for (let i = 0; i < nCols; i++) {
+      lats[k] = lat;
+      lons[k] = west + (i + 0.5) * lonStep;
+      k++;
+    }
+  }
+  return { lats, lons };
+}
+
+function reshapeFlatToGrid(flat: Float64Array, nRows: number, nCols: number): number[][] {
+  const grid: number[][] = [];
+  for (let j = 0; j < nRows; j++) {
+    const row: number[] = [];
+    for (let i = 0; i < nCols; i++) {
+      row.push(flat[j * nCols + i]);
+    }
+    grid.push(row);
+  }
+  return grid;
 }
 
 function mapOrdinaryPrediction(value: unknown): OrdinaryPrediction {
