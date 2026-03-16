@@ -1,0 +1,4 @@
+# Build outputs (do not commit). pkg/.gitignore is removed after wasm-pack build so npm pack includes pkg/.
+pkg/
+dist/
+node_modules/

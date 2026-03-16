@@ -1,0 +1,2 @@
+# Present so npm uses this instead of repo root .gitignore (which has pkg/ and dist/).
+# Published files are controlled by package.json "files" only.

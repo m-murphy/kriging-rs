@@ -3,9 +3,9 @@
 Cargo.lock
 *.pdb
 node_modules/
-pkg/
+/pkg/
 wasm-pack.log
-dist/
+/dist/
 .DS_Store
 
 *.log

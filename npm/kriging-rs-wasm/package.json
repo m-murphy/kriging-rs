@@ -41,8 +41,8 @@
   "main": "./dist/index.js",
   "scripts": {
     "clean": "rm -rf dist pkg",
-    "build:wasm": "cd ../.. && wasm-pack build . --release --target web --out-dir npm/kriging-rs-wasm/pkg -- --features wasm",
-    "build:wasm:gpu": "cd ../.. && wasm-pack build . --release --target web --out-dir npm/kriging-rs-wasm/pkg -- --features wasm,gpu",
+    "build:wasm": "cd ../.. && wasm-pack build . --release --target web --out-dir npm/kriging-rs-wasm/pkg -- --features wasm && rm -f npm/kriging-rs-wasm/pkg/.gitignore",
+    "build:wasm:gpu": "cd ../.. && wasm-pack build . --release --target web --out-dir npm/kriging-rs-wasm/pkg -- --features wasm,gpu && rm -f npm/kriging-rs-wasm/pkg/.gitignore",
     "build:ts": "tsc -p tsconfig.build.json",
     "build": "npm run build:wasm && npm run build:ts",
     "typecheck:contracts": "tsc -p tsconfig.contracts.json --noEmit",
