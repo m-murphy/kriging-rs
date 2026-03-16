@@ -410,16 +410,16 @@ type RawModule = {
   webgpuAvailable?: () => Promise<unknown>;
 };
 
+import * as wasmPkg from "../pkg/kriging_rs.js";
+
 let rawModulePromise: Promise<RawModule> | null = null;
 let rawModuleLoaded: RawModule | null = null;
-const wasmModuleSpecifier: string = "../pkg/kriging_rs.js";
 
 function loadRawModule(): Promise<RawModule> {
   if (!rawModulePromise) {
-    rawModulePromise = import(wasmModuleSpecifier) as Promise<RawModule>;
-    void rawModulePromise.then((mod) => {
-      rawModuleLoaded = mod;
-    });
+    const mod = wasmPkg as RawModule;
+    rawModulePromise = Promise.resolve(mod);
+    rawModuleLoaded = mod;
   }
   return rawModulePromise;
 }
