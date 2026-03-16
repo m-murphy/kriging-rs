@@ -67,6 +67,7 @@ const fromFittedOrdinary = OrdinaryKriging.fromFitted({
   lons,
   values,
   fittedVariogram: fit,
+  nuggetOverride: 0.05,
 });
 const _fromFittedPred: OrdinaryPrediction = fromFittedOrdinary.predict(0.5, 0.5);
 const fittedBatch = fittedOrdinary.predictBatch(lats, lons);
@@ -105,6 +106,7 @@ const binomialFromFittedPrior = BinomialKriging.fromFittedVariogramWithPrior({
   trials,
   fittedVariogram: fit,
   prior: { alpha: 1, beta: 1 },
+  nuggetOverride: 0.02,
 });
 const _binomialFromFittedPriorPred: BinomialPrediction =
   binomialFromFittedPrior.predict(0.4, 0.4);

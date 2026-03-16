@@ -169,6 +169,8 @@ export interface OrdinaryKrigingFromFittedOptions {
   lons: NumericArrayInput;
   values: NumericArrayInput;
   fittedVariogram: FittedVariogram;
+  /** If set, overrides the fitted variogram nugget when building the model (e.g. for UI-tuned sigma²). */
+  nuggetOverride?: number;
 }
 
 /**
@@ -181,6 +183,8 @@ export interface BinomialKrigingFromFittedVariogramOptions {
   successes: IntegerArrayInput;
   trials: IntegerArrayInput;
   fittedVariogram: FittedVariogram;
+  /** If set, overrides the fitted variogram nugget when building the model. */
+  nuggetOverride?: number;
 }
 
 /**
@@ -194,6 +198,8 @@ export interface BinomialKrigingFromFittedVariogramWithPriorOptions {
   trials: IntegerArrayInput;
   fittedVariogram: FittedVariogram;
   prior: BinomialPriorParams;
+  /** If set, overrides the fitted variogram nugget when building the model. */
+  nuggetOverride?: number;
 }
 
 /**
@@ -332,10 +338,13 @@ export async function init(input?: unknown): Promise<unknown> {
 
 export default init;
 
-function fittedToVariogramParams(f: FittedVariogram): VariogramParams {
+function fittedToVariogramParamsWithNuggetOverride(
+  f: FittedVariogram,
+  nuggetOverride: number | undefined
+): VariogramParams {
   return {
     variogramType: f.variogramType,
-    nugget: f.nugget,
+    nugget: nuggetOverride ?? f.nugget,
     sill: f.sill,
     range: f.range,
     shape: f.shape,
@@ -430,7 +439,10 @@ export class OrdinaryKriging {
       lats: options.lats,
       lons: options.lons,
       values: options.values,
-      variogram: fittedToVariogramParams(options.fittedVariogram),
+      variogram: fittedToVariogramParamsWithNuggetOverride(
+        options.fittedVariogram,
+        options.nuggetOverride
+      ),
     });
   }
 
@@ -587,7 +599,10 @@ export class BinomialKriging {
       lons: options.lons,
       successes: options.successes,
       trials: options.trials,
-      variogram: fittedToVariogramParams(options.fittedVariogram),
+      variogram: fittedToVariogramParamsWithNuggetOverride(
+        options.fittedVariogram,
+        options.nuggetOverride
+      ),
     });
   }
 
@@ -606,7 +621,10 @@ export class BinomialKriging {
       lons: options.lons,
       successes: options.successes,
       trials: options.trials,
-      variogram: fittedToVariogramParams(options.fittedVariogram),
+      variogram: fittedToVariogramParamsWithNuggetOverride(
+        options.fittedVariogram,
+        options.nuggetOverride
+      ),
       prior: options.prior,
     });
   }

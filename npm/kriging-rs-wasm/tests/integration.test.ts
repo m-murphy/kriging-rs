@@ -171,6 +171,36 @@ describe("Ordinary kriging", () => {
     expect(pred.variance).toBeGreaterThanOrEqual(0);
     model.free();
   });
+
+  test("OrdinaryKriging.fromFitted with nuggetOverride uses override", () => {
+    const fit = fitVariogram({
+      sampleLats: lats,
+      sampleLons: lons,
+      values,
+      variogramType: VariogramType.Gaussian,
+      nBins: 12,
+    });
+    const modelNoOverride = OrdinaryKriging.fromFitted({
+      lats,
+      lons,
+      values,
+      fittedVariogram: fit,
+    });
+    const predNoOverride = modelNoOverride.predict(0.5, 0.5);
+    modelNoOverride.free();
+    const modelOverride = OrdinaryKriging.fromFitted({
+      lats,
+      lons,
+      values,
+      fittedVariogram: fit,
+      nuggetOverride: 0,
+    });
+    const predOverride = modelOverride.predict(0.5, 0.5);
+    modelOverride.free();
+    expect(Number.isFinite(predOverride.value)).toBe(true);
+    expect(Number.isFinite(predOverride.variance)).toBe(true);
+    expect(predOverride.variance).not.toBe(predNoOverride.variance);
+  });
 });
 
 describe("Binomial kriging", () => {
