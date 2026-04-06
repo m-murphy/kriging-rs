@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-04-06
+
+### Fixed
+
+- **npm package (kriging-rs-wasm)** – Load the wasm-pack glue with a static `import` so bundlers (e.g. Vite) include `pkg/kriging_rs.js` and the `.wasm` file in the app output. Previously a dynamic `import("../pkg/kriging_rs.js")` was not analyzed at build time, so production requests to `/pkg/kriging_rs.js` failed unless consumers copied `pkg/` into `dist/`.
+- **npm package (kriging-rs-wasm)** – `typecheck:contracts` and `verify` run `build:wasm` before TypeScript so `pkg/kriging_rs.js` exists on fresh checkouts (fixes CI TS2307 after the static import change).
+
 ## [0.2.2] - 2025-03-15
 
 ### Fixed
@@ -55,6 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `KrigingError` (JS class with `cause`); `webgpuAvailable` when built with GPU support.
   - Batch and typed-array prediction APIs.
 
+[0.2.3]: https://github.com/m-murphy/kriging-rs/releases/tag/v0.2.3
 [0.2.2]: https://github.com/m-murphy/kriging-rs/releases/tag/v0.2.2
 [0.2.1]: https://github.com/m-murphy/kriging-rs/releases/tag/v0.2.1
 [0.2.0]: https://github.com/m-murphy/kriging-rs/releases/tag/v0.2.0
