@@ -9,7 +9,10 @@ repos:
         pass_filenames: false
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --all-targets --all-features -- -D warnings
+        # Note: the `f64` and `gpu` features are mutually exclusive (WGSL is
+        # f32-only), so we can't pass `--all-features`. Enable the GPU-capable
+        # feature set here; the `f64` build is covered by CI as its own job.
+        entry: cargo clippy --all-targets --features wasm,gpu,gpu-blocking -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false
