@@ -4,6 +4,7 @@ Cargo.lock
 *.pdb
 node_modules/
 /pkg/
+.vite/
 wasm-pack.log
 .DS_Store
 
