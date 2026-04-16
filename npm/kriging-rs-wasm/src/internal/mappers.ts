@@ -1,0 +1,226 @@
+/**
+ * Internal: value converters that turn raw WASM outputs into the strongly-typed shapes
+ * exposed by the public API.
+ *
+ * @module
+ */
+
+import type {
+  BinomialBatchArrayOutput,
+  BinomialCvResidual,
+  BinomialCvResult,
+  BinomialCvSummary,
+  BinomialPrediction,
+  CvResidual,
+  CvResult,
+  CvSummary,
+  EmpiricalVariogramResult,
+  OrdinaryBatchArrayOutput,
+  OrdinaryPrediction,
+} from "../types.js";
+import {
+  asRecord,
+  requireFiniteOrZero,
+  requireFloat64Array,
+  requireNumber,
+  requireUint32Array,
+} from "./convert.js";
+
+export function mapOrdinaryPrediction(value: unknown): OrdinaryPrediction {
+  const item = asRecord(value);
+  return {
+    value: requireNumber(item.value),
+    variance: requireNumber(item.variance),
+  };
+}
+
+export function mapOrdinaryPredictionArray(
+  value: unknown
+): OrdinaryPrediction[] {
+  if (!Array.isArray(value)) {
+    throw new Error("Expected ordinary prediction array output");
+  }
+  return value.map((item) => mapOrdinaryPrediction(item));
+}
+
+export function mapBinomialPrediction(value: unknown): BinomialPrediction {
+  const item = asRecord(value);
+  const maybeSnake = item.logit_value;
+  const maybeCamel = item.logitValue;
+  const logit = maybeCamel ?? maybeSnake;
+  const maybePrevalenceVariance =
+    item.prevalenceVariance ?? item.prevalence_variance;
+  const variance = requireNumber(item.variance);
+  const prevalence = requireNumber(item.prevalence);
+  const prevalenceVariance =
+    typeof maybePrevalenceVariance === "number" &&
+    Number.isFinite(maybePrevalenceVariance)
+      ? maybePrevalenceVariance
+      : deltaPrevalenceVariance(prevalence, variance);
+  return {
+    prevalence,
+    logitValue: requireNumber(logit),
+    variance,
+    prevalenceVariance,
+  };
+}
+
+export function mapBinomialPredictionArray(
+  value: unknown
+): BinomialPrediction[] {
+  if (!Array.isArray(value)) {
+    throw new Error("Expected binomial prediction array output");
+  }
+  return value.map((item) => mapBinomialPrediction(item));
+}
+
+export function mapOrdinaryBatchArrayOutput(
+  value: unknown
+): OrdinaryBatchArrayOutput {
+  const out = asRecord(value);
+  return {
+    values: requireFloat64Array(out.values),
+    variances: requireFloat64Array(out.variances),
+  };
+}
+
+export function mapBinomialBatchArrayOutput(
+  value: unknown
+): BinomialBatchArrayOutput {
+  const out = asRecord(value);
+  const prevalences = requireFloat64Array(out.prevalences);
+  const variances = requireFloat64Array(out.variances);
+  const explicit = out.prevalenceVariances;
+  const prevalenceVariances =
+    explicit instanceof Float64Array
+      ? explicit
+      : computeDeltaPrevalenceVariances(prevalences, variances);
+  return {
+    prevalences,
+    logitValues: requireFloat64Array(out.logitValues),
+    variances,
+    prevalenceVariances,
+  };
+}
+
+export function deltaPrevalenceVariance(
+  prevalence: number,
+  logitVariance: number
+): number {
+  const factor = prevalence * (1 - prevalence);
+  return factor * factor * Math.max(0, logitVariance);
+}
+
+function computeDeltaPrevalenceVariances(
+  prevalences: Float64Array,
+  variances: Float64Array
+): Float64Array {
+  const n = prevalences.length;
+  const out = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    out[i] = deltaPrevalenceVariance(prevalences[i], variances[i]);
+  }
+  return out;
+}
+
+export function mapEmpiricalVariogram(
+  value: unknown
+): EmpiricalVariogramResult {
+  const rec = asRecord(value);
+  return {
+    distances: requireFloat64Array(rec.distances),
+    semivariances: requireFloat64Array(rec.semivariances),
+    counts: requireUint32Array(rec.counts),
+  };
+}
+
+export function mapCvOutput(value: unknown): CvResult {
+  const rec = asRecord(value);
+  const indices = requireUint32Array(rec.indices);
+  const observed = requireFloat64Array(rec.observed);
+  const predicted = requireFloat64Array(rec.predicted);
+  const variances = requireFloat64Array(rec.variances);
+  const summaryRec = asRecord(rec.summary);
+  const summary: CvSummary = {
+    n: requireNumber(summaryRec.n),
+    meanError: requireFiniteOrZero(summaryRec.meanError),
+    rmse: requireFiniteOrZero(summaryRec.rmse),
+    msdr: requireFiniteOrZero(summaryRec.msdr),
+  };
+  const residuals: CvResidual[] = [];
+  for (let i = 0; i < indices.length; i++) {
+    residuals.push({
+      index: indices[i],
+      observed: observed[i],
+      predicted: predicted[i],
+      variance: variances[i],
+      error: observed[i] - predicted[i],
+    });
+  }
+  return {
+    residuals,
+    summary,
+    arrays: { indices, observed, predicted, variances },
+  };
+}
+
+function mapCvSummary(value: unknown): CvSummary {
+  const rec = asRecord(value);
+  return {
+    n: requireNumber(rec.n),
+    meanError: requireFiniteOrZero(rec.meanError),
+    rmse: requireFiniteOrZero(rec.rmse),
+    msdr: requireFiniteOrZero(rec.msdr),
+  };
+}
+
+export function mapBinomialCvOutput(value: unknown): BinomialCvResult {
+  const rec = asRecord(value);
+  const indices = requireUint32Array(rec.indices);
+  const successes = requireUint32Array(rec.successes);
+  const trials = requireUint32Array(rec.trials);
+  const observedLogit = requireFloat64Array(rec.observedLogit);
+  const predictedLogit = requireFloat64Array(rec.predictedLogit);
+  const logitVariance = requireFloat64Array(rec.logitVariance);
+  const observedPrevalence = requireFloat64Array(rec.observedPrevalence);
+  const predictedPrevalence = requireFloat64Array(rec.predictedPrevalence);
+  const prevalenceVariance = requireFloat64Array(rec.prevalenceVariance);
+  const summaryRec = asRecord(rec.summary);
+  const summary: BinomialCvSummary = {
+    n: requireNumber(summaryRec.n),
+    nEvaluated: requireNumber(summaryRec.nEvaluated),
+    logit: mapCvSummary(summaryRec.logit),
+    prevalence: mapCvSummary(summaryRec.prevalence),
+  };
+  const residuals: BinomialCvResidual[] = [];
+  for (let i = 0; i < indices.length; i++) {
+    residuals.push({
+      index: indices[i],
+      successes: successes[i],
+      trials: trials[i],
+      observedLogit: observedLogit[i],
+      predictedLogit: predictedLogit[i],
+      logitVariance: logitVariance[i],
+      observedPrevalence: observedPrevalence[i],
+      predictedPrevalence: predictedPrevalence[i],
+      prevalenceVariance: prevalenceVariance[i],
+      logitError: observedLogit[i] - predictedLogit[i],
+      prevalenceError: observedPrevalence[i] - predictedPrevalence[i],
+    });
+  }
+  return {
+    residuals,
+    summary,
+    arrays: {
+      indices,
+      successes,
+      trials,
+      observedLogit,
+      predictedLogit,
+      logitVariance,
+      observedPrevalence,
+      predictedPrevalence,
+      prevalenceVariance,
+    },
+  };
+}

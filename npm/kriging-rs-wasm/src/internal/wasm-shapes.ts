@@ -1,0 +1,432 @@
+/**
+ * Internal: TypeScript shapes for the WASM-exposed classes, functions, and options.
+ * Purely type-level; not part of the public API.
+ *
+ * @module
+ */
+
+/** WASM ordinary kriging instance shape. */
+export interface WasmOrdinaryInstance {
+  predict(lat: number, lon: number): unknown;
+  predictBatch(lats: Float64Array, lons: Float64Array): unknown;
+  predictBatchArrays(lats: Float64Array, lons: Float64Array): unknown;
+  predictGridArrays?(
+    xMin: number,
+    xMax: number,
+    yMin: number,
+    yMax: number,
+    xCells: number,
+    yCells: number
+  ): unknown;
+  setNeighborhood?(
+    maxNeighbors: number | undefined,
+    maxRadius: number | undefined
+  ): void;
+  neighborhood?(): unknown;
+  free?: () => void;
+  predictBatchGpu?(lats: Float64Array, lons: Float64Array): Promise<unknown>;
+  predictBatchGpuOrCpu?(
+    lats: Float64Array,
+    lons: Float64Array
+  ): Promise<unknown>;
+}
+
+/** WASM simple kriging instance shape. */
+export interface WasmSimpleInstance {
+  predict(lat: number, lon: number): unknown;
+  predictBatch(lats: Float64Array, lons: Float64Array): unknown;
+  predictBatchArrays(lats: Float64Array, lons: Float64Array): unknown;
+  mean(): number;
+  free?: () => void;
+}
+
+/** WASM universal kriging instance shape. */
+export interface WasmUniversalInstance {
+  predict(lat: number, lon: number): unknown;
+  predictBatch(lats: Float64Array, lons: Float64Array): unknown;
+  predictBatchArrays(lats: Float64Array, lons: Float64Array): unknown;
+  free?: () => void;
+}
+
+/** WASM projected kriging instance shape. */
+export interface WasmProjectedInstance {
+  predict(x: number, y: number): unknown;
+  predictBatch(xs: Float64Array, ys: Float64Array): unknown;
+  predictBatchArrays(xs: Float64Array, ys: Float64Array): unknown;
+  free?: () => void;
+}
+
+/** WASM binomial kriging instance shape. */
+export interface WasmBinomialInstance {
+  predict(lat: number, lon: number): unknown;
+  predictBatch(lats: Float64Array, lons: Float64Array): unknown;
+  predictBatchArrays(lats: Float64Array, lons: Float64Array): unknown;
+  predictGridArrays?(
+    xMin: number,
+    xMax: number,
+    yMin: number,
+    yMax: number,
+    xCells: number,
+    yCells: number
+  ): unknown;
+  free?: () => void;
+  predictBatchGpu?(lats: Float64Array, lons: Float64Array): Promise<unknown>;
+  predictBatchGpuOrCpu?(
+    lats: Float64Array,
+    lons: Float64Array
+  ): Promise<unknown>;
+}
+
+/** Shape passed to WASM (plain arrays for serde deserialization). */
+export interface OrdinaryKrigingOptionsWasm {
+  lats: number[];
+  lons: number[];
+  values: number[];
+  variogram: {
+    variogramType: string;
+    nugget: number;
+    sill: number;
+    range: number;
+    shape?: number;
+  };
+}
+
+export interface BinomialKrigingOptionsWasm {
+  lats: number[];
+  lons: number[];
+  successes: number[];
+  trials: number[];
+  variogram: {
+    variogramType: string;
+    nugget: number;
+    sill: number;
+    range: number;
+    shape?: number;
+  };
+}
+
+export interface BinomialKrigingWithPriorOptionsWasm extends BinomialKrigingOptionsWasm {
+  prior: { alpha: number; beta: number };
+}
+
+/** Shape of the raw `pkg/kriging_rs.js` glue module, typed for TS consumers. */
+export type RawModule = {
+  default: (input?: unknown) => Promise<unknown>;
+  WasmOrdinaryKriging: {
+    new (options: OrdinaryKrigingOptionsWasm): WasmOrdinaryInstance;
+    fromArrays?(
+      lats: Float64Array,
+      lons: Float64Array,
+      values: Float64Array,
+      variogramType: string,
+      nugget: number,
+      sill: number,
+      range: number,
+      shape?: number
+    ): WasmOrdinaryInstance;
+  };
+  WasmBinomialKriging: {
+    new (options: BinomialKrigingOptionsWasm): WasmBinomialInstance;
+    newWithPrior(
+      options: BinomialKrigingWithPriorOptionsWasm
+    ): WasmBinomialInstance;
+    fromArrays?(
+      lats: Float64Array,
+      lons: Float64Array,
+      successes: Uint32Array,
+      trials: Uint32Array,
+      variogramType: string,
+      nugget: number,
+      sill: number,
+      range: number,
+      shape?: number
+    ): WasmBinomialInstance;
+    fromPrecomputedLogits?(
+      lats: Float64Array,
+      lons: Float64Array,
+      logits: Float64Array,
+      variogramType: string,
+      nugget: number,
+      sill: number,
+      range: number,
+      shape?: number
+    ): WasmBinomialInstance;
+  };
+  WasmSimpleKriging?: {
+    fromArrays(
+      lats: Float64Array,
+      lons: Float64Array,
+      values: Float64Array,
+      mean: number,
+      variogramType: string,
+      nugget: number,
+      sill: number,
+      range: number,
+      shape?: number
+    ): WasmSimpleInstance;
+  };
+  WasmUniversalKriging?: {
+    fromArrays(
+      lats: Float64Array,
+      lons: Float64Array,
+      values: Float64Array,
+      trend: string,
+      variogramType: string,
+      nugget: number,
+      sill: number,
+      range: number,
+      shape?: number
+    ): WasmUniversalInstance;
+  };
+  WasmProjectedKriging?: {
+    fromArrays(
+      xs: Float64Array,
+      ys: Float64Array,
+      values: Float64Array,
+      variogramType: string,
+      nugget: number,
+      sill: number,
+      range: number,
+      shape: number | undefined,
+      majorAngleDeg: number,
+      rangeRatio: number
+    ): WasmProjectedInstance;
+  };
+  WasmVariogramType: {
+    readonly Spherical: number;
+    readonly Exponential: number;
+    readonly Gaussian: number;
+    readonly Cubic: number;
+    readonly Stable: number;
+    readonly Matern: number;
+    readonly Power: number;
+    readonly HoleEffect: number;
+  };
+  fitVariogram: (
+    sampleLats: Float64Array,
+    sampleLons: Float64Array,
+    values: Float64Array,
+    maxDistance: number | undefined,
+    nBins: number,
+    variogramType: number,
+    estimator?: string
+  ) => unknown;
+  computeEmpiricalVariogram?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    values: Float64Array,
+    maxDistance: number | undefined,
+    nBins: number,
+    estimator?: string
+  ) => unknown;
+  computeDirectionalEmpiricalVariogram?: (
+    xs: Float64Array,
+    ys: Float64Array,
+    values: Float64Array,
+    maxDistance: number,
+    nBins: number,
+    azimuthDeg: number,
+    toleranceDeg: number
+  ) => unknown;
+  leaveOneOut?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    values: Float64Array,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape?: number
+  ) => unknown;
+  kFold?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    values: Float64Array,
+    k: number,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape?: number
+  ) => unknown;
+  leaveOneOutSimple?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    values: Float64Array,
+    mean: number,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape?: number
+  ) => unknown;
+  kFoldSimple?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    values: Float64Array,
+    mean: number,
+    k: number,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape?: number
+  ) => unknown;
+  leaveOneOutUniversal?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    values: Float64Array,
+    trend: string,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape?: number
+  ) => unknown;
+  kFoldUniversal?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    values: Float64Array,
+    trend: string,
+    k: number,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape?: number
+  ) => unknown;
+  leaveOneOutProjected?: (
+    xs: Float64Array,
+    ys: Float64Array,
+    values: Float64Array,
+    majorAngleDeg: number,
+    rangeRatio: number,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape?: number
+  ) => unknown;
+  kFoldProjected?: (
+    xs: Float64Array,
+    ys: Float64Array,
+    values: Float64Array,
+    majorAngleDeg: number,
+    rangeRatio: number,
+    k: number,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape?: number
+  ) => unknown;
+  leaveOneOutBinomial?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    successes: Uint32Array,
+    trials: Uint32Array,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape?: number,
+    priorAlpha?: number,
+    priorBeta?: number
+  ) => unknown;
+  kFoldBinomial?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    successes: Uint32Array,
+    trials: Uint32Array,
+    k: number,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape?: number,
+    priorAlpha?: number,
+    priorBeta?: number
+  ) => unknown;
+  conditionalSimulate?: (
+    conditioningLats: Float64Array,
+    conditioningLons: Float64Array,
+    conditioningValues: Float64Array,
+    targetLats: Float64Array,
+    targetLons: Float64Array,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape: number | undefined,
+    seed: bigint,
+    targetOrder?: Uint32Array
+  ) => unknown;
+  conditionalSimulateSimple?: (
+    conditioningLats: Float64Array,
+    conditioningLons: Float64Array,
+    conditioningValues: Float64Array,
+    targetLats: Float64Array,
+    targetLons: Float64Array,
+    mean: number,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape: number | undefined,
+    seed: bigint,
+    targetOrder?: Uint32Array
+  ) => unknown;
+  conditionalSimulateUniversal?: (
+    conditioningLats: Float64Array,
+    conditioningLons: Float64Array,
+    conditioningValues: Float64Array,
+    targetLats: Float64Array,
+    targetLons: Float64Array,
+    trend: string,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape: number | undefined,
+    seed: bigint,
+    targetOrder?: Uint32Array
+  ) => unknown;
+  conditionalSimulateProjected?: (
+    conditioningXs: Float64Array,
+    conditioningYs: Float64Array,
+    conditioningValues: Float64Array,
+    targetXs: Float64Array,
+    targetYs: Float64Array,
+    majorAngleDeg: number,
+    rangeRatio: number,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape: number | undefined,
+    seed: bigint,
+    targetOrder?: Uint32Array
+  ) => unknown;
+  conditionalSimulateBinomial?: (
+    conditioningLats: Float64Array,
+    conditioningLons: Float64Array,
+    successes: Uint32Array,
+    trials: Uint32Array,
+    targetLats: Float64Array,
+    targetLons: Float64Array,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape: number | undefined,
+    priorAlpha: number | undefined,
+    priorBeta: number | undefined,
+    seed: bigint,
+    targetOrder?: Uint32Array
+  ) => unknown;
+  evaluateNestedVariogram?: (
+    components: unknown,
+    distances: Float64Array
+  ) => unknown;
+  webgpuAvailable?: () => Promise<unknown>;
+};

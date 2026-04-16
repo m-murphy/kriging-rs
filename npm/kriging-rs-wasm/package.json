@@ -24,7 +24,11 @@
     "node": ">=18"
   },
   "type": "module",
-  "sideEffects": true,
+  "sideEffects": [
+    "./dist/index.js",
+    "./pkg/*.js",
+    "*.wasm"
+  ],
   "files": [
     "dist",
     "pkg",
