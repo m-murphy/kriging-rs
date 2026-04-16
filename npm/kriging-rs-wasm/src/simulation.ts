@@ -26,12 +26,20 @@ import {
   toUint32Array,
 } from "./internal/convert.js";
 import { requireLoadedModule } from "./internal/module.js";
+import {
+  packSpaceTimeVariogram,
+  requireSpaceTimeUniversalTrend,
+} from "./internal/spacetime.js";
 import type {
   BinomialSimulationResult,
   ConditionalSimulateBinomialOptions,
   ConditionalSimulateOptions,
   ConditionalSimulateProjectedOptions,
   ConditionalSimulateSimpleOptions,
+  ConditionalSimulateSpaceTimeBinomialOptions,
+  ConditionalSimulateSpaceTimeOptions,
+  ConditionalSimulateSpaceTimeSimpleOptions,
+  ConditionalSimulateSpaceTimeUniversalOptions,
   ConditionalSimulateUniversalOptions,
 } from "./types.js";
 
@@ -257,6 +265,204 @@ export function conditionalSimulateBinomial(
       options.variogram.sill,
       options.variogram.range,
       options.variogram.shape,
+      options.priorAlpha,
+      options.priorBeta,
+      seed,
+      targetOrder
+    ) as { logitSamples: unknown; prevalenceSamples: unknown };
+    return {
+      logitSamples: requireFloat64Array(raw.logitSamples),
+      prevalenceSamples: requireFloat64Array(raw.prevalenceSamples),
+    };
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Space-time conditional simulation
+// ---------------------------------------------------------------------------
+
+/**
+ * Sequential Gaussian simulation for space-time ordinary kriging on geographic
+ * coordinates. Returns a `Float64Array` with one sampled value per target in input
+ * order. Deterministic for a given `seed`.
+ */
+export function conditionalSimulateSpaceTime(
+  options: ConditionalSimulateSpaceTimeOptions
+): Float64Array {
+  const mod = requireLoadedModule();
+  if (typeof mod.conditionalSimulateSpaceTime !== "function") {
+    unavailable("conditionalSimulateSpaceTime");
+  }
+  const seed = normalizeSeed(options.seed);
+  const targetOrder = normalizeTargetOrder(options.targetOrder);
+  const packed = packSpaceTimeVariogram(options.variogram);
+  try {
+    const out = mod.conditionalSimulateSpaceTime(
+      toFloat64Array(options.conditioningLats),
+      toFloat64Array(options.conditioningLons),
+      toFloat64Array(options.conditioningTimes),
+      toFloat64Array(options.conditioningValues),
+      toFloat64Array(options.targetLats),
+      toFloat64Array(options.targetLons),
+      toFloat64Array(options.targetTimes),
+      packed.family,
+      packed.spatialType,
+      packed.spatialNugget,
+      packed.spatialSill,
+      packed.spatialRange,
+      packed.spatialShape,
+      packed.temporalType,
+      packed.temporalNugget,
+      packed.temporalSill,
+      packed.temporalRange,
+      packed.temporalShape,
+      packed.k1,
+      packed.k2,
+      packed.k3,
+      seed,
+      targetOrder
+    );
+    return requireFloat64Array(out);
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+}
+
+/** SGS for space-time simple kriging with a known `mean`. */
+export function conditionalSimulateSpaceTimeSimple(
+  options: ConditionalSimulateSpaceTimeSimpleOptions
+): Float64Array {
+  const mod = requireLoadedModule();
+  if (typeof mod.conditionalSimulateSpaceTimeSimple !== "function") {
+    unavailable("conditionalSimulateSpaceTimeSimple");
+  }
+  const seed = normalizeSeed(options.seed);
+  const targetOrder = normalizeTargetOrder(options.targetOrder);
+  const packed = packSpaceTimeVariogram(options.variogram);
+  try {
+    const out = mod.conditionalSimulateSpaceTimeSimple(
+      toFloat64Array(options.conditioningLats),
+      toFloat64Array(options.conditioningLons),
+      toFloat64Array(options.conditioningTimes),
+      toFloat64Array(options.conditioningValues),
+      toFloat64Array(options.targetLats),
+      toFloat64Array(options.targetLons),
+      toFloat64Array(options.targetTimes),
+      options.mean,
+      packed.family,
+      packed.spatialType,
+      packed.spatialNugget,
+      packed.spatialSill,
+      packed.spatialRange,
+      packed.spatialShape,
+      packed.temporalType,
+      packed.temporalNugget,
+      packed.temporalSill,
+      packed.temporalRange,
+      packed.temporalShape,
+      packed.k1,
+      packed.k2,
+      packed.k3,
+      seed,
+      targetOrder
+    );
+    return requireFloat64Array(out);
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+}
+
+/**
+ * SGS for space-time universal kriging. Trend coefficients are re-estimated at each
+ * simulation step against the growing conditioning pool; requires `p + 1` initial
+ * conditioning stations, where `p` is the trend basis size.
+ */
+export function conditionalSimulateSpaceTimeUniversal(
+  options: ConditionalSimulateSpaceTimeUniversalOptions
+): Float64Array {
+  const mod = requireLoadedModule();
+  if (typeof mod.conditionalSimulateSpaceTimeUniversal !== "function") {
+    unavailable("conditionalSimulateSpaceTimeUniversal");
+  }
+  const seed = normalizeSeed(options.seed);
+  const targetOrder = normalizeTargetOrder(options.targetOrder);
+  const packed = packSpaceTimeVariogram(options.variogram);
+  const trend = requireSpaceTimeUniversalTrend(options.trend);
+  try {
+    const out = mod.conditionalSimulateSpaceTimeUniversal(
+      toFloat64Array(options.conditioningLats),
+      toFloat64Array(options.conditioningLons),
+      toFloat64Array(options.conditioningTimes),
+      toFloat64Array(options.conditioningValues),
+      toFloat64Array(options.targetLats),
+      toFloat64Array(options.targetLons),
+      toFloat64Array(options.targetTimes),
+      trend,
+      packed.family,
+      packed.spatialType,
+      packed.spatialNugget,
+      packed.spatialSill,
+      packed.spatialRange,
+      packed.spatialShape,
+      packed.temporalType,
+      packed.temporalNugget,
+      packed.temporalSill,
+      packed.temporalRange,
+      packed.temporalShape,
+      packed.k1,
+      packed.k2,
+      packed.k3,
+      seed,
+      targetOrder
+    );
+    return requireFloat64Array(out);
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+}
+
+/**
+ * SGS for space-time binomial kriging. Simulation happens on the logit scale; the
+ * result carries both logit and prevalence samples. See {@link conditionalSimulateBinomial}
+ * for full semantics.
+ */
+export function conditionalSimulateSpaceTimeBinomial(
+  options: ConditionalSimulateSpaceTimeBinomialOptions
+): BinomialSimulationResult {
+  const mod = requireLoadedModule();
+  if (typeof mod.conditionalSimulateSpaceTimeBinomial !== "function") {
+    unavailable("conditionalSimulateSpaceTimeBinomial");
+  }
+  validateBinomialPrior(options.priorAlpha, options.priorBeta);
+  const seed = normalizeSeed(options.seed);
+  const targetOrder = normalizeTargetOrder(options.targetOrder);
+  const packed = packSpaceTimeVariogram(options.variogram);
+  try {
+    const raw = mod.conditionalSimulateSpaceTimeBinomial(
+      toFloat64Array(options.conditioningLats),
+      toFloat64Array(options.conditioningLons),
+      toFloat64Array(options.conditioningTimes),
+      toUint32Array(options.successes),
+      toUint32Array(options.trials),
+      toFloat64Array(options.targetLats),
+      toFloat64Array(options.targetLons),
+      toFloat64Array(options.targetTimes),
+      packed.family,
+      packed.spatialType,
+      packed.spatialNugget,
+      packed.spatialSill,
+      packed.spatialRange,
+      packed.spatialShape,
+      packed.temporalType,
+      packed.temporalNugget,
+      packed.temporalSill,
+      packed.temporalRange,
+      packed.temporalShape,
+      packed.k1,
+      packed.k2,
+      packed.k3,
       options.priorAlpha,
       options.priorBeta,
       seed,

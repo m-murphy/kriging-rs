@@ -23,6 +23,10 @@ import { KrigingError, wrapThrown } from "./errors.js";
 import { toFloat64Array, toUint32Array } from "./internal/convert.js";
 import { mapBinomialCvOutput, mapCvOutput } from "./internal/mappers.js";
 import { requireLoadedModule } from "./internal/module.js";
+import {
+  packSpaceTimeVariogram,
+  requireSpaceTimeUniversalTrend,
+} from "./internal/spacetime.js";
 import type {
   BinomialCvResult,
   CvResult,
@@ -30,11 +34,19 @@ import type {
   KFoldOptions,
   KFoldProjectedOptions,
   KFoldSimpleOptions,
+  KFoldSpaceTimeBinomialOptions,
+  KFoldSpaceTimeOptions,
+  KFoldSpaceTimeSimpleOptions,
+  KFoldSpaceTimeUniversalOptions,
   KFoldUniversalOptions,
   LeaveOneOutBinomialOptions,
   LeaveOneOutOptions,
   LeaveOneOutProjectedOptions,
   LeaveOneOutSimpleOptions,
+  LeaveOneOutSpaceTimeBinomialOptions,
+  LeaveOneOutSpaceTimeOptions,
+  LeaveOneOutSpaceTimeSimpleOptions,
+  LeaveOneOutSpaceTimeUniversalOptions,
   LeaveOneOutUniversalOptions,
 } from "./types.js";
 
@@ -317,6 +329,335 @@ export function kFoldBinomial(options: KFoldBinomialOptions): BinomialCvResult {
       options.variogram.sill,
       options.variogram.range,
       options.variogram.shape,
+      options.priorAlpha,
+      options.priorBeta
+    );
+    return mapBinomialCvOutput(out);
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Space-time cross-validation
+// ---------------------------------------------------------------------------
+
+/**
+ * Leave-one-out CV for space-time ordinary kriging. Coordinates are geographic
+ * `(lat, lon)` in degrees; `times` is a scalar axis with user-chosen units.
+ */
+export function leaveOneOutSpaceTime(
+  options: LeaveOneOutSpaceTimeOptions
+): CvResult {
+  const mod = requireLoadedModule();
+  if (typeof mod.leaveOneOutSpaceTime !== "function") {
+    unavailable("leaveOneOutSpaceTime");
+  }
+  const packed = packSpaceTimeVariogram(options.variogram);
+  try {
+    const out = mod.leaveOneOutSpaceTime(
+      toFloat64Array(options.lats),
+      toFloat64Array(options.lons),
+      toFloat64Array(options.times),
+      toFloat64Array(options.values),
+      packed.family,
+      packed.spatialType,
+      packed.spatialNugget,
+      packed.spatialSill,
+      packed.spatialRange,
+      packed.spatialShape,
+      packed.temporalType,
+      packed.temporalNugget,
+      packed.temporalSill,
+      packed.temporalRange,
+      packed.temporalShape,
+      packed.k1,
+      packed.k2,
+      packed.k3
+    );
+    return mapCvOutput(out);
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+}
+
+/** K-fold CV for space-time ordinary kriging. */
+export function kFoldSpaceTime(options: KFoldSpaceTimeOptions): CvResult {
+  const mod = requireLoadedModule();
+  if (typeof mod.kFoldSpaceTime !== "function") unavailable("kFoldSpaceTime");
+  const packed = packSpaceTimeVariogram(options.variogram);
+  try {
+    const out = mod.kFoldSpaceTime(
+      toFloat64Array(options.lats),
+      toFloat64Array(options.lons),
+      toFloat64Array(options.times),
+      toFloat64Array(options.values),
+      options.k,
+      packed.family,
+      packed.spatialType,
+      packed.spatialNugget,
+      packed.spatialSill,
+      packed.spatialRange,
+      packed.spatialShape,
+      packed.temporalType,
+      packed.temporalNugget,
+      packed.temporalSill,
+      packed.temporalRange,
+      packed.temporalShape,
+      packed.k1,
+      packed.k2,
+      packed.k3
+    );
+    return mapCvOutput(out);
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+}
+
+/** Leave-one-out CV for space-time simple kriging with a known `mean`. */
+export function leaveOneOutSpaceTimeSimple(
+  options: LeaveOneOutSpaceTimeSimpleOptions
+): CvResult {
+  const mod = requireLoadedModule();
+  if (typeof mod.leaveOneOutSpaceTimeSimple !== "function") {
+    unavailable("leaveOneOutSpaceTimeSimple");
+  }
+  const packed = packSpaceTimeVariogram(options.variogram);
+  try {
+    const out = mod.leaveOneOutSpaceTimeSimple(
+      toFloat64Array(options.lats),
+      toFloat64Array(options.lons),
+      toFloat64Array(options.times),
+      toFloat64Array(options.values),
+      options.mean,
+      packed.family,
+      packed.spatialType,
+      packed.spatialNugget,
+      packed.spatialSill,
+      packed.spatialRange,
+      packed.spatialShape,
+      packed.temporalType,
+      packed.temporalNugget,
+      packed.temporalSill,
+      packed.temporalRange,
+      packed.temporalShape,
+      packed.k1,
+      packed.k2,
+      packed.k3
+    );
+    return mapCvOutput(out);
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+}
+
+/** K-fold CV for space-time simple kriging with a known `mean`. */
+export function kFoldSpaceTimeSimple(
+  options: KFoldSpaceTimeSimpleOptions
+): CvResult {
+  const mod = requireLoadedModule();
+  if (typeof mod.kFoldSpaceTimeSimple !== "function") {
+    unavailable("kFoldSpaceTimeSimple");
+  }
+  const packed = packSpaceTimeVariogram(options.variogram);
+  try {
+    const out = mod.kFoldSpaceTimeSimple(
+      toFloat64Array(options.lats),
+      toFloat64Array(options.lons),
+      toFloat64Array(options.times),
+      toFloat64Array(options.values),
+      options.mean,
+      options.k,
+      packed.family,
+      packed.spatialType,
+      packed.spatialNugget,
+      packed.spatialSill,
+      packed.spatialRange,
+      packed.spatialShape,
+      packed.temporalType,
+      packed.temporalNugget,
+      packed.temporalSill,
+      packed.temporalRange,
+      packed.temporalShape,
+      packed.k1,
+      packed.k2,
+      packed.k3
+    );
+    return mapCvOutput(out);
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+}
+
+/**
+ * Leave-one-out CV for space-time universal kriging. Trend coefficients are
+ * re-estimated inside each fold from the training stations.
+ */
+export function leaveOneOutSpaceTimeUniversal(
+  options: LeaveOneOutSpaceTimeUniversalOptions
+): CvResult {
+  const mod = requireLoadedModule();
+  if (typeof mod.leaveOneOutSpaceTimeUniversal !== "function") {
+    unavailable("leaveOneOutSpaceTimeUniversal");
+  }
+  const packed = packSpaceTimeVariogram(options.variogram);
+  const trend = requireSpaceTimeUniversalTrend(options.trend);
+  try {
+    const out = mod.leaveOneOutSpaceTimeUniversal(
+      toFloat64Array(options.lats),
+      toFloat64Array(options.lons),
+      toFloat64Array(options.times),
+      toFloat64Array(options.values),
+      trend,
+      packed.family,
+      packed.spatialType,
+      packed.spatialNugget,
+      packed.spatialSill,
+      packed.spatialRange,
+      packed.spatialShape,
+      packed.temporalType,
+      packed.temporalNugget,
+      packed.temporalSill,
+      packed.temporalRange,
+      packed.temporalShape,
+      packed.k1,
+      packed.k2,
+      packed.k3
+    );
+    return mapCvOutput(out);
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+}
+
+/** K-fold CV for space-time universal kriging. */
+export function kFoldSpaceTimeUniversal(
+  options: KFoldSpaceTimeUniversalOptions
+): CvResult {
+  const mod = requireLoadedModule();
+  if (typeof mod.kFoldSpaceTimeUniversal !== "function") {
+    unavailable("kFoldSpaceTimeUniversal");
+  }
+  const packed = packSpaceTimeVariogram(options.variogram);
+  const trend = requireSpaceTimeUniversalTrend(options.trend);
+  try {
+    const out = mod.kFoldSpaceTimeUniversal(
+      toFloat64Array(options.lats),
+      toFloat64Array(options.lons),
+      toFloat64Array(options.times),
+      toFloat64Array(options.values),
+      trend,
+      options.k,
+      packed.family,
+      packed.spatialType,
+      packed.spatialNugget,
+      packed.spatialSill,
+      packed.spatialRange,
+      packed.spatialShape,
+      packed.temporalType,
+      packed.temporalNugget,
+      packed.temporalSill,
+      packed.temporalRange,
+      packed.temporalShape,
+      packed.k1,
+      packed.k2,
+      packed.k3
+    );
+    return mapCvOutput(out);
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+}
+
+function validateSpaceTimeBinomialPrior(
+  priorAlpha: number | undefined,
+  priorBeta: number | undefined
+): void {
+  const hasAlpha = priorAlpha !== undefined;
+  const hasBeta = priorBeta !== undefined;
+  if (hasAlpha !== hasBeta) {
+    throw new KrigingError(
+      "priorAlpha and priorBeta must be provided together",
+      { code: "invalid_input" }
+    );
+  }
+}
+
+/**
+ * Leave-one-out CV for space-time binomial kriging. Returns residuals on **both** the
+ * logit and prevalence scales (see {@link leaveOneOutBinomial}).
+ */
+export function leaveOneOutSpaceTimeBinomial(
+  options: LeaveOneOutSpaceTimeBinomialOptions
+): BinomialCvResult {
+  const mod = requireLoadedModule();
+  if (typeof mod.leaveOneOutSpaceTimeBinomial !== "function") {
+    unavailable("leaveOneOutSpaceTimeBinomial");
+  }
+  validateSpaceTimeBinomialPrior(options.priorAlpha, options.priorBeta);
+  const packed = packSpaceTimeVariogram(options.variogram);
+  try {
+    const out = mod.leaveOneOutSpaceTimeBinomial(
+      toFloat64Array(options.lats),
+      toFloat64Array(options.lons),
+      toFloat64Array(options.times),
+      toUint32Array(options.successes),
+      toUint32Array(options.trials),
+      packed.family,
+      packed.spatialType,
+      packed.spatialNugget,
+      packed.spatialSill,
+      packed.spatialRange,
+      packed.spatialShape,
+      packed.temporalType,
+      packed.temporalNugget,
+      packed.temporalSill,
+      packed.temporalRange,
+      packed.temporalShape,
+      packed.k1,
+      packed.k2,
+      packed.k3,
+      options.priorAlpha,
+      options.priorBeta
+    );
+    return mapBinomialCvOutput(out);
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+}
+
+/** K-fold CV for space-time binomial kriging. */
+export function kFoldSpaceTimeBinomial(
+  options: KFoldSpaceTimeBinomialOptions
+): BinomialCvResult {
+  const mod = requireLoadedModule();
+  if (typeof mod.kFoldSpaceTimeBinomial !== "function") {
+    unavailable("kFoldSpaceTimeBinomial");
+  }
+  validateSpaceTimeBinomialPrior(options.priorAlpha, options.priorBeta);
+  const packed = packSpaceTimeVariogram(options.variogram);
+  try {
+    const out = mod.kFoldSpaceTimeBinomial(
+      toFloat64Array(options.lats),
+      toFloat64Array(options.lons),
+      toFloat64Array(options.times),
+      toUint32Array(options.successes),
+      toUint32Array(options.trials),
+      options.k,
+      packed.family,
+      packed.spatialType,
+      packed.spatialNugget,
+      packed.spatialSill,
+      packed.spatialRange,
+      packed.spatialShape,
+      packed.temporalType,
+      packed.temporalNugget,
+      packed.temporalSill,
+      packed.temporalRange,
+      packed.temporalShape,
+      packed.k1,
+      packed.k2,
+      packed.k3,
       options.priorAlpha,
       options.priorBeta
     );

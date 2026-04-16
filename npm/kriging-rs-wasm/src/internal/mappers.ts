@@ -14,9 +14,15 @@ import type {
   CvResidual,
   CvResult,
   CvSummary,
+  EmpiricalSpaceTimeVariogramResult,
   EmpiricalVariogramResult,
+  FitSpaceTimeVariogramResult,
+  FittedSpaceTimeVariogram,
   OrdinaryBatchArrayOutput,
   OrdinaryPrediction,
+  SpaceTimeVariogramFamily,
+  VariogramParams,
+  VariogramTypeName,
 } from "../types.js";
 import {
   asRecord,
@@ -24,6 +30,7 @@ import {
   requireFloat64Array,
   requireNumber,
   requireUint32Array,
+  requireVariogramType,
 } from "./convert.js";
 
 export function mapOrdinaryPrediction(value: unknown): OrdinaryPrediction {
@@ -222,5 +229,65 @@ export function mapBinomialCvOutput(value: unknown): BinomialCvResult {
       predictedPrevalence,
       prevalenceVariance,
     },
+  };
+}
+
+// ---------- Space-time mappers ----------
+
+function mapVariogramParams(value: unknown): VariogramParams {
+  const rec = asRecord(value);
+  const vt = requireVariogramType(rec.variogramType);
+  const out: VariogramParams = {
+    variogramType: vt as VariogramTypeName,
+    nugget: requireNumber(rec.nugget),
+    sill: requireNumber(rec.sill),
+    range: requireNumber(rec.range),
+  };
+  if (typeof rec.shape === "number" && Number.isFinite(rec.shape)) {
+    out.shape = rec.shape;
+  }
+  return out;
+}
+
+export function mapFittedSpaceTimeVariogram(
+  value: unknown
+): FittedSpaceTimeVariogram {
+  const rec = asRecord(value);
+  const family = rec.family;
+  if (family !== "separable" && family !== "product_sum") {
+    throw new Error("Unknown space-time variogram family from WASM");
+  }
+  return {
+    family: family as SpaceTimeVariogramFamily,
+    spatial: mapVariogramParams(rec.spatial),
+    temporal: mapVariogramParams(rec.temporal),
+    k1: requireNumber(rec.k1),
+    k2: requireNumber(rec.k2),
+    k3: requireNumber(rec.k3),
+    residuals: requireFiniteOrZero(rec.residuals),
+  };
+}
+
+export function mapEmpiricalSpaceTimeVariogram(
+  value: unknown
+): EmpiricalSpaceTimeVariogramResult {
+  const rec = asRecord(value);
+  return {
+    nSpatialBins: requireNumber(rec.nSpatialBins),
+    nTemporalBins: requireNumber(rec.nTemporalBins),
+    spatialLags: requireFloat64Array(rec.spatialLags),
+    temporalLags: requireFloat64Array(rec.temporalLags),
+    semivariances: requireFloat64Array(rec.semivariances),
+    nPairs: requireFloat64Array(rec.nPairs),
+  };
+}
+
+export function mapFitSpaceTimeVariogramResult(
+  value: unknown
+): FitSpaceTimeVariogramResult {
+  const rec = asRecord(value);
+  return {
+    empirical: mapEmpiricalSpaceTimeVariogram(rec.empirical),
+    fit: mapFittedSpaceTimeVariogram(rec.fit),
   };
 }

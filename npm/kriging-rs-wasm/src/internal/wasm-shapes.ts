@@ -429,4 +429,451 @@ export type RawModule = {
     distances: Float64Array
   ) => unknown;
   webgpuAvailable?: () => Promise<unknown>;
+  leaveOneOutSpaceTime?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    times: Float64Array,
+    values: Float64Array,
+    family: string,
+    spatialType: string,
+    spatialNugget: number,
+    spatialSill: number,
+    spatialRange: number,
+    spatialShape: number | undefined,
+    temporalType: string,
+    temporalNugget: number,
+    temporalSill: number,
+    temporalRange: number,
+    temporalShape: number | undefined,
+    k1: number | undefined,
+    k2: number | undefined,
+    k3: number | undefined
+  ) => unknown;
+  kFoldSpaceTime?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    times: Float64Array,
+    values: Float64Array,
+    k: number,
+    family: string,
+    spatialType: string,
+    spatialNugget: number,
+    spatialSill: number,
+    spatialRange: number,
+    spatialShape: number | undefined,
+    temporalType: string,
+    temporalNugget: number,
+    temporalSill: number,
+    temporalRange: number,
+    temporalShape: number | undefined,
+    k1: number | undefined,
+    k2: number | undefined,
+    k3: number | undefined
+  ) => unknown;
+  leaveOneOutSpaceTimeSimple?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    times: Float64Array,
+    values: Float64Array,
+    mean: number,
+    family: string,
+    spatialType: string,
+    spatialNugget: number,
+    spatialSill: number,
+    spatialRange: number,
+    spatialShape: number | undefined,
+    temporalType: string,
+    temporalNugget: number,
+    temporalSill: number,
+    temporalRange: number,
+    temporalShape: number | undefined,
+    k1: number | undefined,
+    k2: number | undefined,
+    k3: number | undefined
+  ) => unknown;
+  kFoldSpaceTimeSimple?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    times: Float64Array,
+    values: Float64Array,
+    mean: number,
+    k: number,
+    family: string,
+    spatialType: string,
+    spatialNugget: number,
+    spatialSill: number,
+    spatialRange: number,
+    spatialShape: number | undefined,
+    temporalType: string,
+    temporalNugget: number,
+    temporalSill: number,
+    temporalRange: number,
+    temporalShape: number | undefined,
+    k1: number | undefined,
+    k2: number | undefined,
+    k3: number | undefined
+  ) => unknown;
+  leaveOneOutSpaceTimeUniversal?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    times: Float64Array,
+    values: Float64Array,
+    trend: string,
+    family: string,
+    spatialType: string,
+    spatialNugget: number,
+    spatialSill: number,
+    spatialRange: number,
+    spatialShape: number | undefined,
+    temporalType: string,
+    temporalNugget: number,
+    temporalSill: number,
+    temporalRange: number,
+    temporalShape: number | undefined,
+    k1: number | undefined,
+    k2: number | undefined,
+    k3: number | undefined
+  ) => unknown;
+  kFoldSpaceTimeUniversal?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    times: Float64Array,
+    values: Float64Array,
+    trend: string,
+    k: number,
+    family: string,
+    spatialType: string,
+    spatialNugget: number,
+    spatialSill: number,
+    spatialRange: number,
+    spatialShape: number | undefined,
+    temporalType: string,
+    temporalNugget: number,
+    temporalSill: number,
+    temporalRange: number,
+    temporalShape: number | undefined,
+    k1: number | undefined,
+    k2: number | undefined,
+    k3: number | undefined
+  ) => unknown;
+  leaveOneOutSpaceTimeBinomial?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    times: Float64Array,
+    successes: Uint32Array,
+    trials: Uint32Array,
+    family: string,
+    spatialType: string,
+    spatialNugget: number,
+    spatialSill: number,
+    spatialRange: number,
+    spatialShape: number | undefined,
+    temporalType: string,
+    temporalNugget: number,
+    temporalSill: number,
+    temporalRange: number,
+    temporalShape: number | undefined,
+    k1: number | undefined,
+    k2: number | undefined,
+    k3: number | undefined,
+    priorAlpha: number | undefined,
+    priorBeta: number | undefined
+  ) => unknown;
+  kFoldSpaceTimeBinomial?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    times: Float64Array,
+    successes: Uint32Array,
+    trials: Uint32Array,
+    k: number,
+    family: string,
+    spatialType: string,
+    spatialNugget: number,
+    spatialSill: number,
+    spatialRange: number,
+    spatialShape: number | undefined,
+    temporalType: string,
+    temporalNugget: number,
+    temporalSill: number,
+    temporalRange: number,
+    temporalShape: number | undefined,
+    k1: number | undefined,
+    k2: number | undefined,
+    k3: number | undefined,
+    priorAlpha: number | undefined,
+    priorBeta: number | undefined
+  ) => unknown;
+  conditionalSimulateSpaceTime?: (
+    conditioningLats: Float64Array,
+    conditioningLons: Float64Array,
+    conditioningTimes: Float64Array,
+    conditioningValues: Float64Array,
+    targetLats: Float64Array,
+    targetLons: Float64Array,
+    targetTimes: Float64Array,
+    family: string,
+    spatialType: string,
+    spatialNugget: number,
+    spatialSill: number,
+    spatialRange: number,
+    spatialShape: number | undefined,
+    temporalType: string,
+    temporalNugget: number,
+    temporalSill: number,
+    temporalRange: number,
+    temporalShape: number | undefined,
+    k1: number | undefined,
+    k2: number | undefined,
+    k3: number | undefined,
+    seed: bigint,
+    targetOrder?: Uint32Array
+  ) => unknown;
+  conditionalSimulateSpaceTimeSimple?: (
+    conditioningLats: Float64Array,
+    conditioningLons: Float64Array,
+    conditioningTimes: Float64Array,
+    conditioningValues: Float64Array,
+    targetLats: Float64Array,
+    targetLons: Float64Array,
+    targetTimes: Float64Array,
+    mean: number,
+    family: string,
+    spatialType: string,
+    spatialNugget: number,
+    spatialSill: number,
+    spatialRange: number,
+    spatialShape: number | undefined,
+    temporalType: string,
+    temporalNugget: number,
+    temporalSill: number,
+    temporalRange: number,
+    temporalShape: number | undefined,
+    k1: number | undefined,
+    k2: number | undefined,
+    k3: number | undefined,
+    seed: bigint,
+    targetOrder?: Uint32Array
+  ) => unknown;
+  conditionalSimulateSpaceTimeUniversal?: (
+    conditioningLats: Float64Array,
+    conditioningLons: Float64Array,
+    conditioningTimes: Float64Array,
+    conditioningValues: Float64Array,
+    targetLats: Float64Array,
+    targetLons: Float64Array,
+    targetTimes: Float64Array,
+    trend: string,
+    family: string,
+    spatialType: string,
+    spatialNugget: number,
+    spatialSill: number,
+    spatialRange: number,
+    spatialShape: number | undefined,
+    temporalType: string,
+    temporalNugget: number,
+    temporalSill: number,
+    temporalRange: number,
+    temporalShape: number | undefined,
+    k1: number | undefined,
+    k2: number | undefined,
+    k3: number | undefined,
+    seed: bigint,
+    targetOrder?: Uint32Array
+  ) => unknown;
+  conditionalSimulateSpaceTimeBinomial?: (
+    conditioningLats: Float64Array,
+    conditioningLons: Float64Array,
+    conditioningTimes: Float64Array,
+    successes: Uint32Array,
+    trials: Uint32Array,
+    targetLats: Float64Array,
+    targetLons: Float64Array,
+    targetTimes: Float64Array,
+    family: string,
+    spatialType: string,
+    spatialNugget: number,
+    spatialSill: number,
+    spatialRange: number,
+    spatialShape: number | undefined,
+    temporalType: string,
+    temporalNugget: number,
+    temporalSill: number,
+    temporalRange: number,
+    temporalShape: number | undefined,
+    k1: number | undefined,
+    k2: number | undefined,
+    k3: number | undefined,
+    priorAlpha: number | undefined,
+    priorBeta: number | undefined,
+    seed: bigint,
+    targetOrder?: Uint32Array
+  ) => unknown;
+  WasmSpaceTimeOrdinaryKriging?: {
+    fromArrays(
+      lats: Float64Array,
+      lons: Float64Array,
+      times: Float64Array,
+      values: Float64Array,
+      family: string,
+      spatialType: string,
+      spatialNugget: number,
+      spatialSill: number,
+      spatialRange: number,
+      spatialShape: number | undefined,
+      temporalType: string,
+      temporalNugget: number,
+      temporalSill: number,
+      temporalRange: number,
+      temporalShape: number | undefined,
+      k1: number | undefined,
+      k2: number | undefined,
+      k3: number | undefined
+    ): WasmSpaceTimeInstance;
+  };
+  WasmSpaceTimeSimpleKriging?: {
+    fromArrays(
+      lats: Float64Array,
+      lons: Float64Array,
+      times: Float64Array,
+      values: Float64Array,
+      mean: number,
+      family: string,
+      spatialType: string,
+      spatialNugget: number,
+      spatialSill: number,
+      spatialRange: number,
+      spatialShape: number | undefined,
+      temporalType: string,
+      temporalNugget: number,
+      temporalSill: number,
+      temporalRange: number,
+      temporalShape: number | undefined,
+      k1: number | undefined,
+      k2: number | undefined,
+      k3: number | undefined
+    ): WasmSpaceTimeInstance;
+  };
+  WasmSpaceTimeUniversalKriging?: {
+    fromArrays(
+      lats: Float64Array,
+      lons: Float64Array,
+      times: Float64Array,
+      values: Float64Array,
+      trend: string,
+      family: string,
+      spatialType: string,
+      spatialNugget: number,
+      spatialSill: number,
+      spatialRange: number,
+      spatialShape: number | undefined,
+      temporalType: string,
+      temporalNugget: number,
+      temporalSill: number,
+      temporalRange: number,
+      temporalShape: number | undefined,
+      k1: number | undefined,
+      k2: number | undefined,
+      k3: number | undefined
+    ): WasmSpaceTimeInstance;
+  };
+  WasmSpaceTimeBinomialKriging?: {
+    fromArrays(
+      lats: Float64Array,
+      lons: Float64Array,
+      times: Float64Array,
+      successes: Uint32Array,
+      trials: Uint32Array,
+      family: string,
+      spatialType: string,
+      spatialNugget: number,
+      spatialSill: number,
+      spatialRange: number,
+      spatialShape: number | undefined,
+      temporalType: string,
+      temporalNugget: number,
+      temporalSill: number,
+      temporalRange: number,
+      temporalShape: number | undefined,
+      k1: number | undefined,
+      k2: number | undefined,
+      k3: number | undefined
+    ): WasmSpaceTimeBinomialInstance;
+  };
+  WasmSpaceTimeOrdinaryProjectedKriging?: {
+    fromArrays(
+      xs: Float64Array,
+      ys: Float64Array,
+      times: Float64Array,
+      values: Float64Array,
+      majorAngleDeg: number,
+      rangeRatio: number,
+      family: string,
+      spatialType: string,
+      spatialNugget: number,
+      spatialSill: number,
+      spatialRange: number,
+      spatialShape: number | undefined,
+      temporalType: string,
+      temporalNugget: number,
+      temporalSill: number,
+      temporalRange: number,
+      temporalShape: number | undefined,
+      k1: number | undefined,
+      k2: number | undefined,
+      k3: number | undefined
+    ): WasmSpaceTimeInstance;
+  };
+  wasmComputeEmpiricalSpaceTimeVariogram?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    times: Float64Array,
+    values: Float64Array,
+    maxSpatialDistance: number | undefined,
+    maxTemporalLag: number | undefined,
+    nSpatialBins: number,
+    nTemporalBins: number,
+    estimator: string
+  ) => unknown;
+  wasmFitSpaceTimeVariogram?: (
+    lats: Float64Array,
+    lons: Float64Array,
+    times: Float64Array,
+    values: Float64Array,
+    maxSpatialDistance: number | undefined,
+    maxTemporalLag: number | undefined,
+    nSpatialBins: number,
+    nTemporalBins: number,
+    estimator: string,
+    family: string,
+    spatialModel: string,
+    temporalModel: string
+  ) => unknown;
 };
+
+/** WASM space-time continuous kriging instance shape (ordinary / simple / universal / projected). */
+export interface WasmSpaceTimeInstance {
+  predict(a: number, b: number, time: number): unknown;
+  predictBatch?(a: Float64Array, b: Float64Array, times: Float64Array): unknown;
+  predictBatchArrays(
+    a: Float64Array,
+    b: Float64Array,
+    times: Float64Array
+  ): unknown;
+  free?: () => void;
+}
+
+/** WASM space-time binomial kriging instance shape. */
+export interface WasmSpaceTimeBinomialInstance {
+  predict(lat: number, lon: number, time: number): unknown;
+  predictBatch(
+    lats: Float64Array,
+    lons: Float64Array,
+    times: Float64Array
+  ): unknown;
+  predictBatchArrays(
+    lats: Float64Array,
+    lons: Float64Array,
+    times: Float64Array
+  ): unknown;
+  free?: () => void;
+}
