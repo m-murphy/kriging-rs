@@ -23,6 +23,7 @@ import { KrigingError, wrapThrown } from "./errors.js";
 import { toFloat64Array, toUint32Array } from "./internal/convert.js";
 import { mapBinomialCvOutput, mapCvOutput } from "./internal/mappers.js";
 import { requireLoadedModule } from "./internal/module.js";
+import { resolveBinomialPrior } from "./internal/prior.js";
 import {
   packSpaceTimeVariogram,
   requireSpaceTimeUniversalTrend,
@@ -267,17 +268,6 @@ export function kFoldProjected(options: KFoldProjectedOptions): CvResult {
   }
 }
 
-function validateBinomialPrior(options: LeaveOneOutBinomialOptions): void {
-  const hasAlpha = typeof options.priorAlpha === "number";
-  const hasBeta = typeof options.priorBeta === "number";
-  if (hasAlpha !== hasBeta) {
-    throw new KrigingError(
-      "priorAlpha and priorBeta must be provided together",
-      { code: "invalid_input" }
-    );
-  }
-}
-
 /**
  * Leave-one-out CV over binomial kriging. Returns residuals on **both** the logit scale
  * (directly comparable to continuous kriging; MSDR-calibratable) and the prevalence
@@ -291,7 +281,7 @@ export function leaveOneOutBinomial(
   if (typeof mod.leaveOneOutBinomial !== "function") {
     unavailable("leaveOneOutBinomial");
   }
-  validateBinomialPrior(options);
+  const { alpha, beta } = resolveBinomialPrior(options.prior);
   try {
     const out = mod.leaveOneOutBinomial(
       toFloat64Array(options.lats),
@@ -303,8 +293,8 @@ export function leaveOneOutBinomial(
       options.variogram.sill,
       options.variogram.range,
       options.variogram.shape,
-      options.priorAlpha,
-      options.priorBeta
+      alpha,
+      beta
     );
     return mapBinomialCvOutput(out);
   } catch (e) {
@@ -316,7 +306,7 @@ export function leaveOneOutBinomial(
 export function kFoldBinomial(options: KFoldBinomialOptions): BinomialCvResult {
   const mod = requireLoadedModule();
   if (typeof mod.kFoldBinomial !== "function") unavailable("kFoldBinomial");
-  validateBinomialPrior(options);
+  const { alpha, beta } = resolveBinomialPrior(options.prior);
   try {
     const out = mod.kFoldBinomial(
       toFloat64Array(options.lats),
@@ -329,8 +319,8 @@ export function kFoldBinomial(options: KFoldBinomialOptions): BinomialCvResult {
       options.variogram.sill,
       options.variogram.range,
       options.variogram.shape,
-      options.priorAlpha,
-      options.priorBeta
+      alpha,
+      beta
     );
     return mapBinomialCvOutput(out);
   } catch (e) {
@@ -569,20 +559,6 @@ export function kFoldSpaceTimeUniversal(
   }
 }
 
-function validateSpaceTimeBinomialPrior(
-  priorAlpha: number | undefined,
-  priorBeta: number | undefined
-): void {
-  const hasAlpha = priorAlpha !== undefined;
-  const hasBeta = priorBeta !== undefined;
-  if (hasAlpha !== hasBeta) {
-    throw new KrigingError(
-      "priorAlpha and priorBeta must be provided together",
-      { code: "invalid_input" }
-    );
-  }
-}
-
 /**
  * Leave-one-out CV for space-time binomial kriging. Returns residuals on **both** the
  * logit and prevalence scales (see {@link leaveOneOutBinomial}).
@@ -594,7 +570,7 @@ export function leaveOneOutSpaceTimeBinomial(
   if (typeof mod.leaveOneOutSpaceTimeBinomial !== "function") {
     unavailable("leaveOneOutSpaceTimeBinomial");
   }
-  validateSpaceTimeBinomialPrior(options.priorAlpha, options.priorBeta);
+  const { alpha, beta } = resolveBinomialPrior(options.prior);
   const packed = packSpaceTimeVariogram(options.variogram);
   try {
     const out = mod.leaveOneOutSpaceTimeBinomial(
@@ -617,8 +593,8 @@ export function leaveOneOutSpaceTimeBinomial(
       packed.k1,
       packed.k2,
       packed.k3,
-      options.priorAlpha,
-      options.priorBeta
+      alpha,
+      beta
     );
     return mapBinomialCvOutput(out);
   } catch (e) {
@@ -634,7 +610,7 @@ export function kFoldSpaceTimeBinomial(
   if (typeof mod.kFoldSpaceTimeBinomial !== "function") {
     unavailable("kFoldSpaceTimeBinomial");
   }
-  validateSpaceTimeBinomialPrior(options.priorAlpha, options.priorBeta);
+  const { alpha, beta } = resolveBinomialPrior(options.prior);
   const packed = packSpaceTimeVariogram(options.variogram);
   try {
     const out = mod.kFoldSpaceTimeBinomial(
@@ -658,8 +634,8 @@ export function kFoldSpaceTimeBinomial(
       packed.k1,
       packed.k2,
       packed.k3,
-      options.priorAlpha,
-      options.priorBeta
+      alpha,
+      beta
     );
     return mapBinomialCvOutput(out);
   } catch (e) {
