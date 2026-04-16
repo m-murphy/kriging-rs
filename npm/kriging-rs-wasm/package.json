@@ -1,6 +1,6 @@
 {
   "name": "kriging-rs-wasm",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "TypeScript-first WebAssembly bindings for kriging-rs",
   "license": "MIT",
   "repository": {

@@ -1,6 +1,6 @@
 # kriging-rs-wasm
 
-TypeScript-first WebAssembly package for [kriging-rs](https://github.com/m-murphy/kriging-rs): ordinary and binomial kriging with optional WebGPU acceleration.
+TypeScript-first WebAssembly package for [kriging-rs](https://github.com/m-murphy/kriging-rs): ordinary / simple / universal / binomial kriging (both 2-D spatial and 2+1-D spatio-temporal) with optional WebGPU acceleration.
 
 ## Quick start
 
@@ -55,6 +55,21 @@ const pred = model.predict(37.705, -122.435);
 | `KrigingError` | Error class thrown on invalid inputs or model build failure; `cause` holds the underlying error; optional `code` for UI (e.g. `singular_covariance`, `mismatched_arrays`). |
 | `KrigingErrorCode` | Type of stable error codes (`not_loaded`, `model_freed`, `mismatched_arrays`, etc.). |
 | `webgpuAvailable` | Check if WebGPU-backed batch prediction is available (requires GPU build). |
+| `SpaceTimeOrdinaryKriging` | Spatio-temporal ordinary kriging over `(lat, lon, time)`. |
+| `SpaceTimeSimpleKriging` | ST simple kriging with a known, constant mean. |
+| `SpaceTimeUniversalKriging` | ST universal kriging with polynomial trends in space and/or time. |
+| `SpaceTimeBinomialKriging` | ST binomial kriging from `(successes, trials)` over `(lat, lon, time)`. |
+| `SpaceTimeProjectedOrdinaryKriging` | ST ordinary kriging on projected `(x, y, time)` with 2-D anisotropy. |
+| `computeEmpiricalSpaceTimeVariogram` | 2-D empirical space-time variogram (spatial × temporal bins). |
+| `fitSpaceTimeVariogram` | Fit a separable or product-sum ST variogram against the empirical surface. |
+| `leaveOneOutSpaceTime` / `kFoldSpaceTime` | Cross-validation on ST ordinary kriging. |
+| `leaveOneOutSpaceTimeSimple` / `kFoldSpaceTimeSimple` | Cross-validation on ST simple kriging (known `mean`). |
+| `leaveOneOutSpaceTimeUniversal` / `kFoldSpaceTimeUniversal` | Cross-validation on ST universal kriging; trend refit per fold. |
+| `leaveOneOutSpaceTimeBinomial` / `kFoldSpaceTimeBinomial` | Cross-validation on ST binomial kriging; dual-scale residuals. |
+| `conditionalSimulateSpaceTime` | Sequential Gaussian simulation for ST ordinary kriging; deterministic for a given `seed`. |
+| `conditionalSimulateSpaceTimeSimple` | ST SGS with simple kriging (known `mean`). |
+| `conditionalSimulateSpaceTimeUniversal` | ST SGS with universal kriging (polynomial trend refit per step). |
+| `conditionalSimulateSpaceTimeBinomial` | ST SGS for count data on the logit scale; returns both logit and prevalence samples. |
 
 **When to use which:** Use **ordinary kriging** when you have continuous measurements at locations (e.g. sensor values, elevations). Use **binomial kriging** when you have counts (successes and trials) and want to estimate a proportion or prevalence surface.
 
@@ -544,9 +559,124 @@ if (await webgpuAvailable()) {
 
 If `predictBatchGpu` is called without a GPU build, it throws.
 
+### Space-time kriging
+
+All four kriging families are mirrored in the `SpaceTime*` classes, which add a `time`
+axis to the usual `(lat, lon)` inputs. Use `separable` when the space and time processes
+can be modeled independently, and `product_sum` when you need an additive interaction
+term on top of the marginals (`k1·C_s·C_t + k2·C_s + k3·C_t`).
+
+```ts
+import init, {
+  SpaceTimeOrdinaryKriging,
+  fitSpaceTimeVariogram,
+} from "kriging-rs-wasm";
+await init();
+
+const fit = fitSpaceTimeVariogram({
+  lats,
+  lons,
+  times,
+  values,
+  nSpatialBins: 10,
+  nTemporalBins: 6,
+  family: "separable",
+  spatialModel: "exponential",
+  temporalModel: "exponential",
+});
+
+const model = new SpaceTimeOrdinaryKriging({
+  lats,
+  lons,
+  times,
+  values,
+  variogram: {
+    family: fit.fit.family,
+    spatial: fit.fit.spatial,
+    temporal: fit.fit.temporal,
+    k1: fit.fit.k1,
+    k2: fit.fit.k2,
+    k3: fit.fit.k3,
+  },
+});
+
+const { value, variance } = model.predict(37.77, -122.42, 1.5);
+model.free();
+```
+
+Universal space-time kriging adds a polynomial trend via `trend`: one of `"constant"`,
+`"linearInTime"`, `"quadraticInTime"`, `"linearInSpace"`, `"linearInSpaceAndTime"`,
+`"quadraticInSpaceAndTime"`. Binomial space-time kriging takes `successes`/`trials`
+arrays in addition to `lats`/`lons`/`times` and reports prevalence on `[0, 1]`.
+
+Space-time cross-validation mirrors the 2-D surface — `leaveOneOutSpaceTime` / `kFoldSpaceTime`
+for ordinary, plus `_simple`, `_universal`, and `_binomial` variants (the last returns dual-scale
+logit+prevalence residuals):
+
+```ts
+import { leaveOneOutSpaceTime, kFoldSpaceTimeBinomial } from "kriging-rs-wasm";
+
+const cv = leaveOneOutSpaceTime({
+  lats,
+  lons,
+  times,
+  values,
+  variogram: { family: "separable", spatial, temporal },
+});
+console.log(cv.summary.rmse, cv.summary.msdr);
+
+const bin = kFoldSpaceTimeBinomial({
+  lats,
+  lons,
+  times,
+  successes,
+  trials,
+  variogram: { family: "separable", spatial, temporal },
+  k: 5,
+});
+console.log(bin.summary.logit.rmse, bin.summary.prevalence.rmse);
+```
+
+Space-time conditional simulation (Sequential Gaussian Simulation) is also available for every
+ST variant; results are deterministic for a given `seed`. `conditionalSimulateSpaceTimeBinomial`
+samples on the logit scale and returns both logit and prevalence samples:
+
+```ts
+import {
+  conditionalSimulateSpaceTime,
+  conditionalSimulateSpaceTimeBinomial,
+} from "kriging-rs-wasm";
+
+const samples = conditionalSimulateSpaceTime({
+  conditioningLats: lats,
+  conditioningLons: lons,
+  conditioningTimes: times,
+  conditioningValues: values,
+  targetLats,
+  targetLons,
+  targetTimes,
+  variogram: { family: "separable", spatial, temporal },
+  seed: 42n,
+});
+
+const binSamples = conditionalSimulateSpaceTimeBinomial({
+  conditioningLats: lats,
+  conditioningLons: lons,
+  conditioningTimes: times,
+  successes,
+  trials,
+  targetLats,
+  targetLons,
+  targetTimes,
+  variogram: { family: "separable", spatial, temporal },
+  seed: 42n,
+});
+// binSamples.logitSamples, binSamples.prevalenceSamples
+```
+
 ## Error handling
 
-Constructors (`OrdinaryKriging`, `SimpleKriging`, `UniversalKriging`, `ProjectedKriging`, `BinomialKriging`, `BinomialKriging.newWithPrior`, `BinomialKriging.fromPrecomputedLogits`), `fitVariogram`, and the top-level helpers (`computeEmpiricalVariogram`, `computeDirectionalEmpiricalVariogram`, `leaveOneOut`, `kFold`, `leaveOneOutSimple`, `kFoldSimple`, `leaveOneOutUniversal`, `kFoldUniversal`, `leaveOneOutProjected`, `kFoldProjected`, `leaveOneOutBinomial`, `kFoldBinomial`, `conditionalSimulate`, `conditionalSimulateSimple`, `conditionalSimulateUniversal`, `conditionalSimulateProjected`, `conditionalSimulateBinomial`, `evaluateNestedVariogram`) throw on invalid inputs or model build failure (e.g. singular covariance). Errors are rethrown as `KrigingError` with the underlying cause attached as `cause`. For UI-friendly messages, use the optional **`code`** property (when present), which is one of: `not_loaded`, `model_freed`, `mismatched_arrays`, `invalid_variogram`, `invalid_bins`, `singular_covariance`, `too_few_points`, `unknown_variogram`, `invalid_input`, `backend_unavailable`, `internal_error`. Not every error has a code. `backend_unavailable` specifically indicates that the WASM package was built without the export in question (e.g. without the `gpu` feature), so the API can't fulfill the call in the current build.
+Constructors (`OrdinaryKriging`, `SimpleKriging`, `UniversalKriging`, `ProjectedKriging`, `BinomialKriging`, `BinomialKriging.newWithPrior`, `BinomialKriging.fromPrecomputedLogits`, the `SpaceTime*Kriging` classes), `fitVariogram`, `fitSpaceTimeVariogram`, and the top-level helpers (`computeEmpiricalVariogram`, `computeDirectionalEmpiricalVariogram`, `computeEmpiricalSpaceTimeVariogram`, `leaveOneOut`, `kFold`, `leaveOneOutSimple`, `kFoldSimple`, `leaveOneOutUniversal`, `kFoldUniversal`, `leaveOneOutProjected`, `kFoldProjected`, `leaveOneOutBinomial`, `kFoldBinomial`, `leaveOneOutSpaceTime`, `kFoldSpaceTime`, `leaveOneOutSpaceTimeSimple`, `kFoldSpaceTimeSimple`, `leaveOneOutSpaceTimeUniversal`, `kFoldSpaceTimeUniversal`, `leaveOneOutSpaceTimeBinomial`, `kFoldSpaceTimeBinomial`, `conditionalSimulate`, `conditionalSimulateSimple`, `conditionalSimulateUniversal`, `conditionalSimulateProjected`, `conditionalSimulateBinomial`, `conditionalSimulateSpaceTime`, `conditionalSimulateSpaceTimeSimple`, `conditionalSimulateSpaceTimeUniversal`, `conditionalSimulateSpaceTimeBinomial`, `evaluateNestedVariogram`) throw on invalid inputs or model build failure (e.g. singular covariance). Errors are rethrown as `KrigingError` with the underlying cause attached as `cause`. For UI-friendly messages, use the optional **`code`** property (when present), which is one of: `not_loaded`, `model_freed`, `mismatched_arrays`, `invalid_variogram`, `invalid_bins`, `singular_covariance`, `too_few_points`, `unknown_variogram`, `unknown_family`, `unknown_trend`, `unknown_estimator`, `invalid_input`, `backend_unavailable`, `internal_error`. Not every error has a code. `backend_unavailable` specifically indicates that the WASM package was built without the export in question (e.g. without the `gpu` feature), so the API can't fulfill the call in the current build.
 
 Typical causes:
 

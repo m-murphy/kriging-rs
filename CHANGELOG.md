@@ -7,8 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-16
+
 ### Added
 
+- **Spatio-temporal kriging.** New `spacetime` module with full feature parity against the 2-D kriging surface:
+  - Coordinates and datasets: `SpaceTimeCoord<C>`, `SpaceTimeDataset<C>`, generic over a spatial-coordinate type that implements the new `SpatialMetric` trait.
+  - Metrics: `GeoMetric` (Haversine on `GeoCoord`) and `ProjectedMetric` (Euclidean on `ProjectedCoord` with optional `Anisotropy2D`), both re-exported from `spacetime`.
+  - Variogram families: `SpaceTimeVariogram::new_separable(spatial, temporal)` (normalized product) and `SpaceTimeVariogram::new_product_sum(spatial, temporal, k1, k2, k3)` with admissibility checks (k's non-negative, k1+k2+k3 > 0, power-law marginals rejected).
+  - Empirical 2-D space-time variogram (`EmpiricalSpaceTimeVariogram`, `SpaceTimeVariogramConfig`, `compute_empirical_spacetime_variogram`) with Matheron and Cressie–Hawkins estimators; `spatial_marginal` / `temporal_marginal` helpers project to 1-D slices.
+  - Parametric fitting (`fit_spacetime_variogram`, `SpaceTimeFitConfig`, `SpaceTimeFitResult`) that fits marginals independently and, for product-sum, solves a non-negative least-squares problem for `(k1, k2, k3)`.
+  - Kriging models (all generic over `SpatialMetric`): `SpaceTimeOrdinaryKrigingModel<M>`, `SpaceTimeSimpleKrigingModel<M>`, `SpaceTimeUniversalKrigingModel<M>` with time-extended trends (`Constant`, `LinearInTime`, `QuadraticInTime`, `LinearInSpace`, `LinearInSpaceAndTime`, `QuadraticInSpaceAndTime`), and `SpaceTimeBinomialKrigingModel<M>` (with `SpaceTimeBinomialObservation`, supports Beta priors and pre-computed logits).
+  - WASM bindings: `WasmSpaceTimeOrdinaryKriging`, `WasmSpaceTimeSimpleKriging`, `WasmSpaceTimeUniversalKriging`, `WasmSpaceTimeBinomialKriging`, `WasmSpaceTimeOrdinaryProjectedKriging`, plus `wasmComputeEmpiricalSpaceTimeVariogram` and `wasmFitSpaceTimeVariogram`.
+  - TypeScript wrappers under `npm/kriging-rs-wasm/src/spacetime/`: `SpaceTimeOrdinaryKriging`, `SpaceTimeSimpleKriging`, `SpaceTimeUniversalKriging`, `SpaceTimeBinomialKriging`, `SpaceTimeProjectedOrdinaryKriging`, and top-level `computeEmpiricalSpaceTimeVariogram` / `fitSpaceTimeVariogram`. New `KrigingErrorCode`s: `"unknown_family"`, `"unknown_trend"`, `"unknown_estimator"`.
+  - Space-time cross-validation: leave-one-out and K-fold for every ST variant.
+    - Rust: `leave_one_out_spacetime` / `k_fold_spacetime` (ordinary), `_simple`, `_universal`, `_binomial` — all generic over `SpatialMetric` (ordinary/simple/binomial) or `SpatialBasis` (universal).
+    - WASM / TypeScript: `leaveOneOutSpaceTime`, `kFoldSpaceTime`, `leaveOneOutSpaceTimeSimple`, `kFoldSpaceTimeSimple`, `leaveOneOutSpaceTimeUniversal`, `kFoldSpaceTimeUniversal`, `leaveOneOutSpaceTimeBinomial`, `kFoldSpaceTimeBinomial`. Binomial variants return dual-scale residuals (logit + prevalence).
+  - Space-time conditional simulation (Sequential Gaussian Simulation): one helper per ST variant.
+    - Rust: `conditional_simulate_spacetime`, `_simple`, `_universal`, `_binomial`.
+    - WASM / TypeScript: `conditionalSimulateSpaceTime`, `conditionalSimulateSpaceTimeSimple`, `conditionalSimulateSpaceTimeUniversal`, `conditionalSimulateSpaceTimeBinomial`. Deterministic for a given `seed`; optional `targetOrder` override; binomial variant returns `logitSamples` and `prevalenceSamples`.
 - **Cross-validation for every kriging variant.** Previously ordinary-only; now each variant has its own leave-one-out and K-fold helper:
   - Rust: `leave_one_out_simple` / `k_fold_simple`, `leave_one_out_universal` / `k_fold_universal`, `leave_one_out_projected` / `k_fold_projected`, `leave_one_out_binomial` / `k_fold_binomial`. Internal fold iteration is now factored into shared helpers (`for_each_loo_fold`, `for_each_k_fold`) so adding new variants is trivial.
   - WASM / TypeScript: `leaveOneOutSimple`, `kFoldSimple`, `leaveOneOutUniversal`, `kFoldUniversal`, `leaveOneOutProjected`, `kFoldProjected`, `leaveOneOutBinomial`, `kFoldBinomial`.

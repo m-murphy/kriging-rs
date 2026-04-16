@@ -33,10 +33,18 @@ println!("{:?}", prediction.value);
 
 ## Features
 
-- Ordinary kriging for spatial interpolation
-- Binomial kriging for prevalence surface estimation
-- Variogram models: spherical, exponential, Gaussian, cubic, stable, Matérn (stable and Matérn accept an optional shape parameter)
-- Geographic coordinate support with Haversine distances
+- Ordinary, simple, universal, and binomial kriging for 2-D spatial interpolation
+- **Spatio-temporal kriging** (ordinary / simple / universal / binomial) over a 2-D spatial
+  axis and a scalar time axis, with separable and product-sum space-time variograms
+- Empirical and parametric 2-D and space-time variogram fitting
+- Leave-one-out and K-fold cross-validation for every 2-D and space-time variant (continuous
+  residuals plus dual-scale logit+prevalence for binomial)
+- Sequential Gaussian simulation (conditional simulation) for every 2-D and space-time variant,
+  deterministic for a given RNG seed
+- Variogram models: spherical, exponential, Gaussian, cubic, stable, Matérn, power, hole-effect
+  (stable and Matérn accept an optional shape parameter)
+- Geographic coordinates with Haversine distances and planar `(x, y)` coordinates with 2-D
+  anisotropy — both usable in the spatial and spatio-temporal paths
 - Optional WASM bindings for browser applications
 - `Real` abstraction defaults to `f32` for compute paths
 - Optional cross-platform GPU capability path via `wgpu`
