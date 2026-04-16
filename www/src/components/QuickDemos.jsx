@@ -4,6 +4,8 @@ import {
   BinomialKriging,
   VariogramType,
   fitVariogram,
+  SpaceTimeOrdinaryKriging,
+  fitSpaceTimeVariogram,
 } from "kriging-rs-wasm";
 import { buildBinomialLogits } from "../lib/sampleData";
 
@@ -134,12 +136,78 @@ export default function QuickDemos({ onError }) {
     }
   }
 
+  function runSpaceTime() {
+    setRunning(true);
+    try {
+      const lats = [];
+      const lons = [];
+      const times = [];
+      const values = [];
+      for (let i = 0; i < 5; i += 1) {
+        for (let j = 0; j < 5; j += 1) {
+          for (let k = 0; k < 3; k += 1) {
+            const lat = 37.7 + i * 0.01;
+            const lon = -122.45 + j * 0.01;
+            const t = k * 1.0;
+            lats.push(lat);
+            lons.push(lon);
+            times.push(t);
+            values.push(
+              10.0 +
+                (lat - 37.7) * 100.0 +
+                (lon + 122.45) * 50.0 +
+                0.5 * t,
+            );
+          }
+        }
+      }
+
+      const fit = fitSpaceTimeVariogram({
+        lats,
+        lons,
+        times,
+        values,
+        nSpatialBins: 6,
+        nTemporalBins: 4,
+        family: "separable",
+        spatialModel: "exponential",
+        temporalModel: "exponential",
+      });
+
+      const model = new SpaceTimeOrdinaryKriging({
+        lats,
+        lons,
+        times,
+        values,
+        variogram: {
+          family: fit.fit.family,
+          spatial: fit.fit.spatial,
+          temporal: fit.fit.temporal,
+          k1: fit.fit.k1,
+          k2: fit.fit.k2,
+          k3: fit.fit.k3,
+        },
+      });
+      const pred = model.predict(37.72, -122.43, 1.5);
+      model.free();
+      write("Space-time ordinary kriging prediction", {
+        fit: fit.fit,
+        prediction: pred,
+      });
+    } catch (err) {
+      onError?.(err?.message ?? String(err));
+      write("Space-time kriging failed", { message: err?.message ?? String(err) });
+    } finally {
+      setRunning(false);
+    }
+  }
+
   return (
     <div className="panel">
       <h2>Quick demos</h2>
       <p>
-        Run a single ordinary or binomial prediction, or the full fitted pipeline (fit
-        variogram then predict).
+        Run a single ordinary or binomial prediction, a spatio-temporal prediction, or the
+        full fitted pipeline (fit variogram then predict).
       </p>
       <div>
         <button type="button" onClick={runOrdinary} disabled={running}>
@@ -150,6 +218,9 @@ export default function QuickDemos({ onError }) {
         </button>
         <button type="button" onClick={runFittedPipeline} disabled={running}>
           Fitted pipeline
+        </button>
+        <button type="button" onClick={runSpaceTime} disabled={running}>
+          Space-time ordinary
         </button>
       </div>
       <div style={{ marginTop: "1rem" }}>
