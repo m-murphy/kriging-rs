@@ -66,7 +66,7 @@ export function computeEmpiricalSpaceTimeVariogram(
 /**
  * Fit a parametric space-time variogram (separable or product-sum) to the empirical
  * space-time variogram of the supplied data. The fit uses sequential optimization:
- * marginals are fit independently via weighted least squares, and for `product_sum`
+ * marginals are fit independently via weighted least squares, and for `productSum`
  * the three non-negative coefficients `(k1, k2, k3)` are fit by non-negative least
  * squares against the full 2-D empirical surface.
  */

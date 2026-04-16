@@ -30,7 +30,7 @@ use super::{
     set_object_field, split_binomial_predictions, split_predictions,
 };
 
-const FAMILY_HELP: &str = "family must be 'separable' or 'product_sum'";
+const FAMILY_HELP: &str = "family must be 'separable' or 'productSum'";
 
 fn parse_spacetime_variogram(
     family: &str,
@@ -807,7 +807,7 @@ fn fit_to_js(fit: SpaceTimeFitResult) -> Result<JsValue, JsValue> {
     let obj = Object::new();
     let (family_name, k1, k2, k3) = match fit.model {
         SpaceTimeVariogram::Separable { .. } => ("separable", 1.0 as Real, 0.0, 0.0),
-        SpaceTimeVariogram::ProductSum { k1, k2, k3, .. } => ("product_sum", k1, k2, k3),
+        SpaceTimeVariogram::ProductSum { k1, k2, k3, .. } => ("productSum", k1, k2, k3),
     };
     set_object_field(&obj, "family", &JsValue::from_str(family_name))?;
     set_object_field(&obj, "spatial", &variogram_to_js(fit.model.spatial())?)?;

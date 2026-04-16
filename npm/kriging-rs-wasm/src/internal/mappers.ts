@@ -20,7 +20,6 @@ import type {
   FittedSpaceTimeVariogram,
   OrdinaryBatchArrayOutput,
   OrdinaryPrediction,
-  SpaceTimeVariogramFamily,
   VariogramParams,
   VariogramTypeName,
 } from "../types.js";
@@ -254,17 +253,28 @@ export function mapFittedSpaceTimeVariogram(
 ): FittedSpaceTimeVariogram {
   const rec = asRecord(value);
   const family = rec.family;
-  if (family !== "separable" && family !== "product_sum") {
+  if (family !== "separable" && family !== "productSum") {
     throw new Error("Unknown space-time variogram family from WASM");
   }
+  const spatial = mapVariogramParams(rec.spatial);
+  const temporal = mapVariogramParams(rec.temporal);
+  const residuals = requireFiniteOrZero(rec.residuals);
+  if (family === "productSum") {
+    return {
+      family: "productSum",
+      spatial,
+      temporal,
+      k1: requireNumber(rec.k1),
+      k2: requireNumber(rec.k2),
+      k3: requireNumber(rec.k3),
+      residuals,
+    };
+  }
   return {
-    family: family as SpaceTimeVariogramFamily,
-    spatial: mapVariogramParams(rec.spatial),
-    temporal: mapVariogramParams(rec.temporal),
-    k1: requireNumber(rec.k1),
-    k2: requireNumber(rec.k2),
-    k3: requireNumber(rec.k3),
-    residuals: requireFiniteOrZero(rec.residuals),
+    family: "separable",
+    spatial,
+    temporal,
+    residuals,
   };
 }
 
