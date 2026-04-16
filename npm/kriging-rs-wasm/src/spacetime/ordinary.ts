@@ -6,17 +6,24 @@
 
 import { KrigingError, wrapThrown } from "../errors.js";
 import { toFloat64Array } from "../internal/convert.js";
+import { buildGridLatsLons, reshapeFlatToGrid } from "../internal/grid.js";
 import {
   mapOrdinaryBatchArrayOutput,
   mapOrdinaryPrediction,
 } from "../internal/mappers.js";
 import { requireLoadedModule } from "../internal/module.js";
-import { packSpaceTimeVariogram } from "../internal/spacetime.js";
+import {
+  fittedToSpaceTimeVariogramParams,
+  packSpaceTimeVariogram,
+} from "../internal/spacetime.js";
 import type { WasmSpaceTimeInstance } from "../internal/wasm-shapes.js";
 import type {
   NumericArrayInput,
   OrdinaryBatchArrayOutput,
+  OrdinaryGridOutput,
   OrdinaryPrediction,
+  PredictGridAtTimeOptions,
+  SpaceTimeOrdinaryKrigingFromFittedOptions,
   SpaceTimeOrdinaryKrigingOptions,
 } from "../types.js";
 
@@ -73,11 +80,33 @@ export class SpaceTimeOrdinaryKriging {
     return this.inner;
   }
 
+  /**
+   * Build a model from sample data plus a fitted space-time variogram (e.g.
+   * from {@link fitSpaceTimeVariogram}). Drops `residuals` and preserves the
+   * discriminated-union arms so `fit.fit` flows straight through.
+   */
+  static fromFitted(
+    options: SpaceTimeOrdinaryKrigingFromFittedOptions
+  ): SpaceTimeOrdinaryKriging {
+    return new SpaceTimeOrdinaryKriging({
+      lats: options.lats,
+      lons: options.lons,
+      times: options.times,
+      values: options.values,
+      variogram: fittedToSpaceTimeVariogramParams(options.fittedVariogram),
+    });
+  }
+
   /** Release WASM-held resources. Safe to call multiple times. */
   free(): void {
     if (this.inner === null) return;
     if (typeof this.inner.free === "function") this.inner.free();
     this.inner = null;
+  }
+
+  /** Explicit-resource-management disposer; calls {@link free}. */
+  [Symbol.dispose](): void {
+    this.free();
   }
 
   /** Single-point prediction at `(lat, lon, time)`. */
@@ -99,5 +128,27 @@ export class SpaceTimeOrdinaryKriging {
       toFloat64Array(times)
     );
     return mapOrdinaryBatchArrayOutput(out);
+  }
+
+  /**
+   * Predict on a rectangular lat/lon grid at a fixed `time` slice. Builds
+   * cell-center coordinates in row-major order, fills a `time` array with the
+   * same scalar for every cell, and reshapes results into 2D arrays of shape
+   * `[yCells][xCells]`.
+   */
+  predictGridAtTime(options: PredictGridAtTimeOptions): OrdinaryGridOutput {
+    const inner = this.requireInner();
+    const nRows = Math.max(1, Math.floor(options.yCells));
+    const nCols = Math.max(1, Math.floor(options.xCells));
+    const { lats, lons } = buildGridLatsLons(options);
+    const times = new Float64Array(lats.length);
+    times.fill(options.time);
+    const out = inner.predictBatchArrays(lats, lons, times);
+    const { values: valuesFlat, variances: variancesFlat } =
+      mapOrdinaryBatchArrayOutput(out);
+    return {
+      values: reshapeFlatToGrid(valuesFlat, nRows, nCols),
+      variances: reshapeFlatToGrid(variancesFlat, nRows, nCols),
+    };
   }
 }

@@ -135,6 +135,16 @@ export interface BinomialGridOutput {
 }
 
 /**
+ * Options for space-time grid prediction at a fixed time slice. Same spatial
+ * bounds and cell counts as {@link PredictGridOptions}, plus the scalar `time`
+ * at which every cell is evaluated.
+ */
+export interface PredictGridAtTimeOptions extends PredictGridOptions {
+  /** Time value (same units used to build the model) applied to every grid cell. */
+  time: number;
+}
+
+/**
  * Options for one-shot ordinary kriging: fit variogram from sample data, build model, predict on grid, then free.
  */
 export interface InterpolateOrdinaryToGridOptions {
@@ -515,9 +525,8 @@ export interface LeaveOneOutBinomialOptions {
   successes: ArrayLike<number> | Uint32Array;
   trials: ArrayLike<number> | Uint32Array;
   variogram: VariogramParams;
-  /** Optional Beta prior hyperparameters; both or neither must be given. Default Beta(½, ½). */
-  priorAlpha?: number;
-  priorBeta?: number;
+  /** Optional Beta(alpha, beta) prior; defaults to Beta(½, ½) when omitted. */
+  prior?: BinomialPriorParams;
 }
 
 /** Options for {@link kFoldBinomial}. */
@@ -614,6 +623,21 @@ export interface ConditionalSimulateOptions {
 }
 
 /**
+ * Options for {@link conditionalSimulateMany}.
+ *
+ * Replaces the single `seed` field with `nRealizations` and a `baseSeed`. The k-th
+ * realization is drawn with `baseSeed + BigInt(k)` so every draw is independent yet
+ * deterministic.
+ */
+export interface ConditionalSimulateManyOptions
+  extends Omit<ConditionalSimulateOptions, "seed"> {
+  /** Number of independent realizations to draw (must be >= 1). */
+  nRealizations: number;
+  /** Seed for the first realization. Successive realizations use `baseSeed + k`. */
+  baseSeed?: number | bigint;
+}
+
+/**
  * Options for {@link conditionalSimulateSimple}.
  *
  * Simulation uses simple kriging with the supplied known `mean` at every step.
@@ -673,9 +697,8 @@ export interface ConditionalSimulateBinomialOptions {
   targetLats: NumericArrayInput;
   targetLons: NumericArrayInput;
   variogram: VariogramParams;
-  /** Optional Beta prior hyperparameters; both or neither must be given. Default Beta(½, ½). */
-  priorAlpha?: number;
-  priorBeta?: number;
+  /** Optional Beta(alpha, beta) prior; defaults to Beta(½, ½) when omitted. */
+  prior?: BinomialPriorParams;
   /** RNG seed for reproducibility (defaults to `0n`). */
   seed?: number | bigint;
   /** Optional permutation of `0..nTargets` giving the visit order. */
@@ -781,24 +804,30 @@ export type KrigingErrorCode =
  * Family of space-time variogram models.
  *
  * - `"separable"` — `C(h_s, h_t) = C_s(h_s) · C_t(h_t) / C_s(0)` (product of normalized marginals).
- * - `"product_sum"` — `C(h_s, h_t) = k1·C_s(h_s)·C_t(h_t) + k2·C_s(h_s) + k3·C_t(h_t)` with
+ * - `"productSum"` — `C(h_s, h_t) = k1·C_s(h_s)·C_t(h_t) + k2·C_s(h_s) + k3·C_t(h_t)` with
  *   `k1 ≥ 0`, `k2 ≥ 0`, `k3 ≥ 0` and `k1 + k2 + k3 > 0`.
  */
-export type SpaceTimeVariogramFamily = "separable" | "product_sum";
+export type SpaceTimeVariogramFamily = "separable" | "productSum";
 
 /**
  * Fully-specified space-time variogram. Spatial and temporal marginals are ordinary
- * 2-D variograms (e.g. `{ variogramType: "exponential", nugget, sill, range }`); `k1/k2/k3`
- * are only used for `"product_sum"` and default to `1/0/0` for `"separable"`.
+ * 2-D variograms (e.g. `{ variogramType: "exponential", nugget, sill, range }`). The
+ * discriminated union forces `k1/k2/k3` to be supplied iff `family === "productSum"`.
  */
-export interface SpaceTimeVariogramParams {
-  family: SpaceTimeVariogramFamily;
-  spatial: VariogramParams;
-  temporal: VariogramParams;
-  k1?: number;
-  k2?: number;
-  k3?: number;
-}
+export type SpaceTimeVariogramParams =
+  | {
+      family: "separable";
+      spatial: VariogramParams;
+      temporal: VariogramParams;
+    }
+  | {
+      family: "productSum";
+      spatial: VariogramParams;
+      temporal: VariogramParams;
+      k1: number;
+      k2: number;
+      k3: number;
+    };
 
 /**
  * Drift basis for space-time universal kriging.
@@ -869,6 +898,55 @@ export interface SpaceTimeProjectedOrdinaryKrigingOptions {
 }
 
 /**
+ * Options for {@link SpaceTimeOrdinaryKriging.fromFitted}: sample data plus a
+ * {@link FittedSpaceTimeVariogram} (e.g. from {@link fitSpaceTimeVariogram}) to
+ * build the model without manually spreading family / spatial / temporal / k
+ * fields.
+ */
+export interface SpaceTimeOrdinaryKrigingFromFittedOptions {
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  times: NumericArrayInput;
+  values: NumericArrayInput;
+  fittedVariogram: FittedSpaceTimeVariogram;
+}
+
+/** Options for {@link SpaceTimeSimpleKriging.fromFitted}. */
+export interface SpaceTimeSimpleKrigingFromFittedOptions
+  extends SpaceTimeOrdinaryKrigingFromFittedOptions {
+  mean: number;
+}
+
+/** Options for {@link SpaceTimeUniversalKriging.fromFitted}. */
+export interface SpaceTimeUniversalKrigingFromFittedOptions
+  extends SpaceTimeOrdinaryKrigingFromFittedOptions {
+  trend: SpaceTimeUniversalTrend;
+}
+
+/** Options for {@link SpaceTimeBinomialKriging.fromFitted}. */
+export interface SpaceTimeBinomialKrigingFromFittedOptions {
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  times: NumericArrayInput;
+  successes: IntegerArrayInput;
+  trials: IntegerArrayInput;
+  fittedVariogram: FittedSpaceTimeVariogram;
+}
+
+/** Options for {@link SpaceTimeProjectedOrdinaryKriging.fromFitted}. */
+export interface SpaceTimeProjectedOrdinaryKrigingFromFittedOptions {
+  xs: NumericArrayInput;
+  ys: NumericArrayInput;
+  times: NumericArrayInput;
+  values: NumericArrayInput;
+  fittedVariogram: FittedSpaceTimeVariogram;
+  /** Azimuth of the major axis, in degrees counter-clockwise from +x. */
+  majorAngleDeg: number;
+  /** Ratio of minor to major range, in `(0, 1]`. */
+  rangeRatio: number;
+}
+
+/**
  * Options for {@link computeEmpiricalSpaceTimeVariogram}. Produces a 2-D empirical
  * variogram binned simultaneously in space and time.
  */
@@ -908,7 +986,7 @@ export interface EmpiricalSpaceTimeVariogramResult {
 
 /** Options for {@link fitSpaceTimeVariogram}. */
 export interface FitSpaceTimeVariogramOptions extends ComputeEmpiricalSpaceTimeVariogramOptions {
-  /** Space-time family to fit: `"separable"` or `"product_sum"`. */
+  /** Space-time family to fit: `"separable"` or `"productSum"`. */
   family: SpaceTimeVariogramFamily;
   /** Parametric model for the spatial marginal (e.g. `"exponential"`). */
   spatialModel: VariogramTypeName;
@@ -916,20 +994,32 @@ export interface FitSpaceTimeVariogramOptions extends ComputeEmpiricalSpaceTimeV
   temporalModel: VariogramTypeName;
 }
 
-/** Result of fitting a space-time variogram. */
-export interface FittedSpaceTimeVariogram {
-  family: SpaceTimeVariogramFamily;
-  spatial: VariogramParams;
-  temporal: VariogramParams;
-  /** Product coefficient (0 for separable-only; default 1). */
-  k1: number;
-  /** Spatial-marginal coefficient (0 unless `product_sum`). */
-  k2: number;
-  /** Temporal-marginal coefficient (0 unless `product_sum`). */
-  k3: number;
-  /** Sum-of-squared-errors of the final fit against the empirical variogram. */
-  residuals: number;
-}
+/**
+ * Result of fitting a space-time variogram. Shape mirrors
+ * {@link SpaceTimeVariogramParams} so you can pass `fit.fit` directly as a
+ * kriging model's `variogram` option.
+ */
+export type FittedSpaceTimeVariogram =
+  | {
+      family: "separable";
+      spatial: VariogramParams;
+      temporal: VariogramParams;
+      /** Sum-of-squared-errors of the final fit against the empirical variogram. */
+      residuals: number;
+    }
+  | {
+      family: "productSum";
+      spatial: VariogramParams;
+      temporal: VariogramParams;
+      /** Product coefficient. */
+      k1: number;
+      /** Spatial-marginal coefficient. */
+      k2: number;
+      /** Temporal-marginal coefficient. */
+      k3: number;
+      /** Sum-of-squared-errors of the final fit against the empirical variogram. */
+      residuals: number;
+    };
 
 /**
  * Combined empirical + parametric fit result returned by {@link fitSpaceTimeVariogram}.
@@ -992,9 +1082,8 @@ export interface LeaveOneOutSpaceTimeBinomialOptions {
   successes: IntegerArrayInput;
   trials: IntegerArrayInput;
   variogram: SpaceTimeVariogramParams;
-  /** Optional Beta prior; both or neither must be given. Default Beta(½, ½). */
-  priorAlpha?: number;
-  priorBeta?: number;
+  /** Optional Beta(alpha, beta) prior; defaults to Beta(½, ½) when omitted. */
+  prior?: BinomialPriorParams;
 }
 
 /** Options for {@link kFoldSpaceTimeBinomial}. */
@@ -1020,6 +1109,18 @@ export interface ConditionalSimulateSpaceTimeOptions {
   seed?: number | bigint;
   /** Optional permutation of `0..nTargets` giving the visit order. */
   targetOrder?: ArrayLike<number> | Uint32Array;
+}
+
+/**
+ * Options for {@link conditionalSimulateManySpaceTime}. Mirrors
+ * {@link ConditionalSimulateManyOptions} for the space-time ordinary variant.
+ */
+export interface ConditionalSimulateManySpaceTimeOptions
+  extends Omit<ConditionalSimulateSpaceTimeOptions, "seed"> {
+  /** Number of independent realizations to draw (must be >= 1). */
+  nRealizations: number;
+  /** Seed for the first realization. Successive realizations use `baseSeed + k`. */
+  baseSeed?: number | bigint;
 }
 
 /** Options for {@link conditionalSimulateSpaceTimeSimple}. */
@@ -1048,9 +1149,8 @@ export interface ConditionalSimulateSpaceTimeBinomialOptions {
   targetLons: NumericArrayInput;
   targetTimes: NumericArrayInput;
   variogram: SpaceTimeVariogramParams;
-  /** Optional Beta prior; both or neither must be given. Default Beta(½, ½). */
-  priorAlpha?: number;
-  priorBeta?: number;
+  /** Optional Beta(alpha, beta) prior; defaults to Beta(½, ½) when omitted. */
+  prior?: BinomialPriorParams;
   /** RNG seed for reproducibility (defaults to `0n`). */
   seed?: number | bigint;
   /** Optional permutation of `0..nTargets` giving the visit order. */

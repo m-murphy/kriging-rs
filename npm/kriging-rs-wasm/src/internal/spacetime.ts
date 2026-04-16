@@ -6,6 +6,7 @@
  */
 
 import type {
+  FittedSpaceTimeVariogram,
   SpaceTimeUniversalTrend,
   SpaceTimeVariogramFamily,
   SpaceTimeVariogramParams,
@@ -14,7 +15,8 @@ import type {
 /**
  * Positional layout of the space-time variogram arguments in the WASM `fromArrays`
  * factories. Keeping this in one place so adding a future parameter only touches the
- * wrapper glue.
+ * wrapper glue. The `family` field uses the same {@link SpaceTimeVariogramFamily}
+ * camelCase strings as the public TS API.
  */
 export interface SpaceTimeVariogramArgs {
   family: SpaceTimeVariogramFamily;
@@ -36,7 +38,7 @@ export interface SpaceTimeVariogramArgs {
 export function packSpaceTimeVariogram(
   variogram: SpaceTimeVariogramParams
 ): SpaceTimeVariogramArgs {
-  return {
+  const base = {
     family: variogram.family,
     spatialType: variogram.spatial.variogramType,
     spatialNugget: variogram.spatial.nugget,
@@ -48,9 +50,45 @@ export function packSpaceTimeVariogram(
     temporalSill: variogram.temporal.sill,
     temporalRange: variogram.temporal.range,
     temporalShape: variogram.temporal.shape,
-    k1: variogram.k1,
-    k2: variogram.k2,
-    k3: variogram.k3,
+  };
+  if (variogram.family === "productSum") {
+    return {
+      ...base,
+      k1: variogram.k1,
+      k2: variogram.k2,
+      k3: variogram.k3,
+    };
+  }
+  return {
+    ...base,
+    k1: undefined,
+    k2: undefined,
+    k3: undefined,
+  };
+}
+
+/**
+ * Convert a fitted space-time variogram into the parameter shape expected by
+ * the kriging constructors. Drops the `residuals` field and preserves the
+ * discriminated union.
+ */
+export function fittedToSpaceTimeVariogramParams(
+  fit: FittedSpaceTimeVariogram
+): SpaceTimeVariogramParams {
+  if (fit.family === "productSum") {
+    return {
+      family: "productSum",
+      spatial: fit.spatial,
+      temporal: fit.temporal,
+      k1: fit.k1,
+      k2: fit.k2,
+      k3: fit.k3,
+    };
+  }
+  return {
+    family: "separable",
+    spatial: fit.spatial,
+    temporal: fit.temporal,
   };
 }
 

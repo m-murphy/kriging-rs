@@ -12,6 +12,7 @@ import {
 } from "../internal/mappers.js";
 import { requireLoadedModule } from "../internal/module.js";
 import {
+  fittedToSpaceTimeVariogramParams,
   packSpaceTimeVariogram,
   requireSpaceTimeUniversalTrend,
 } from "../internal/spacetime.js";
@@ -20,6 +21,7 @@ import type {
   NumericArrayInput,
   OrdinaryBatchArrayOutput,
   OrdinaryPrediction,
+  SpaceTimeUniversalKrigingFromFittedOptions,
   SpaceTimeUniversalKrigingOptions,
 } from "../types.js";
 
@@ -77,10 +79,29 @@ export class SpaceTimeUniversalKriging {
     return this.inner;
   }
 
+  /** Build a universal-kriging model from a fitted space-time variogram and a trend. */
+  static fromFitted(
+    options: SpaceTimeUniversalKrigingFromFittedOptions
+  ): SpaceTimeUniversalKriging {
+    return new SpaceTimeUniversalKriging({
+      lats: options.lats,
+      lons: options.lons,
+      times: options.times,
+      values: options.values,
+      trend: options.trend,
+      variogram: fittedToSpaceTimeVariogramParams(options.fittedVariogram),
+    });
+  }
+
   free(): void {
     if (this.inner === null) return;
     if (typeof this.inner.free === "function") this.inner.free();
     this.inner = null;
+  }
+
+  /** Explicit-resource-management disposer; calls {@link free}. */
+  [Symbol.dispose](): void {
+    this.free();
   }
 
   predict(lat: number, lon: number, time: number): OrdinaryPrediction {

@@ -181,6 +181,11 @@ export class OrdinaryKriging {
     this.inner = null;
   }
 
+  /** Explicit-resource-management disposer; calls {@link free}. */
+  [Symbol.dispose](): void {
+    this.free();
+  }
+
   /**
    * Single-point prediction at (lat, lon) in degrees.
    *

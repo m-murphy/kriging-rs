@@ -54,6 +54,8 @@ export {
 export {
   conditionalSimulate,
   conditionalSimulateBinomial,
+  conditionalSimulateMany,
+  conditionalSimulateManySpaceTime,
   conditionalSimulateProjected,
   conditionalSimulateSimple,
   conditionalSimulateSpaceTime,
@@ -75,6 +77,7 @@ export {
   computeEmpiricalSpaceTimeVariogram,
   fitSpaceTimeVariogram,
 } from "./spacetime/index.js";
+export { datesFromTimes, timesFromDates } from "./time.js";
 
 export type {
   BinomialBatchArrayOutput,
@@ -93,6 +96,8 @@ export type {
   ComputeDirectionalEmpiricalVariogramOptions,
   ComputeEmpiricalVariogramOptions,
   ConditionalSimulateBinomialOptions,
+  ConditionalSimulateManyOptions,
+  ConditionalSimulateManySpaceTimeOptions,
   ConditionalSimulateOptions,
   ConditionalSimulateProjectedOptions,
   ConditionalSimulateSimpleOptions,
@@ -139,6 +144,7 @@ export type {
   OrdinaryKrigingFromFittedOptions,
   OrdinaryKrigingOptions,
   OrdinaryPrediction,
+  PredictGridAtTimeOptions,
   PredictGridOptions,
   ProjectedKrigingOptions,
   SimpleKrigingOptions,
@@ -151,15 +157,21 @@ export type {
   FitSpaceTimeVariogramOptions,
   FitSpaceTimeVariogramResult,
   FittedSpaceTimeVariogram,
+  SpaceTimeBinomialKrigingFromFittedOptions,
   SpaceTimeBinomialKrigingOptions,
+  SpaceTimeOrdinaryKrigingFromFittedOptions,
   SpaceTimeOrdinaryKrigingOptions,
+  SpaceTimeProjectedOrdinaryKrigingFromFittedOptions,
   SpaceTimeProjectedOrdinaryKrigingOptions,
+  SpaceTimeSimpleKrigingFromFittedOptions,
   SpaceTimeSimpleKrigingOptions,
+  SpaceTimeUniversalKrigingFromFittedOptions,
   SpaceTimeUniversalKrigingOptions,
   SpaceTimeUniversalTrend,
   SpaceTimeVariogramFamily,
   SpaceTimeVariogramParams,
 } from "./types.js";
+export type { TimeUnit } from "./time.js";
 
 import { init } from "./internal/module.js";
 

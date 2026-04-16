@@ -243,6 +243,11 @@ export class BinomialKriging {
     this.inner = null;
   }
 
+  /** Explicit-resource-management disposer; calls {@link free}. */
+  [Symbol.dispose](): void {
+    this.free();
+  }
+
   /**
    * Single-point prevalence prediction at (lat, lon) in degrees.
    *

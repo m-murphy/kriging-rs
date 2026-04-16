@@ -34,6 +34,8 @@ import {
   leaveOneOutBinomial,
   kFoldBinomial,
   conditionalSimulate,
+  conditionalSimulateMany,
+  conditionalSimulateManySpaceTime,
   conditionalSimulateSimple,
   conditionalSimulateUniversal,
   conditionalSimulateProjected,
@@ -78,6 +80,29 @@ describe("Ordinary kriging", () => {
   const nugget = 0.01;
   const sill = 1.5;
   const range = 5.0;
+
+  test("using block disposes an OrdinaryKriging model and a later predict throws model_freed", () => {
+    let captured: OrdinaryKriging;
+    {
+      using model = new OrdinaryKriging({
+        lats,
+        lons,
+        values,
+        variogram: { variogramType, nugget, sill, range },
+      });
+      captured = model;
+      const { value } = model.predict(0.5, 0.5);
+      expect(Number.isFinite(value)).toBe(true);
+    }
+    let err: unknown;
+    try {
+      captured.predict(0.5, 0.5);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(KrigingError);
+    expect((err as KrigingError).code).toBe("model_freed");
+  });
 
   test("fitVariogram returns valid FittedVariogram (enum)", () => {
     const fit = fitVariogram({
@@ -1061,24 +1086,10 @@ describe("Cross-validation (binomial, both scales)", () => {
       successes,
       trials,
       variogram,
-      priorAlpha: 1,
-      priorBeta: 1,
+      prior: { alpha: 1, beta: 1 },
     });
     expect(out.residuals.length).toBe(lats.length);
     expect(Number.isFinite(out.summary.prevalence.rmse)).toBe(true);
-  });
-
-  test("leaveOneOutBinomial rejects partial prior specification", () => {
-    expect(() =>
-      leaveOneOutBinomial({
-        lats,
-        lons,
-        successes,
-        trials,
-        variogram,
-        priorAlpha: 1,
-      })
-    ).toThrow(KrigingError);
   });
 });
 
@@ -1138,6 +1149,50 @@ describe("Conditional simulation", () => {
       seed: 2,
     });
     expect(Array.from(a)).not.toEqual(Array.from(b));
+  });
+
+  test("conditionalSimulateMany equals manual loop with baseSeed + k", () => {
+    const many = conditionalSimulateMany({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      conditioningValues: condValues,
+      targetLats,
+      targetLons,
+      variogram,
+      nRealizations: 3,
+      baseSeed: 7,
+    });
+    expect(many).toBeInstanceOf(Float64Array);
+    expect(many.length).toBe(3 * targetLats.length);
+    const nTargets = targetLats.length;
+    for (let k = 0; k < 3; k++) {
+      const row = conditionalSimulate({
+        conditioningLats: condLats,
+        conditioningLons: condLons,
+        conditioningValues: condValues,
+        targetLats,
+        targetLons,
+        variogram,
+        seed: BigInt(7) + BigInt(k),
+      });
+      for (let j = 0; j < nTargets; j++) {
+        expect(many[k * nTargets + j]).toBe(row[j]);
+      }
+    }
+  });
+
+  test("conditionalSimulateMany rejects non-positive nRealizations", () => {
+    expect(() =>
+      conditionalSimulateMany({
+        conditioningLats: condLats,
+        conditioningLons: condLons,
+        conditioningValues: condValues,
+        targetLats,
+        targetLons,
+        variogram,
+        nRealizations: 0,
+      }),
+    ).toThrow(KrigingError);
   });
 });
 
@@ -1357,22 +1412,6 @@ describe("Conditional simulation (binomial, both scales)", () => {
     );
   });
 
-  test("conditionalSimulateBinomial rejects lopsided priors", () => {
-    expect(() =>
-      conditionalSimulateBinomial({
-        conditioningLats: condLats,
-        conditioningLons: condLons,
-        successes,
-        trials,
-        targetLats,
-        targetLons,
-        variogram,
-        priorAlpha: 2,
-        seed: 0,
-      })
-    ).toThrow(KrigingError);
-  });
-
   test("conditionalSimulateBinomial with custom prior differs from default", () => {
     const defaultPrior = conditionalSimulateBinomial({
       conditioningLats: condLats,
@@ -1392,8 +1431,7 @@ describe("Conditional simulation (binomial, both scales)", () => {
       targetLats,
       targetLons,
       variogram,
-      priorAlpha: 2,
-      priorBeta: 5,
+      prior: { alpha: 2, beta: 5 },
       seed: 55,
     });
     expect(
@@ -1666,6 +1704,187 @@ describe("Space-time kriging", () => {
     expect(emp.nPairs.length).toBe(expected);
   });
 
+  test("SpaceTimeOrdinaryKriging.fromFitted matches manual construction", () => {
+    const denseLats: number[] = [];
+    const denseLons: number[] = [];
+    const denseTimes: number[] = [];
+    const denseValues: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      for (let t = 0; t < 5; t++) {
+        denseLats.push(i * 0.1);
+        denseLons.push(0.05 * t);
+        denseTimes.push(t);
+        denseValues.push((i + t) * 0.5);
+      }
+    }
+    for (const family of ["separable", "productSum"] as const) {
+      const fit = fitSpaceTimeVariogram({
+        lats: denseLats,
+        lons: denseLons,
+        times: denseTimes,
+        values: denseValues,
+        nSpatialBins: 5,
+        nTemporalBins: 5,
+        family,
+        spatialModel: "exponential",
+        temporalModel: "exponential",
+      });
+      const m1 = SpaceTimeOrdinaryKriging.fromFitted({
+        lats: denseLats,
+        lons: denseLons,
+        times: denseTimes,
+        values: denseValues,
+        fittedVariogram: fit.fit,
+      });
+      const m2 = new SpaceTimeOrdinaryKriging({
+        lats: denseLats,
+        lons: denseLons,
+        times: denseTimes,
+        values: denseValues,
+        variogram: fit.fit,
+      });
+      try {
+        const p1 = m1.predict(0.25, 0.1, 2);
+        const p2 = m2.predict(0.25, 0.1, 2);
+        expect(p1.value).toBeCloseTo(p2.value, 12);
+        expect(p1.variance).toBeCloseTo(p2.variance, 12);
+      } finally {
+        m1.free();
+        m2.free();
+      }
+    }
+  });
+
+  test("camelCase productSum family round-trips through fit and predict", () => {
+    const denseLats: number[] = [];
+    const denseLons: number[] = [];
+    const denseTimes: number[] = [];
+    const denseValues: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      for (let t = 0; t < 5; t++) {
+        denseLats.push(i * 0.1);
+        denseLons.push(0.05 * t);
+        denseTimes.push(t);
+        denseValues.push((i + t) * 0.5);
+      }
+    }
+    const fit = fitSpaceTimeVariogram({
+      lats: denseLats,
+      lons: denseLons,
+      times: denseTimes,
+      values: denseValues,
+      nSpatialBins: 5,
+      nTemporalBins: 5,
+      family: "productSum",
+      spatialModel: "exponential",
+      temporalModel: "exponential",
+    });
+    expect(fit.fit.family).toBe("productSum");
+    if (fit.fit.family !== "productSum") throw new Error("unreachable");
+    expect(Number.isFinite(fit.fit.k1)).toBe(true);
+    expect(Number.isFinite(fit.fit.k2)).toBe(true);
+    expect(Number.isFinite(fit.fit.k3)).toBe(true);
+
+    const model = new SpaceTimeOrdinaryKriging({
+      lats: denseLats,
+      lons: denseLons,
+      times: denseTimes,
+      values: denseValues,
+      variogram: fit.fit,
+    });
+    try {
+      const { value, variance } = model.predict(0.25, 0.1, 2);
+      expect(Number.isFinite(value)).toBe(true);
+      expect(variance).toBeGreaterThanOrEqual(0);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("SpaceTimeOrdinaryKriging.predictGridAtTime matches manual batch predict", () => {
+    const model = new SpaceTimeOrdinaryKriging({
+      lats,
+      lons,
+      times,
+      values,
+      variogram,
+    });
+    try {
+      const grid = model.predictGridAtTime({
+        west: 0,
+        south: 0,
+        east: 1,
+        north: 1,
+        xCells: 3,
+        yCells: 2,
+        time: 0.5,
+      });
+      expect(grid.values.length).toBe(2);
+      expect(grid.values[0].length).toBe(3);
+      expect(grid.variances.length).toBe(2);
+      expect(grid.variances[0].length).toBe(3);
+      const manualLats: number[] = [];
+      const manualLons: number[] = [];
+      const manualTimes: number[] = [];
+      const latStep = 0.5;
+      const lonStep = 1 / 3;
+      for (let j = 0; j < 2; j++) {
+        const lat = 0 + (j + 0.5) * latStep;
+        for (let i = 0; i < 3; i++) {
+          manualLats.push(lat);
+          manualLons.push(0 + (i + 0.5) * lonStep);
+          manualTimes.push(0.5);
+        }
+      }
+      const out = model.predictBatchArrays(manualLats, manualLons, manualTimes);
+      for (let j = 0; j < 2; j++) {
+        for (let i = 0; i < 3; i++) {
+          const flatIdx = j * 3 + i;
+          expect(grid.values[j][i]).toBeCloseTo(out.values[flatIdx], 12);
+          expect(grid.variances[j][i]).toBeCloseTo(out.variances[flatIdx], 12);
+        }
+      }
+    } finally {
+      model.free();
+    }
+  });
+
+  test("SpaceTimeBinomialKriging.predictGridAtTime returns 2D prevalence grids", () => {
+    const model = new SpaceTimeBinomialKriging({
+      lats,
+      lons,
+      times,
+      successes,
+      trials,
+      variogram,
+    });
+    try {
+      const grid = model.predictGridAtTime({
+        west: 0,
+        south: 0,
+        east: 1,
+        north: 1,
+        xCells: 2,
+        yCells: 2,
+        time: 0.5,
+      });
+      expect(grid.prevalences.length).toBe(2);
+      expect(grid.prevalences[0].length).toBe(2);
+      expect(grid.logitValues.length).toBe(2);
+      expect(grid.variances.length).toBe(2);
+      expect(grid.prevalenceVariances.length).toBe(2);
+      for (let j = 0; j < 2; j++) {
+        for (let i = 0; i < 2; i++) {
+          expect(grid.prevalences[j][i]).toBeGreaterThanOrEqual(0);
+          expect(grid.prevalences[j][i]).toBeLessThanOrEqual(1);
+          expect(grid.variances[j][i]).toBeGreaterThanOrEqual(0);
+        }
+      }
+    } finally {
+      model.free();
+    }
+  });
+
   test("fitSpaceTimeVariogram returns a separable fit with finite residuals", () => {
     const denseLats: number[] = [];
     const denseLons: number[] = [];
@@ -1707,6 +1926,30 @@ describe("Space-time kriging", () => {
           variogram,
         })
     ).toThrow(KrigingError);
+  });
+
+  test("using block disposes ST models and subsequent predict throws model_freed", () => {
+    let freedAddress: SpaceTimeOrdinaryKriging;
+    {
+      using model = new SpaceTimeOrdinaryKriging({
+        lats,
+        lons,
+        times,
+        values,
+        variogram,
+      });
+      freedAddress = model;
+      const { value } = model.predict(0.5, 0.5, 0.5);
+      expect(Number.isFinite(value)).toBe(true);
+    }
+    let err: unknown;
+    try {
+      freedAddress.predict(0.5, 0.5, 0.5);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(KrigingError);
+    expect((err as KrigingError).code).toBe("model_freed");
   });
 });
 
@@ -1854,18 +2097,17 @@ describe("Space-time cross-validation", () => {
     expect(out.residuals.length).toBe(successes.length);
   });
 
-  test("binomial CV rejects prior with only alpha", () => {
-    expect(() =>
-      leaveOneOutSpaceTimeBinomial({
-        lats,
-        lons,
-        times,
-        successes,
-        trials,
-        variogram,
-        priorAlpha: 1,
-      })
-    ).toThrow(KrigingError);
+  test("binomial CV accepts custom Beta prior via `prior`", () => {
+    const out = leaveOneOutSpaceTimeBinomial({
+      lats,
+      lons,
+      times,
+      successes,
+      trials,
+      variogram,
+      prior: { alpha: 2, beta: 5 },
+    });
+    expect(out.residuals.length).toBe(successes.length);
   });
 });
 
@@ -1945,6 +2187,40 @@ describe("Space-time conditional simulation", () => {
       seed: 2n,
     });
     expect(Array.from(a)).not.toEqual(Array.from(b));
+  });
+
+  test("conditionalSimulateManySpaceTime equals manual loop with baseSeed + k", () => {
+    const many = conditionalSimulateManySpaceTime({
+      conditioningLats,
+      conditioningLons,
+      conditioningTimes,
+      conditioningValues,
+      targetLats,
+      targetLons,
+      targetTimes,
+      variogram,
+      nRealizations: 3,
+      baseSeed: 5,
+    });
+    expect(many).toBeInstanceOf(Float64Array);
+    const nTargets = targetLats.length;
+    expect(many.length).toBe(3 * nTargets);
+    for (let k = 0; k < 3; k++) {
+      const row = conditionalSimulateSpaceTime({
+        conditioningLats,
+        conditioningLons,
+        conditioningTimes,
+        conditioningValues,
+        targetLats,
+        targetLons,
+        targetTimes,
+        variogram,
+        seed: BigInt(5) + BigInt(k),
+      });
+      for (let j = 0; j < nTargets; j++) {
+        expect(many[k * nTargets + j]).toBe(row[j]);
+      }
+    }
   });
 
   test("conditionalSimulateSpaceTimeSimple honors known mean", () => {

@@ -7,18 +7,25 @@
 
 import { KrigingError, wrapThrown } from "../errors.js";
 import { toFloat64Array, toUint32Array } from "../internal/convert.js";
+import { buildGridLatsLons, reshapeFlatToGrid } from "../internal/grid.js";
 import {
   mapBinomialBatchArrayOutput,
   mapBinomialPrediction,
   mapBinomialPredictionArray,
 } from "../internal/mappers.js";
 import { requireLoadedModule } from "../internal/module.js";
-import { packSpaceTimeVariogram } from "../internal/spacetime.js";
+import {
+  fittedToSpaceTimeVariogramParams,
+  packSpaceTimeVariogram,
+} from "../internal/spacetime.js";
 import type { WasmSpaceTimeBinomialInstance } from "../internal/wasm-shapes.js";
 import type {
   BinomialBatchArrayOutput,
+  BinomialGridOutput,
   BinomialPrediction,
   NumericArrayInput,
+  PredictGridAtTimeOptions,
+  SpaceTimeBinomialKrigingFromFittedOptions,
   SpaceTimeBinomialKrigingOptions,
 } from "../types.js";
 
@@ -76,10 +83,29 @@ export class SpaceTimeBinomialKriging {
     return this.inner;
   }
 
+  /** Build a binomial-kriging model from sample counts plus a fitted space-time variogram. */
+  static fromFitted(
+    options: SpaceTimeBinomialKrigingFromFittedOptions
+  ): SpaceTimeBinomialKriging {
+    return new SpaceTimeBinomialKriging({
+      lats: options.lats,
+      lons: options.lons,
+      times: options.times,
+      successes: options.successes,
+      trials: options.trials,
+      variogram: fittedToSpaceTimeVariogramParams(options.fittedVariogram),
+    });
+  }
+
   free(): void {
     if (this.inner === null) return;
     if (typeof this.inner.free === "function") this.inner.free();
     this.inner = null;
+  }
+
+  /** Explicit-resource-management disposer; calls {@link free}. */
+  [Symbol.dispose](): void {
+    this.free();
   }
 
   predict(lat: number, lon: number, time: number): BinomialPrediction {
@@ -110,5 +136,33 @@ export class SpaceTimeBinomialKriging {
       toFloat64Array(times)
     );
     return mapBinomialBatchArrayOutput(out);
+  }
+
+  /**
+   * Predict prevalence on a rectangular lat/lon grid at a fixed `time` slice.
+   * Builds cell-center coordinates in row-major order, fills a `time` array
+   * with the same scalar for every cell, and reshapes results into 2D arrays
+   * of shape `[yCells][xCells]`.
+   */
+  predictGridAtTime(options: PredictGridAtTimeOptions): BinomialGridOutput {
+    const inner = this.requireInner();
+    const nRows = Math.max(1, Math.floor(options.yCells));
+    const nCols = Math.max(1, Math.floor(options.xCells));
+    const { lats, lons } = buildGridLatsLons(options);
+    const times = new Float64Array(lats.length);
+    times.fill(options.time);
+    const out = inner.predictBatchArrays(lats, lons, times);
+    const {
+      prevalences: prevFlat,
+      logitValues: logitFlat,
+      variances: varFlat,
+      prevalenceVariances: prevVarFlat,
+    } = mapBinomialBatchArrayOutput(out);
+    return {
+      prevalences: reshapeFlatToGrid(prevFlat, nRows, nCols),
+      logitValues: reshapeFlatToGrid(logitFlat, nRows, nCols),
+      variances: reshapeFlatToGrid(varFlat, nRows, nCols),
+      prevalenceVariances: reshapeFlatToGrid(prevVarFlat, nRows, nCols),
+    };
   }
 }

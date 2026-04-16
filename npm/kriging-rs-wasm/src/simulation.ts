@@ -26,6 +26,7 @@ import {
   toUint32Array,
 } from "./internal/convert.js";
 import { requireLoadedModule } from "./internal/module.js";
+import { resolveBinomialPrior } from "./internal/prior.js";
 import {
   packSpaceTimeVariogram,
   requireSpaceTimeUniversalTrend,
@@ -33,6 +34,8 @@ import {
 import type {
   BinomialSimulationResult,
   ConditionalSimulateBinomialOptions,
+  ConditionalSimulateManyOptions,
+  ConditionalSimulateManySpaceTimeOptions,
   ConditionalSimulateOptions,
   ConditionalSimulateProjectedOptions,
   ConditionalSimulateSimpleOptions,
@@ -51,6 +54,15 @@ function unavailable(name: string): never {
 
 function normalizeSeed(seed: number | bigint | undefined): bigint {
   return typeof seed === "bigint" ? seed : BigInt(seed ?? 0);
+}
+
+function requirePositiveInt(value: number, label: string): number {
+  if (!Number.isInteger(value) || value < 1) {
+    throw new KrigingError(`${label} must be a positive integer`, {
+      code: "invalid_input",
+    });
+  }
+  return value;
 }
 
 function normalizeTargetOrder(
@@ -213,20 +225,6 @@ export function conditionalSimulateProjected(
   }
 }
 
-function validateBinomialPrior(
-  priorAlpha: number | undefined,
-  priorBeta: number | undefined
-): void {
-  const hasAlpha = priorAlpha !== undefined;
-  const hasBeta = priorBeta !== undefined;
-  if (hasAlpha !== hasBeta) {
-    throw new KrigingError(
-      "priorAlpha and priorBeta must be provided together (or both omitted)",
-      { code: "invalid_input" }
-    );
-  }
-}
-
 /**
  * Sequential Gaussian simulation for binomial (count) data.
  *
@@ -249,7 +247,7 @@ export function conditionalSimulateBinomial(
   if (typeof mod.conditionalSimulateBinomial !== "function") {
     unavailable("conditionalSimulateBinomial");
   }
-  validateBinomialPrior(options.priorAlpha, options.priorBeta);
+  const { alpha, beta } = resolveBinomialPrior(options.prior);
   const seed = normalizeSeed(options.seed);
   const targetOrder = normalizeTargetOrder(options.targetOrder);
   try {
@@ -265,8 +263,8 @@ export function conditionalSimulateBinomial(
       options.variogram.sill,
       options.variogram.range,
       options.variogram.shape,
-      options.priorAlpha,
-      options.priorBeta,
+      alpha,
+      beta,
       seed,
       targetOrder
     ) as { logitSamples: unknown; prevalenceSamples: unknown };
@@ -435,7 +433,7 @@ export function conditionalSimulateSpaceTimeBinomial(
   if (typeof mod.conditionalSimulateSpaceTimeBinomial !== "function") {
     unavailable("conditionalSimulateSpaceTimeBinomial");
   }
-  validateBinomialPrior(options.priorAlpha, options.priorBeta);
+  const { alpha, beta } = resolveBinomialPrior(options.prior);
   const seed = normalizeSeed(options.seed);
   const targetOrder = normalizeTargetOrder(options.targetOrder);
   const packed = packSpaceTimeVariogram(options.variogram);
@@ -463,8 +461,8 @@ export function conditionalSimulateSpaceTimeBinomial(
       packed.k1,
       packed.k2,
       packed.k3,
-      options.priorAlpha,
-      options.priorBeta,
+      alpha,
+      beta,
       seed,
       targetOrder
     ) as { logitSamples: unknown; prevalenceSamples: unknown };
@@ -475,4 +473,76 @@ export function conditionalSimulateSpaceTimeBinomial(
   } catch (e) {
     throw wrapThrown(e);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Batch (multi-realization) conditional simulation
+// ---------------------------------------------------------------------------
+
+/**
+ * Draw `nRealizations` independent ordinary-kriging SGS realizations with
+ * deterministic seeds `baseSeed + k`. Returns a flat row-major
+ * `Float64Array(nRealizations * nTargets)` where row `k` holds the k-th
+ * realization in input order.
+ *
+ * Each realization is produced by a single call to {@link conditionalSimulate},
+ * so the output is identical to calling it in a loop — but collected into one
+ * buffer for easy aggregation (mean, quantiles, variance).
+ */
+export function conditionalSimulateMany(
+  options: ConditionalSimulateManyOptions
+): Float64Array {
+  const n = requirePositiveInt(options.nRealizations, "nRealizations");
+  const baseSeed = normalizeSeed(options.baseSeed);
+  const targetLats = toFloat64Array(options.targetLats);
+  const nTargets = targetLats.length;
+  const out = new Float64Array(n * nTargets);
+  const {
+    nRealizations: _nRealizations,
+    baseSeed: _baseSeed,
+    ...rest
+  } = options;
+  void _nRealizations;
+  void _baseSeed;
+  for (let k = 0; k < n; k++) {
+    const row = conditionalSimulate({
+      ...rest,
+      targetLats,
+      seed: baseSeed + BigInt(k),
+    });
+    out.set(row, k * nTargets);
+  }
+  return out;
+}
+
+/**
+ * Draw `nRealizations` independent space-time ordinary-kriging SGS realizations
+ * with deterministic seeds `baseSeed + k`. Returns a flat row-major
+ * `Float64Array(nRealizations * nTargets)` where row `k` holds the k-th
+ * realization in input order.
+ */
+export function conditionalSimulateManySpaceTime(
+  options: ConditionalSimulateManySpaceTimeOptions
+): Float64Array {
+  const n = requirePositiveInt(options.nRealizations, "nRealizations");
+  const baseSeed = normalizeSeed(options.baseSeed);
+  const targetLats = toFloat64Array(options.targetLats);
+  const nTargets = targetLats.length;
+  const out = new Float64Array(n * nTargets);
+  const {
+    nRealizations: _nRealizations,
+    baseSeed: _baseSeed,
+    ...rest
+  } = options;
+  void _nRealizations;
+  void _baseSeed;
+  for (let k = 0; k < n; k++) {
+    const row = conditionalSimulateSpaceTime({
+      ...rest,
+      targetLats,
+      seed: baseSeed + BigInt(k),
+    });
+    out.set(row, k * nTargets);
+  }
+  return out;
 }

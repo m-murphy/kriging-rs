@@ -11,12 +11,16 @@ import {
   mapOrdinaryPrediction,
 } from "../internal/mappers.js";
 import { requireLoadedModule } from "../internal/module.js";
-import { packSpaceTimeVariogram } from "../internal/spacetime.js";
+import {
+  fittedToSpaceTimeVariogramParams,
+  packSpaceTimeVariogram,
+} from "../internal/spacetime.js";
 import type { WasmSpaceTimeInstance } from "../internal/wasm-shapes.js";
 import type {
   NumericArrayInput,
   OrdinaryBatchArrayOutput,
   OrdinaryPrediction,
+  SpaceTimeSimpleKrigingFromFittedOptions,
   SpaceTimeSimpleKrigingOptions,
 } from "../types.js";
 
@@ -74,10 +78,29 @@ export class SpaceTimeSimpleKriging {
     return this.inner;
   }
 
+  /** Build a simple-kriging model from a fitted space-time variogram plus a known mean. */
+  static fromFitted(
+    options: SpaceTimeSimpleKrigingFromFittedOptions
+  ): SpaceTimeSimpleKriging {
+    return new SpaceTimeSimpleKriging({
+      lats: options.lats,
+      lons: options.lons,
+      times: options.times,
+      values: options.values,
+      mean: options.mean,
+      variogram: fittedToSpaceTimeVariogramParams(options.fittedVariogram),
+    });
+  }
+
   free(): void {
     if (this.inner === null) return;
     if (typeof this.inner.free === "function") this.inner.free();
     this.inner = null;
+  }
+
+  /** Explicit-resource-management disposer; calls {@link free}. */
+  [Symbol.dispose](): void {
+    this.free();
   }
 
   predict(lat: number, lon: number, time: number): OrdinaryPrediction {

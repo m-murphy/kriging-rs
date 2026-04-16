@@ -37,6 +37,7 @@ import {
   type OrdinaryPrediction,
   type OrdinaryGridOutput,
   type PredictGridOptions,
+  type SpaceTimeVariogramParams,
   type VariogramTypeName,
 } from "../src/index.js";
 
@@ -414,3 +415,48 @@ const _oneShotBinomial: BinomialGridOutput = interpolateBinomialToGrid({
   variogramType: "exponential",
   prior: { alpha: 1, beta: 1 },
 });
+
+// ---------- SpaceTimeVariogramParams discriminated-union contracts ----------
+
+const _separableOk: SpaceTimeVariogramParams = {
+  family: "separable",
+  spatial: stVariogram.spatial,
+  temporal: stVariogram.temporal,
+};
+
+const _productSumOk: SpaceTimeVariogramParams = {
+  family: "productSum",
+  spatial: stVariogram.spatial,
+  temporal: stVariogram.temporal,
+  k1: 1,
+  k2: 0,
+  k3: 0,
+};
+
+// Separable MUST NOT accept k1/k2/k3.
+const _separableRejectsK: SpaceTimeVariogramParams = {
+  family: "separable",
+  spatial: stVariogram.spatial,
+  temporal: stVariogram.temporal,
+  // @ts-expect-error separable has no k coefficients
+  k1: 1,
+};
+
+// productSum MUST require k1/k2/k3.
+// @ts-expect-error productSum requires k1, k2, k3
+const _productSumRequiresK: SpaceTimeVariogramParams = {
+  family: "productSum",
+  spatial: stVariogram.spatial,
+  temporal: stVariogram.temporal,
+};
+
+// snake_case "product_sum" must be rejected at the TS boundary.
+const _snakeCaseRejected: SpaceTimeVariogramParams = {
+  // @ts-expect-error snake_case family name is not part of the public API
+  family: "product_sum",
+  spatial: stVariogram.spatial,
+  temporal: stVariogram.temporal,
+  k1: 1,
+  k2: 0,
+  k3: 0,
+};
