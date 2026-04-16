@@ -1,6 +1,12 @@
 #![cfg(all(feature = "wasm", target_arch = "wasm32"))]
 
 use js_sys::{Array, Float64Array, Object, Reflect};
+use kriging_rs::wasm::spacetime::{
+    WasmSpaceTimeBinomialKriging, WasmSpaceTimeOrdinaryKriging,
+    WasmSpaceTimeOrdinaryProjectedKriging, WasmSpaceTimeSimpleKriging,
+    WasmSpaceTimeUniversalKriging, wasm_compute_empirical_spacetime_variogram,
+    wasm_fit_spacetime_variogram,
+};
 #[cfg(feature = "gpu")]
 use kriging_rs::wasm::wasm_webgpu_available;
 use kriging_rs::wasm::{WasmBinomialKriging, WasmOrdinaryKriging};
@@ -225,6 +231,307 @@ fn wasm_mismatched_arrays_throws_with_code() {
         .as_string()
         .unwrap_or_default();
     assert_eq!(code, "mismatched_arrays");
+}
+
+// ---------- Space–time bindings ----------
+
+#[wasm_bindgen_test]
+fn wasm_spacetime_ordinary_predict_is_finite() {
+    let lats = [0.0, 0.0, 1.0, 1.0];
+    let lons = [0.0, 1.0, 0.0, 1.0];
+    let times = [0.0, 1.0, 2.0, 3.0];
+    let values = [1.0, 2.0, 1.5, 2.5];
+    let model = WasmSpaceTimeOrdinaryKriging::from_arrays(
+        &lats,
+        &lons,
+        &times,
+        &values,
+        "separable",
+        "exponential",
+        0.01,
+        1.0,
+        300.0,
+        None,
+        "exponential",
+        0.01,
+        1.0,
+        5.0,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("model should construct");
+    let js = model
+        .predict(0.5, 0.5, 1.5)
+        .expect("predict should succeed");
+    let value = Reflect::get(&js, &JsValue::from_str("value"))
+        .expect("has value")
+        .as_f64()
+        .unwrap_or(f64::NAN);
+    let variance = Reflect::get(&js, &JsValue::from_str("variance"))
+        .expect("has variance")
+        .as_f64()
+        .unwrap_or(f64::NAN);
+    assert!(value.is_finite());
+    assert!(variance.is_finite() && variance >= 0.0);
+}
+
+#[wasm_bindgen_test]
+fn wasm_spacetime_ordinary_batch_arrays_returns_typed_arrays() {
+    let lats = [0.0, 0.0, 1.0, 1.0];
+    let lons = [0.0, 1.0, 0.0, 1.0];
+    let times = [0.0, 1.0, 2.0, 3.0];
+    let values = [1.0, 2.0, 1.5, 2.5];
+    let model = WasmSpaceTimeOrdinaryKriging::from_arrays(
+        &lats,
+        &lons,
+        &times,
+        &values,
+        "separable",
+        "exponential",
+        0.01,
+        1.0,
+        300.0,
+        None,
+        "exponential",
+        0.01,
+        1.0,
+        5.0,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("model should construct");
+    let js = model
+        .predict_batch_arrays(&[0.2, 0.4], &[0.3, 0.6], &[0.5, 1.5])
+        .expect("batch arrays should succeed");
+    let values = Reflect::get(&js, &JsValue::from_str("values")).expect("has values");
+    let variances = Reflect::get(&js, &JsValue::from_str("variances")).expect("has variances");
+    assert!(values.is_instance_of::<Float64Array>());
+    assert!(variances.is_instance_of::<Float64Array>());
+}
+
+#[wasm_bindgen_test]
+fn wasm_spacetime_simple_reverts_to_mean_far_away() {
+    let lats = [0.0, 0.0, 1.0, 1.0];
+    let lons = [0.0, 1.0, 0.0, 1.0];
+    let times = [0.0, 1.0, 2.0, 3.0];
+    let values = [1.0, 2.0, 1.5, 2.5];
+    let mean = 100.0;
+    let model = WasmSpaceTimeSimpleKriging::from_arrays(
+        &lats,
+        &lons,
+        &times,
+        &values,
+        mean,
+        "separable",
+        "exponential",
+        0.01,
+        1.0,
+        2.0,
+        None,
+        "exponential",
+        0.01,
+        1.0,
+        0.5,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("model should construct");
+    let js = model
+        .predict(50.0, 50.0, 500.0)
+        .expect("predict should succeed");
+    let value = Reflect::get(&js, &JsValue::from_str("value"))
+        .expect("has value")
+        .as_f64()
+        .unwrap();
+    assert!((value - mean).abs() < 1.0);
+}
+
+#[wasm_bindgen_test]
+fn wasm_spacetime_universal_constant_trend_is_finite() {
+    let lats = [0.0, 0.0, 1.0, 1.0];
+    let lons = [0.0, 1.0, 0.0, 1.0];
+    let times = [0.0, 1.0, 2.0, 3.0];
+    let values = [1.0, 2.0, 1.5, 2.5];
+    let model = WasmSpaceTimeUniversalKriging::from_arrays(
+        &lats,
+        &lons,
+        &times,
+        &values,
+        "constant",
+        "separable",
+        "exponential",
+        0.05,
+        1.0,
+        300.0,
+        None,
+        "exponential",
+        0.05,
+        1.0,
+        5.0,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("model should construct");
+    let js = model
+        .predict(0.5, 0.5, 1.5)
+        .expect("predict should succeed");
+    let value = Reflect::get(&js, &JsValue::from_str("value"))
+        .expect("has value")
+        .as_f64()
+        .unwrap_or(f64::NAN);
+    assert!(value.is_finite());
+}
+
+#[wasm_bindgen_test]
+fn wasm_spacetime_binomial_returns_unit_interval_prevalence() {
+    let lats = [0.0, 0.0, 1.0];
+    let lons = [0.0, 1.0, 0.0];
+    let times = [0.0, 1.0, 2.0];
+    let successes: [u32; 3] = [3, 7, 5];
+    let trials: [u32; 3] = [10, 10, 10];
+    let model = WasmSpaceTimeBinomialKriging::from_arrays(
+        &lats,
+        &lons,
+        &times,
+        &successes,
+        &trials,
+        "separable",
+        "exponential",
+        0.05,
+        1.0,
+        200.0,
+        None,
+        "exponential",
+        0.05,
+        1.0,
+        5.0,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("model should construct");
+    let js = model
+        .predict(0.5, 0.5, 1.0)
+        .expect("predict should succeed");
+    let prev = Reflect::get(&js, &JsValue::from_str("prevalence"))
+        .expect("has prevalence")
+        .as_f64()
+        .unwrap();
+    assert!(prev > 0.0 && prev < 1.0);
+}
+
+#[wasm_bindgen_test]
+fn wasm_spacetime_projected_predict_is_finite() {
+    let xs = [0.0, 0.0, 1.0, 1.0];
+    let ys = [0.0, 1.0, 0.0, 1.0];
+    let times = [0.0, 1.0, 2.0, 3.0];
+    let values = [1.0, 2.0, 1.5, 2.5];
+    let model = WasmSpaceTimeOrdinaryProjectedKriging::from_arrays(
+        &xs,
+        &ys,
+        &times,
+        &values,
+        0.0,
+        1.0,
+        "separable",
+        "exponential",
+        0.01,
+        1.0,
+        2.0,
+        None,
+        "exponential",
+        0.01,
+        1.0,
+        3.0,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("model should construct");
+    let js = model
+        .predict(0.5, 0.5, 1.5)
+        .expect("predict should succeed");
+    let value = Reflect::get(&js, &JsValue::from_str("value"))
+        .expect("has value")
+        .as_f64()
+        .unwrap_or(f64::NAN);
+    assert!(value.is_finite());
+}
+
+#[wasm_bindgen_test]
+fn wasm_compute_empirical_spacetime_variogram_returns_typed_arrays() {
+    let lats = [0.0, 0.0, 1.0, 1.0, 0.5];
+    let lons = [0.0, 1.0, 0.0, 1.0, 0.5];
+    let times = [0.0, 1.0, 2.0, 3.0, 1.5];
+    let values = [1.0, 2.0, 1.5, 2.5, 2.0];
+    let js = wasm_compute_empirical_spacetime_variogram(
+        &lats,
+        &lons,
+        &times,
+        &values,
+        None,
+        None,
+        4,
+        4,
+        "classical",
+    )
+    .expect("empirical computation should succeed");
+    let semis = Reflect::get(&js, &JsValue::from_str("semivariances")).expect("has semivariances");
+    let n_pairs = Reflect::get(&js, &JsValue::from_str("nPairs")).expect("has nPairs");
+    assert!(semis.is_instance_of::<Float64Array>());
+    assert!(n_pairs.is_instance_of::<Float64Array>());
+}
+
+#[wasm_bindgen_test]
+fn wasm_fit_spacetime_variogram_returns_fit_object() {
+    let mut lats = Vec::new();
+    let mut lons = Vec::new();
+    let mut times = Vec::new();
+    let mut values = Vec::new();
+    for i in 0..6 {
+        for t in 0..5 {
+            lats.push(i as f64 * 0.1);
+            lons.push(0.05 * (t as f64));
+            times.push(t as f64);
+            values.push(((i + t) as f64) * 0.5);
+        }
+    }
+    let js = wasm_fit_spacetime_variogram(
+        &lats,
+        &lons,
+        &times,
+        &values,
+        None,
+        None,
+        5,
+        5,
+        "classical",
+        "separable",
+        "exponential",
+        "exponential",
+    )
+    .expect("fit should succeed");
+    let fit = Reflect::get(&js, &JsValue::from_str("fit")).expect("has fit");
+    let family = Reflect::get(&fit, &JsValue::from_str("family"))
+        .expect("has family")
+        .as_string()
+        .unwrap_or_default();
+    assert_eq!(family, "separable");
+    let residuals = Reflect::get(&fit, &JsValue::from_str("residuals"))
+        .expect("has residuals")
+        .as_f64()
+        .unwrap_or(f64::NAN);
+    assert!(residuals.is_finite());
 }
 
 #[cfg(feature = "gpu")]

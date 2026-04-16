@@ -1,4 +1,8 @@
 use criterion::{Criterion, criterion_group, criterion_main};
+use kriging_rs::spacetime::{
+    GeoMetric, SpaceTimeCoord, SpaceTimeDataset, SpaceTimeOrdinaryKrigingModel, SpaceTimeVariogram,
+    SpaceTimeVariogramConfig, compute_empirical_spacetime_variogram,
+};
 use kriging_rs::variogram::empirical::{VariogramConfig, compute_empirical_variogram};
 use kriging_rs::variogram::fitting::fit_variogram;
 use kriging_rs::variogram::models::VariogramType;
@@ -378,12 +382,99 @@ fn bench_quick_phase_profile(c: &mut Criterion) {
     });
 }
 
+fn build_spacetime_dataset(spatial_side: usize, time_steps: usize) -> SpaceTimeDataset<GeoCoord> {
+    let mut coords = Vec::with_capacity(spatial_side * spatial_side * time_steps);
+    let mut values = Vec::with_capacity(spatial_side * spatial_side * time_steps);
+    for i in 0..spatial_side {
+        for j in 0..spatial_side {
+            for k in 0..time_steps {
+                let lat = 35.0 + (i as Real) * 0.05;
+                let lon = -120.0 + (j as Real) * 0.05;
+                let t = k as Real;
+                let coord = SpaceTimeCoord::try_new(GeoCoord::try_new(lat, lon).unwrap(), t)
+                    .expect("st coord");
+                coords.push(coord);
+                values.push(
+                    10.0 + 2.0 * lat
+                        + 1.5 * lon
+                        + 0.5 * t
+                        + ((i + j + k) as Real * 0.1).sin() * 0.25,
+                );
+            }
+        }
+    }
+    SpaceTimeDataset::new(coords, values).expect("spacetime dataset")
+}
+
+fn build_spacetime_variogram() -> SpaceTimeVariogram {
+    let spatial = VariogramModel::new(0.05, 2.0, 10.0, VariogramType::Exponential)
+        .expect("spatial variogram");
+    let temporal = VariogramModel::new(0.05, 1.0, 3.0, VariogramType::Exponential)
+        .expect("temporal variogram");
+    SpaceTimeVariogram::new_separable(spatial, temporal).expect("separable variogram")
+}
+
+fn build_spacetime_targets(count: usize) -> Vec<SpaceTimeCoord<GeoCoord>> {
+    (0..count)
+        .map(|i| {
+            let lat = 35.1 + (i as Real) * 0.001;
+            let lon = -119.9 + (i as Real) * 0.001;
+            let t = ((i % 5) as Real) * 0.5;
+            SpaceTimeCoord::try_new(GeoCoord::try_new(lat, lon).unwrap(), t).unwrap()
+        })
+        .collect()
+}
+
+fn bench_spacetime(c: &mut Criterion) {
+    // ~10x10 spatial x 4 time steps = 400 points.
+    let dataset_400 = build_spacetime_dataset(10, 4);
+    let variogram = build_spacetime_variogram();
+
+    c.bench_function("spacetime_ordinary_model_build_400pts", |b| {
+        let variogram = build_spacetime_variogram();
+        let dataset = dataset_400.clone();
+        b.iter(|| {
+            let _ = SpaceTimeOrdinaryKrigingModel::new(GeoMetric, dataset.clone(), variogram)
+                .expect("st model");
+        })
+    });
+
+    let model_400 = SpaceTimeOrdinaryKrigingModel::new(GeoMetric, dataset_400.clone(), variogram)
+        .expect("st model");
+    let single_target =
+        SpaceTimeCoord::try_new(GeoCoord::try_new(35.25, -119.75).unwrap(), 1.0).unwrap();
+    c.bench_function("spacetime_ordinary_predict_single_400pts", |b| {
+        b.iter(|| {
+            let _ = model_400.predict(single_target).expect("st predict");
+        })
+    });
+
+    let targets_250 = build_spacetime_targets(250);
+    c.bench_function("spacetime_ordinary_predict_batch_250_with_400pts", |b| {
+        b.iter(|| {
+            let _ = model_400
+                .predict_batch(&targets_250)
+                .expect("st predict batch");
+        })
+    });
+
+    let variogram_config = SpaceTimeVariogramConfig::default();
+    c.bench_function("spacetime_empirical_variogram_400pts", |b| {
+        b.iter(|| {
+            let _ =
+                compute_empirical_spacetime_variogram(&GeoMetric, &dataset_400, &variogram_config)
+                    .expect("st empirical");
+        })
+    });
+}
+
 criterion_group!(
     performance,
     bench_model_build,
     bench_single_prediction,
     bench_batch_prediction,
     bench_binomial,
+    bench_spacetime,
     bench_quick_phase_profile
 );
 criterion_main!(performance);

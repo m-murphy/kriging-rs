@@ -11,6 +11,13 @@ import {
   SimpleKriging,
   UniversalKriging,
   ProjectedKriging,
+  SpaceTimeOrdinaryKriging,
+  SpaceTimeSimpleKriging,
+  SpaceTimeUniversalKriging,
+  SpaceTimeBinomialKriging,
+  SpaceTimeProjectedOrdinaryKriging,
+  computeEmpiricalSpaceTimeVariogram,
+  fitSpaceTimeVariogram,
   fitVariogram,
   interpolateOrdinaryToGrid,
   interpolateBinomialToGrid,
@@ -31,6 +38,18 @@ import {
   conditionalSimulateUniversal,
   conditionalSimulateProjected,
   conditionalSimulateBinomial,
+  leaveOneOutSpaceTime,
+  kFoldSpaceTime,
+  leaveOneOutSpaceTimeSimple,
+  kFoldSpaceTimeSimple,
+  leaveOneOutSpaceTimeUniversal,
+  kFoldSpaceTimeUniversal,
+  leaveOneOutSpaceTimeBinomial,
+  kFoldSpaceTimeBinomial,
+  conditionalSimulateSpaceTime,
+  conditionalSimulateSpaceTimeSimple,
+  conditionalSimulateSpaceTimeUniversal,
+  conditionalSimulateSpaceTimeBinomial,
   evaluateNestedVariogram,
   VariogramType,
   type OrdinaryPrediction,
@@ -1482,5 +1501,549 @@ describe("Uninitialized API", () => {
       encoding: "utf8",
     });
     expect(result.status).toBe(0);
+  });
+});
+
+describe("Space-time kriging", () => {
+  const lats = [0, 0, 0, 0, 1, 1, 1, 1];
+  const lons = [0, 0, 1, 1, 0, 0, 1, 1];
+  const times = [0, 1, 0, 1, 0, 1, 0, 1];
+  const values = [1, 2, 1.5, 2.5, 1.2, 2.1, 1.8, 2.7];
+  const successes = [2, 4, 3, 5, 3, 5, 4, 6];
+  const trials = [10, 10, 10, 10, 10, 10, 10, 10];
+  const variogram = {
+    family: "separable" as const,
+    spatial: {
+      variogramType: "exponential" as const,
+      nugget: 0.01,
+      sill: 1.0,
+      range: 300,
+    },
+    temporal: {
+      variogramType: "exponential" as const,
+      nugget: 0.01,
+      sill: 1.0,
+      range: 2,
+    },
+  };
+
+  test("ordinary model predicts finite value and non-negative variance", () => {
+    const model = new SpaceTimeOrdinaryKriging({
+      lats,
+      lons,
+      times,
+      values,
+      variogram,
+    });
+    try {
+      const { value, variance } = model.predict(0.5, 0.5, 0.5);
+      expect(Number.isFinite(value)).toBe(true);
+      expect(variance).toBeGreaterThanOrEqual(0);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("ordinary batch-arrays returns typed arrays sized by targets", () => {
+    const model = new SpaceTimeOrdinaryKriging({
+      lats,
+      lons,
+      times,
+      values,
+      variogram,
+    });
+    try {
+      const out = model.predictBatchArrays(
+        [0.25, 0.75],
+        [0.25, 0.75],
+        [0.25, 0.75]
+      );
+      expect(out.values).toBeInstanceOf(Float64Array);
+      expect(out.values.length).toBe(2);
+      expect(out.variances.length).toBe(2);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("simple model reverts to the supplied mean far outside the data", () => {
+    const mean = 100;
+    const model = new SpaceTimeSimpleKriging({
+      lats,
+      lons,
+      times,
+      values,
+      variogram: {
+        ...variogram,
+        spatial: { ...variogram.spatial, range: 0.5 },
+        temporal: { ...variogram.temporal, range: 0.5 },
+      },
+      mean,
+    });
+    try {
+      const { value } = model.predict(50, 50, 500);
+      expect(Math.abs(value - mean)).toBeLessThan(1);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("universal model with constant trend predicts finite value", () => {
+    const model = new SpaceTimeUniversalKriging({
+      lats,
+      lons,
+      times,
+      values,
+      variogram,
+      trend: "constant",
+    });
+    try {
+      const { value } = model.predict(0.5, 0.5, 0.5);
+      expect(Number.isFinite(value)).toBe(true);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("binomial model returns prevalence in the unit interval", () => {
+    const model = new SpaceTimeBinomialKriging({
+      lats,
+      lons,
+      times,
+      successes,
+      trials,
+      variogram,
+    });
+    try {
+      const { prevalence, logitValue, variance, prevalenceVariance } =
+        model.predict(0.5, 0.5, 0.5);
+      expect(prevalence).toBeGreaterThan(0);
+      expect(prevalence).toBeLessThan(1);
+      expect(Number.isFinite(logitValue)).toBe(true);
+      expect(variance).toBeGreaterThanOrEqual(0);
+      expect(prevalenceVariance).toBeGreaterThanOrEqual(0);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("projected ordinary model predicts finite value", () => {
+    const model = new SpaceTimeProjectedOrdinaryKriging({
+      xs: lats,
+      ys: lons,
+      times,
+      values,
+      variogram: {
+        ...variogram,
+        spatial: { ...variogram.spatial, range: 2.0 },
+      },
+      majorAngleDeg: 0,
+      rangeRatio: 1.0,
+    });
+    try {
+      const { value } = model.predict(0.5, 0.5, 0.5);
+      expect(Number.isFinite(value)).toBe(true);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("computeEmpiricalSpaceTimeVariogram produces bin arrays of the expected size", () => {
+    const emp = computeEmpiricalSpaceTimeVariogram({
+      lats,
+      lons,
+      times,
+      values,
+      nSpatialBins: 3,
+      nTemporalBins: 2,
+    });
+    expect(emp.nSpatialBins).toBe(3);
+    expect(emp.nTemporalBins).toBe(2);
+    const expected = 3 * 2;
+    expect(emp.semivariances.length).toBe(expected);
+    expect(emp.spatialLags.length).toBe(expected);
+    expect(emp.temporalLags.length).toBe(expected);
+    expect(emp.nPairs.length).toBe(expected);
+  });
+
+  test("fitSpaceTimeVariogram returns a separable fit with finite residuals", () => {
+    const denseLats: number[] = [];
+    const denseLons: number[] = [];
+    const denseTimes: number[] = [];
+    const denseValues: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      for (let t = 0; t < 5; t++) {
+        denseLats.push(i * 0.1);
+        denseLons.push(0.05 * t);
+        denseTimes.push(t);
+        denseValues.push((i + t) * 0.5);
+      }
+    }
+    const result = fitSpaceTimeVariogram({
+      lats: denseLats,
+      lons: denseLons,
+      times: denseTimes,
+      values: denseValues,
+      nSpatialBins: 5,
+      nTemporalBins: 5,
+      family: "separable",
+      spatialModel: "exponential",
+      temporalModel: "exponential",
+    });
+    expect(result.fit.family).toBe("separable");
+    expect(result.fit.spatial.variogramType).toBe("exponential");
+    expect(result.fit.temporal.variogramType).toBe("exponential");
+    expect(Number.isFinite(result.fit.residuals)).toBe(true);
+  });
+
+  test("mismatched arrays raise a KrigingError with a code", () => {
+    expect(
+      () =>
+        new SpaceTimeOrdinaryKriging({
+          lats: [0, 0],
+          lons: [0, 1, 2],
+          times: [0, 1],
+          values: [1, 2],
+          variogram,
+        })
+    ).toThrow(KrigingError);
+  });
+});
+
+describe("Space-time cross-validation", () => {
+  const lats = [0, 0, 0, 0, 1, 1, 1, 1];
+  const lons = [0, 0, 1, 1, 0, 0, 1, 1];
+  const times = [0, 1, 0, 1, 0, 1, 0, 1];
+  const values = [1, 2, 1.5, 2.5, 1.2, 2.1, 1.8, 2.7];
+  const successes = [2, 4, 3, 5, 3, 5, 4, 6];
+  const trials = [10, 10, 10, 10, 10, 10, 10, 10];
+  const variogram = {
+    family: "separable" as const,
+    spatial: {
+      variogramType: "exponential" as const,
+      nugget: 0.01,
+      sill: 1.0,
+      range: 300,
+    },
+    temporal: {
+      variogramType: "exponential" as const,
+      nugget: 0.01,
+      sill: 1.0,
+      range: 2,
+    },
+  };
+
+  test("leaveOneOutSpaceTime returns one residual per station", () => {
+    const out = leaveOneOutSpaceTime({ lats, lons, times, values, variogram });
+    expect(out.residuals.length).toBe(values.length);
+    for (const r of out.residuals) {
+      expect(Number.isFinite(r.predicted)).toBe(true);
+      expect(r.variance).toBeGreaterThanOrEqual(0);
+    }
+    expect(out.summary.n).toBe(values.length);
+  });
+
+  test("kFoldSpaceTime returns residuals for all stations", () => {
+    const out = kFoldSpaceTime({
+      lats,
+      lons,
+      times,
+      values,
+      variogram,
+      k: 4,
+    });
+    expect(out.residuals.length).toBe(values.length);
+  });
+
+  test("kFoldSpaceTime rejects k < 2", () => {
+    expect(() =>
+      kFoldSpaceTime({ lats, lons, times, values, variogram, k: 1 })
+    ).toThrow(KrigingError);
+  });
+
+  test("leaveOneOutSpaceTimeSimple honors known mean", () => {
+    const out = leaveOneOutSpaceTimeSimple({
+      lats,
+      lons,
+      times,
+      values,
+      variogram,
+      mean: 2,
+    });
+    expect(out.residuals.length).toBe(values.length);
+  });
+
+  test("kFoldSpaceTimeSimple returns residuals for all stations", () => {
+    const out = kFoldSpaceTimeSimple({
+      lats,
+      lons,
+      times,
+      values,
+      variogram,
+      mean: 2,
+      k: 4,
+    });
+    expect(out.residuals.length).toBe(values.length);
+  });
+
+  test("leaveOneOutSpaceTimeUniversal with constant trend matches ordinary CV", () => {
+    const ok = leaveOneOutSpaceTime({
+      lats,
+      lons,
+      times,
+      values,
+      variogram,
+    });
+    const uk = leaveOneOutSpaceTimeUniversal({
+      lats,
+      lons,
+      times,
+      values,
+      variogram,
+      trend: "constant",
+    });
+    expect(uk.residuals.length).toBe(ok.residuals.length);
+    for (let i = 0; i < ok.residuals.length; i++) {
+      expect(uk.residuals[i].predicted).toBeCloseTo(
+        ok.residuals[i].predicted,
+        6
+      );
+    }
+  });
+
+  test("kFoldSpaceTimeUniversal returns residuals for all stations", () => {
+    const out = kFoldSpaceTimeUniversal({
+      lats,
+      lons,
+      times,
+      values,
+      variogram,
+      trend: "linearInTime",
+      k: 4,
+    });
+    expect(out.residuals.length).toBe(values.length);
+  });
+
+  test("leaveOneOutSpaceTimeBinomial returns dual-scale residuals", () => {
+    const out = leaveOneOutSpaceTimeBinomial({
+      lats,
+      lons,
+      times,
+      successes,
+      trials,
+      variogram,
+    });
+    expect(out.residuals.length).toBe(successes.length);
+    for (const r of out.residuals) {
+      expect(Number.isFinite(r.predictedLogit)).toBe(true);
+      expect(r.predictedPrevalence).toBeGreaterThan(0);
+      expect(r.predictedPrevalence).toBeLessThan(1);
+    }
+  });
+
+  test("kFoldSpaceTimeBinomial returns residuals for all stations", () => {
+    const out = kFoldSpaceTimeBinomial({
+      lats,
+      lons,
+      times,
+      successes,
+      trials,
+      variogram,
+      k: 4,
+    });
+    expect(out.residuals.length).toBe(successes.length);
+  });
+
+  test("binomial CV rejects prior with only alpha", () => {
+    expect(() =>
+      leaveOneOutSpaceTimeBinomial({
+        lats,
+        lons,
+        times,
+        successes,
+        trials,
+        variogram,
+        priorAlpha: 1,
+      })
+    ).toThrow(KrigingError);
+  });
+});
+
+describe("Space-time conditional simulation", () => {
+  const conditioningLats = [0, 0, 0, 0, 1, 1, 1, 1];
+  const conditioningLons = [0, 0, 1, 1, 0, 0, 1, 1];
+  const conditioningTimes = [0, 1, 0, 1, 0, 1, 0, 1];
+  const conditioningValues = [1, 2, 1.5, 2.5, 1.2, 2.1, 1.8, 2.7];
+  const successes = [2, 4, 3, 5, 3, 5, 4, 6];
+  const trials = [10, 10, 10, 10, 10, 10, 10, 10];
+  const targetLats = [0.25, 0.75];
+  const targetLons = [0.25, 0.75];
+  const targetTimes = [0.5, 0.5];
+  const variogram = {
+    family: "separable" as const,
+    spatial: {
+      variogramType: "exponential" as const,
+      nugget: 0.01,
+      sill: 1.0,
+      range: 300,
+    },
+    temporal: {
+      variogramType: "exponential" as const,
+      nugget: 0.01,
+      sill: 1.0,
+      range: 2,
+    },
+  };
+
+  test("conditionalSimulateSpaceTime is deterministic under fixed seed", () => {
+    const a = conditionalSimulateSpaceTime({
+      conditioningLats,
+      conditioningLons,
+      conditioningTimes,
+      conditioningValues,
+      targetLats,
+      targetLons,
+      targetTimes,
+      variogram,
+      seed: 42n,
+    });
+    const b = conditionalSimulateSpaceTime({
+      conditioningLats,
+      conditioningLons,
+      conditioningTimes,
+      conditioningValues,
+      targetLats,
+      targetLons,
+      targetTimes,
+      variogram,
+      seed: 42n,
+    });
+    expect(Array.from(a)).toEqual(Array.from(b));
+  });
+
+  test("conditionalSimulateSpaceTime differs across seeds", () => {
+    const a = conditionalSimulateSpaceTime({
+      conditioningLats,
+      conditioningLons,
+      conditioningTimes,
+      conditioningValues,
+      targetLats,
+      targetLons,
+      targetTimes,
+      variogram,
+      seed: 1n,
+    });
+    const b = conditionalSimulateSpaceTime({
+      conditioningLats,
+      conditioningLons,
+      conditioningTimes,
+      conditioningValues,
+      targetLats,
+      targetLons,
+      targetTimes,
+      variogram,
+      seed: 2n,
+    });
+    expect(Array.from(a)).not.toEqual(Array.from(b));
+  });
+
+  test("conditionalSimulateSpaceTimeSimple honors known mean", () => {
+    const out = conditionalSimulateSpaceTimeSimple({
+      conditioningLats,
+      conditioningLons,
+      conditioningTimes,
+      conditioningValues,
+      targetLats,
+      targetLons,
+      targetTimes,
+      variogram,
+      mean: 2,
+      seed: 7n,
+    });
+    expect(out.length).toBe(targetLats.length);
+    for (const v of out) expect(Number.isFinite(v)).toBe(true);
+  });
+
+  test("conditionalSimulateSpaceTimeUniversal with constant trend ≈ ordinary", () => {
+    const ord = conditionalSimulateSpaceTime({
+      conditioningLats,
+      conditioningLons,
+      conditioningTimes,
+      conditioningValues,
+      targetLats,
+      targetLons,
+      targetTimes,
+      variogram,
+      seed: 11n,
+    });
+    const uk = conditionalSimulateSpaceTimeUniversal({
+      conditioningLats,
+      conditioningLons,
+      conditioningTimes,
+      conditioningValues,
+      targetLats,
+      targetLons,
+      targetTimes,
+      variogram,
+      trend: "constant",
+      seed: 11n,
+    });
+    expect(uk.length).toBe(ord.length);
+    for (let i = 0; i < ord.length; i++) {
+      expect(uk[i]).toBeCloseTo(ord[i], 5);
+    }
+  });
+
+  test("conditionalSimulateSpaceTimeBinomial returns logit and prevalence samples", () => {
+    const out = conditionalSimulateSpaceTimeBinomial({
+      conditioningLats,
+      conditioningLons,
+      conditioningTimes,
+      successes,
+      trials,
+      targetLats,
+      targetLons,
+      targetTimes,
+      variogram,
+      seed: 13n,
+    });
+    expect(out.logitSamples.length).toBe(targetLats.length);
+    expect(out.prevalenceSamples.length).toBe(targetLats.length);
+    for (let i = 0; i < targetLats.length; i++) {
+      expect(Number.isFinite(out.logitSamples[i])).toBe(true);
+      expect(out.prevalenceSamples[i]).toBeGreaterThan(0);
+      expect(out.prevalenceSamples[i]).toBeLessThan(1);
+    }
+  });
+
+  test("conditionalSimulateSpaceTimeBinomial is deterministic under fixed seed", () => {
+    const a = conditionalSimulateSpaceTimeBinomial({
+      conditioningLats,
+      conditioningLons,
+      conditioningTimes,
+      successes,
+      trials,
+      targetLats,
+      targetLons,
+      targetTimes,
+      variogram,
+      seed: 99n,
+    });
+    const b = conditionalSimulateSpaceTimeBinomial({
+      conditioningLats,
+      conditioningLons,
+      conditioningTimes,
+      successes,
+      trials,
+      targetLats,
+      targetLons,
+      targetTimes,
+      variogram,
+      seed: 99n,
+    });
+    expect(Array.from(a.logitSamples)).toEqual(Array.from(b.logitSamples));
+    expect(Array.from(a.prevalenceSamples)).toEqual(
+      Array.from(b.prevalenceSamples)
+    );
   });
 });

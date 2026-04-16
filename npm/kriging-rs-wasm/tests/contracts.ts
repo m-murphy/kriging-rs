@@ -1,14 +1,38 @@
 import {
   BinomialKriging,
   OrdinaryKriging,
+  SpaceTimeBinomialKriging,
+  SpaceTimeOrdinaryKriging,
+  SpaceTimeProjectedOrdinaryKriging,
+  SpaceTimeSimpleKriging,
+  SpaceTimeUniversalKriging,
+  computeEmpiricalSpaceTimeVariogram,
+  conditionalSimulateSpaceTime,
+  conditionalSimulateSpaceTimeBinomial,
+  conditionalSimulateSpaceTimeSimple,
+  conditionalSimulateSpaceTimeUniversal,
+  fitSpaceTimeVariogram,
   fitVariogram,
   init,
   interpolateOrdinaryToGrid,
   interpolateBinomialToGrid,
+  kFoldSpaceTime,
+  kFoldSpaceTimeBinomial,
+  kFoldSpaceTimeSimple,
+  kFoldSpaceTimeUniversal,
+  leaveOneOutSpaceTime,
+  leaveOneOutSpaceTimeBinomial,
+  leaveOneOutSpaceTimeSimple,
+  leaveOneOutSpaceTimeUniversal,
   VariogramType,
   type BinomialBatchArrayOutput,
+  type BinomialCvResult,
   type BinomialPrediction,
   type BinomialGridOutput,
+  type BinomialSimulationResult,
+  type CvResult,
+  type EmpiricalSpaceTimeVariogramResult,
+  type FitSpaceTimeVariogramResult,
   type OrdinaryBatchArrayOutput,
   type OrdinaryPrediction,
   type OrdinaryGridOutput,
@@ -159,6 +183,222 @@ const _oneShotOrdinary: OrdinaryGridOutput = interpolateOrdinaryToGrid({
   variogramType: "exponential",
   nBins: 12,
 });
+
+// ---------- Space-time contracts ----------
+
+const times = new Float64Array([0, 1, 2]);
+
+const stVariogram = {
+  family: "separable" as const,
+  spatial: {
+    variogramType: "exponential" as const,
+    nugget: 0.01,
+    sill: 1.0,
+    range: 100,
+  },
+  temporal: {
+    variogramType: "exponential" as const,
+    nugget: 0.01,
+    sill: 1.0,
+    range: 5,
+  },
+};
+
+const stOrdinary = new SpaceTimeOrdinaryKriging({
+  lats,
+  lons,
+  times,
+  values,
+  variogram: stVariogram,
+});
+const _stPred: OrdinaryPrediction = stOrdinary.predict(0.5, 0.5, 1.0);
+const _stBatchArrays: OrdinaryBatchArrayOutput = stOrdinary.predictBatchArrays(
+  lats,
+  lons,
+  times
+);
+
+const stSimple = new SpaceTimeSimpleKriging({
+  lats,
+  lons,
+  times,
+  values,
+  variogram: stVariogram,
+  mean: 4.0,
+});
+const _stSimplePred: OrdinaryPrediction = stSimple.predict(0.5, 0.5, 1.0);
+
+const stUniversal = new SpaceTimeUniversalKriging({
+  lats,
+  lons,
+  times,
+  values,
+  variogram: stVariogram,
+  trend: "linearInSpaceAndTime",
+});
+const _stUniversalPred: OrdinaryPrediction = stUniversal.predict(0.5, 0.5, 1.0);
+
+const stBinomial = new SpaceTimeBinomialKriging({
+  lats,
+  lons,
+  times,
+  successes,
+  trials,
+  variogram: stVariogram,
+});
+const _stBinomialPred: BinomialPrediction = stBinomial.predict(0.5, 0.5, 1.0);
+const _stBinomialBatchArrays: BinomialBatchArrayOutput =
+  stBinomial.predictBatchArrays(lats, lons, times);
+
+const stProjected = new SpaceTimeProjectedOrdinaryKriging({
+  xs: lats,
+  ys: lons,
+  times,
+  values,
+  variogram: stVariogram,
+  majorAngleDeg: 0,
+  rangeRatio: 1.0,
+});
+const _stProjectedPred: OrdinaryPrediction = stProjected.predict(0.5, 0.5, 1.0);
+
+const _stEmpirical: EmpiricalSpaceTimeVariogramResult =
+  computeEmpiricalSpaceTimeVariogram({
+    lats,
+    lons,
+    times,
+    values,
+    nSpatialBins: 4,
+    nTemporalBins: 3,
+  });
+
+const _stFit: FitSpaceTimeVariogramResult = fitSpaceTimeVariogram({
+  lats,
+  lons,
+  times,
+  values,
+  nSpatialBins: 4,
+  nTemporalBins: 3,
+  family: "separable",
+  spatialModel: "exponential",
+  temporalModel: "exponential",
+});
+
+// Space-time CV / SGS contracts
+const _stCv: CvResult = leaveOneOutSpaceTime({
+  lats,
+  lons,
+  times,
+  values,
+  variogram: stVariogram,
+});
+const _stCvKf: CvResult = kFoldSpaceTime({
+  lats,
+  lons,
+  times,
+  values,
+  variogram: stVariogram,
+  k: 3,
+});
+const _stCvSimple: CvResult = leaveOneOutSpaceTimeSimple({
+  lats,
+  lons,
+  times,
+  values,
+  variogram: stVariogram,
+  mean: 4,
+});
+const _stCvSimpleKf: CvResult = kFoldSpaceTimeSimple({
+  lats,
+  lons,
+  times,
+  values,
+  variogram: stVariogram,
+  mean: 4,
+  k: 3,
+});
+const _stCvUniv: CvResult = leaveOneOutSpaceTimeUniversal({
+  lats,
+  lons,
+  times,
+  values,
+  variogram: stVariogram,
+  trend: "linearInSpaceAndTime",
+});
+const _stCvUnivKf: CvResult = kFoldSpaceTimeUniversal({
+  lats,
+  lons,
+  times,
+  values,
+  variogram: stVariogram,
+  trend: "linearInSpaceAndTime",
+  k: 3,
+});
+const _stCvBin: BinomialCvResult = leaveOneOutSpaceTimeBinomial({
+  lats,
+  lons,
+  times,
+  successes,
+  trials,
+  variogram: stVariogram,
+});
+const _stCvBinKf: BinomialCvResult = kFoldSpaceTimeBinomial({
+  lats,
+  lons,
+  times,
+  successes,
+  trials,
+  variogram: stVariogram,
+  k: 3,
+});
+
+const _stSgs: Float64Array = conditionalSimulateSpaceTime({
+  conditioningLats: lats,
+  conditioningLons: lons,
+  conditioningTimes: times,
+  conditioningValues: values,
+  targetLats: new Float64Array([0.5]),
+  targetLons: new Float64Array([0.5]),
+  targetTimes: new Float64Array([0.5]),
+  variogram: stVariogram,
+  seed: 1n,
+});
+const _stSgsSimple: Float64Array = conditionalSimulateSpaceTimeSimple({
+  conditioningLats: lats,
+  conditioningLons: lons,
+  conditioningTimes: times,
+  conditioningValues: values,
+  targetLats: new Float64Array([0.5]),
+  targetLons: new Float64Array([0.5]),
+  targetTimes: new Float64Array([0.5]),
+  variogram: stVariogram,
+  mean: 4,
+  seed: 1n,
+});
+const _stSgsUniv: Float64Array = conditionalSimulateSpaceTimeUniversal({
+  conditioningLats: lats,
+  conditioningLons: lons,
+  conditioningTimes: times,
+  conditioningValues: values,
+  targetLats: new Float64Array([0.5]),
+  targetLons: new Float64Array([0.5]),
+  targetTimes: new Float64Array([0.5]),
+  variogram: stVariogram,
+  trend: "constant",
+  seed: 1n,
+});
+const _stSgsBin: BinomialSimulationResult =
+  conditionalSimulateSpaceTimeBinomial({
+    conditioningLats: lats,
+    conditioningLons: lons,
+    conditioningTimes: times,
+    successes,
+    trials,
+    targetLats: new Float64Array([0.5]),
+    targetLons: new Float64Array([0.5]),
+    targetTimes: new Float64Array([0.5]),
+    variogram: stVariogram,
+    seed: 1n,
+  });
 
 const _oneShotBinomial: BinomialGridOutput = interpolateBinomialToGrid({
   lats: Array.from(lats),
