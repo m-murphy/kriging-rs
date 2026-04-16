@@ -562,9 +562,14 @@ If `predictBatchGpu` is called without a GPU build, it throws.
 ### Space-time kriging
 
 All four kriging families are mirrored in the `SpaceTime*` classes, which add a `time`
-axis to the usual `(lat, lon)` inputs. Use `separable` when the space and time processes
-can be modeled independently, and `product_sum` when you need an additive interaction
-term on top of the marginals (`k1·C_s·C_t + k2·C_s + k3·C_t`).
+axis to the usual `(lat, lon)` inputs. Use `"separable"` when the space and time processes
+can be modeled independently, and `"productSum"` when you need an additive interaction
+term on top of the marginals (`k1·C_s·C_t + k2·C_s + k3·C_t`). The two families form a
+TypeScript discriminated union, so `k1`, `k2`, and `k3` are only accepted (and required)
+when `family: "productSum"`.
+
+Use `fromFitted(...)` to pipe the result of `fitSpaceTimeVariogram` straight into a model
+without re-stating the variogram fields:
 
 ```ts
 import init, {
@@ -585,23 +590,59 @@ const fit = fitSpaceTimeVariogram({
   temporalModel: "exponential",
 });
 
+using model = SpaceTimeOrdinaryKriging.fromFitted({
+  lats,
+  lons,
+  times,
+  values,
+  fittedVariogram: fit.fit,
+});
+
+const { value, variance } = model.predict(37.77, -122.42, 1.5);
+```
+
+The `using` declaration (ES2023) calls `model[Symbol.dispose]()` — equivalent to
+`model.free()` — when the block exits, so you don't have to remember to release
+WASM-held memory. This works on every 2-D and space-time kriging class.
+
+If you have the variogram parameters by hand, the regular constructor also accepts
+`fit.fit` directly thanks to the discriminated union:
+
+```ts
 const model = new SpaceTimeOrdinaryKriging({
   lats,
   lons,
   times,
   values,
-  variogram: {
-    family: fit.fit.family,
-    spatial: fit.fit.spatial,
-    temporal: fit.fit.temporal,
-    k1: fit.fit.k1,
-    k2: fit.fit.k2,
-    k3: fit.fit.k3,
-  },
+  variogram: fit.fit,
 });
+```
 
-const { value, variance } = model.predict(37.77, -122.42, 1.5);
-model.free();
+To render a 2-D heatmap at a specific time slice, use `predictGridAtTime`:
+
+```ts
+const grid = model.predictGridAtTime({
+  west: -122.5,
+  south: 37.7,
+  east: -122.35,
+  north: 37.82,
+  xCells: 64,
+  yCells: 48,
+  time: 1.5,
+});
+// grid.values[j][i] and grid.variances[j][i], shape [yCells][xCells]
+```
+
+Dates as the time axis: convert between `Date[]` and the scalar time axis via
+`timesFromDates` / `datesFromTimes` with an optional `TimeUnit` (`"ms" | "s" |
+"minutes" | "hours" | "days"`):
+
+```ts
+import { timesFromDates, datesFromTimes } from "kriging-rs-wasm";
+
+const times = timesFromDates(dateObjects, "days");
+// ...build and use the model...
+const dates = datesFromTimes(times, "days");
 ```
 
 Universal space-time kriging adds a polynomial trend via `trend`: one of `"constant"`,
@@ -669,9 +710,33 @@ const binSamples = conditionalSimulateSpaceTimeBinomial({
   targetLons,
   targetTimes,
   variogram: { family: "separable", spatial, temporal },
+  prior: { alpha: 1, beta: 1 }, // optional; alpha and beta are set together
   seed: 42n,
 });
 // binSamples.logitSamples, binSamples.prevalenceSamples
+```
+
+To draw multiple independent realizations in one call, use `conditionalSimulateMany`
+(2-D) or `conditionalSimulateManySpaceTime`. Each draw uses `baseSeed + k`, so the
+result is deterministic and trivially reproducible:
+
+```ts
+import { conditionalSimulateManySpaceTime } from "kriging-rs-wasm";
+
+const realizations = conditionalSimulateManySpaceTime({
+  conditioningLats: lats,
+  conditioningLons: lons,
+  conditioningTimes: times,
+  conditioningValues: values,
+  targetLats,
+  targetLons,
+  targetTimes,
+  variogram: { family: "separable", spatial, temporal },
+  nRealizations: 100,
+  baseSeed: 42,
+});
+// Flat Float64Array of length nRealizations * targetLats.length, row-major
+// (row k holds the k-th realization in input order).
 ```
 
 ## Error handling

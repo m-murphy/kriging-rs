@@ -174,26 +174,32 @@ export default function QuickDemos({ onError }) {
         temporalModel: "exponential",
       });
 
-      const model = new SpaceTimeOrdinaryKriging({
+      const model = SpaceTimeOrdinaryKriging.fromFitted({
         lats,
         lons,
         times,
         values,
-        variogram: {
-          family: fit.fit.family,
-          spatial: fit.fit.spatial,
-          temporal: fit.fit.temporal,
-          k1: fit.fit.k1,
-          k2: fit.fit.k2,
-          k3: fit.fit.k3,
-        },
+        fittedVariogram: fit.fit,
       });
-      const pred = model.predict(37.72, -122.43, 1.5);
-      model.free();
-      write("Space-time ordinary kriging prediction", {
-        fit: fit.fit,
-        prediction: pred,
-      });
+      try {
+        const pred = model.predict(37.72, -122.43, 1.5);
+        const slice = model.predictGridAtTime({
+          west: -122.45,
+          south: 37.7,
+          east: -122.41,
+          north: 37.74,
+          xCells: 3,
+          yCells: 3,
+          time: 1.5,
+        });
+        write("Space-time ordinary kriging prediction", {
+          fit: fit.fit,
+          prediction: pred,
+          gridAtTime: slice,
+        });
+      } finally {
+        model.free();
+      }
     } catch (err) {
       onError?.(err?.message ?? String(err));
       write("Space-time kriging failed", { message: err?.message ?? String(err) });
