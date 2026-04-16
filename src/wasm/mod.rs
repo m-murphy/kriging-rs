@@ -37,6 +37,8 @@ use crate::variogram::nested::NestedVariogram;
 use crate::{Real, compute_empirical_variogram};
 use std::num::NonZeroUsize;
 
+pub mod spacetime;
+
 /// WASM-exposed variogram type enum; maps to crate's VariogramType.
 #[wasm_bindgen]
 pub enum WasmVariogramType {
@@ -65,7 +67,7 @@ impl From<WasmVariogramType> for VariogramType {
     }
 }
 
-fn parse_variogram(
+pub(super) fn parse_variogram(
     variogram_type: &str,
     nugget: f64,
     sill: f64,
@@ -139,7 +141,7 @@ fn build_grid_coords(
     Ok(coords)
 }
 
-fn to_coords(lats: &[f64], lons: &[f64]) -> Result<Vec<GeoCoord>, JsValue> {
+pub(super) fn to_coords(lats: &[f64], lons: &[f64]) -> Result<Vec<GeoCoord>, JsValue> {
     if lats.len() != lons.len() {
         return Err(coded_err(
             "lats and lons must have same length",
@@ -155,17 +157,17 @@ fn to_coords(lats: &[f64], lons: &[f64]) -> Result<Vec<GeoCoord>, JsValue> {
 
 /// Map any display-able error to a coded JS error object. Defaults `code` to `invalid_input`.
 /// Prefer [`kriging_err_to_js`] for `KrigingError` so the right code is attached.
-fn err_to_js(err: impl std::fmt::Display) -> JsValue {
+pub(super) fn err_to_js(err: impl std::fmt::Display) -> JsValue {
     coded_err(&err.to_string(), "invalid_input")
 }
 
 /// Map a [`KrigingError`] to a JS `Error`-like object with `message` and a stable `code` field.
-fn kriging_err_to_js(err: crate::error::KrigingError) -> JsValue {
+pub(super) fn kriging_err_to_js(err: crate::error::KrigingError) -> JsValue {
     let code = error_code_for(&err);
     coded_err(&err.to_string(), code)
 }
 
-fn coded_err(message: &str, code: &str) -> JsValue {
+pub(super) fn coded_err(message: &str, code: &str) -> JsValue {
     let obj = Object::new();
     let _ = Reflect::set(
         &obj,
@@ -219,9 +221,9 @@ fn build_observations(
 }
 
 #[derive(Debug, Serialize)]
-struct JsPrediction {
-    value: f64,
-    variance: f64,
+pub(super) struct JsPrediction {
+    pub value: f64,
+    pub variance: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -238,11 +240,11 @@ struct JsFittedVariogram {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct JsBinomialPrediction {
-    prevalence: f64,
-    logit_value: f64,
-    variance: f64,
-    prevalence_variance: f64,
+pub(super) struct JsBinomialPrediction {
+    pub prevalence: f64,
+    pub logit_value: f64,
+    pub variance: f64,
+    pub prevalence_variance: f64,
 }
 
 fn variogram_type_name(variogram_type: VariogramType) -> &'static str {
@@ -258,7 +260,7 @@ fn variogram_type_name(variogram_type: VariogramType) -> &'static str {
     }
 }
 
-fn map_predictions(out: Vec<crate::kriging::ordinary::Prediction>) -> Vec<JsPrediction> {
+pub(super) fn map_predictions(out: Vec<crate::kriging::ordinary::Prediction>) -> Vec<JsPrediction> {
     out.into_iter()
         .map(|p| JsPrediction {
             value: p.value as f64,
@@ -267,7 +269,9 @@ fn map_predictions(out: Vec<crate::kriging::ordinary::Prediction>) -> Vec<JsPred
         .collect::<Vec<_>>()
 }
 
-fn split_predictions(out: Vec<crate::kriging::ordinary::Prediction>) -> (Vec<f64>, Vec<f64>) {
+pub(super) fn split_predictions(
+    out: Vec<crate::kriging::ordinary::Prediction>,
+) -> (Vec<f64>, Vec<f64>) {
     let mut values = Vec::with_capacity(out.len());
     let mut variances = Vec::with_capacity(out.len());
     for pred in out {
@@ -277,7 +281,7 @@ fn split_predictions(out: Vec<crate::kriging::ordinary::Prediction>) -> (Vec<f64
     (values, variances)
 }
 
-fn map_binomial_predictions(
+pub(super) fn map_binomial_predictions(
     out: Vec<crate::kriging::binomial::BinomialPrediction>,
 ) -> Vec<JsBinomialPrediction> {
     out.into_iter()
@@ -290,7 +294,7 @@ fn map_binomial_predictions(
         .collect::<Vec<_>>()
 }
 
-fn split_binomial_predictions(
+pub(super) fn split_binomial_predictions(
     out: Vec<crate::kriging::binomial::BinomialPrediction>,
 ) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
     let mut prevalences = Vec::with_capacity(out.len());
@@ -306,7 +310,7 @@ fn split_binomial_predictions(
     (prevalences, logit_values, variances, prevalence_variances)
 }
 
-fn set_object_field(obj: &Object, key: &str, value: &JsValue) -> Result<(), JsValue> {
+pub(super) fn set_object_field(obj: &Object, key: &str, value: &JsValue) -> Result<(), JsValue> {
     match Reflect::set(obj, &JsValue::from_str(key), value) {
         Ok(true) => Ok(()),
         Ok(false) => Err(coded_err(
@@ -1273,7 +1277,7 @@ struct JsCvSummary {
     msdr: f64,
 }
 
-fn cv_result_to_js(residuals: Vec<crate::cv::CvResidual>) -> Result<JsValue, JsValue> {
+pub(super) fn cv_result_to_js(residuals: Vec<crate::cv::CvResidual>) -> Result<JsValue, JsValue> {
     let n = residuals.len();
     let summary = crate::cv::CvSummary::from_residuals(&residuals);
     let mut indices: Vec<u32> = Vec::with_capacity(n);
@@ -1565,7 +1569,9 @@ pub fn wasm_k_fold_projected(
 
 // --- Binomial kriging CV (reports both logit and prevalence scales) ---
 
-fn binomial_cv_result_to_js(residuals: Vec<BinomialCvResidual>) -> Result<JsValue, JsValue> {
+pub(super) fn binomial_cv_result_to_js(
+    residuals: Vec<BinomialCvResidual>,
+) -> Result<JsValue, JsValue> {
     let n = residuals.len();
     let summary = BinomialCvSummary::from_residuals(&residuals);
 
@@ -1659,7 +1665,7 @@ fn binomial_cv_result_to_js(residuals: Vec<BinomialCvResidual>) -> Result<JsValu
     Ok(result.into())
 }
 
-fn parse_binomial_prior(
+pub(super) fn parse_binomial_prior(
     prior_alpha: Option<f64>,
     prior_beta: Option<f64>,
 ) -> Result<BinomialPrior, JsValue> {
@@ -1793,7 +1799,10 @@ pub fn wasm_conditional_simulate(
     Ok(Float64Array::from(samples_f64.as_slice()).into())
 }
 
-fn parse_simulation_options(seed: u64, target_order: Option<Vec<u32>>) -> SimulationOptions {
+pub(super) fn parse_simulation_options(
+    seed: u64,
+    target_order: Option<Vec<u32>>,
+) -> SimulationOptions {
     SimulationOptions {
         seed,
         target_order: target_order.map(|v| v.into_iter().map(|x| x as usize).collect()),
@@ -1948,7 +1957,9 @@ pub fn wasm_conditional_simulate_projected(
     Ok(Float64Array::from(samples_f64.as_slice()).into())
 }
 
-fn binomial_simulation_to_js(result: BinomialSimulationResult) -> Result<JsValue, JsValue> {
+pub(super) fn binomial_simulation_to_js(
+    result: BinomialSimulationResult,
+) -> Result<JsValue, JsValue> {
     let logit: Vec<f64> = result.logit_samples.into_iter().map(|v| v as f64).collect();
     let prev: Vec<f64> = result
         .prevalence_samples

@@ -25,6 +25,9 @@
 //! - [`conditional_simulate_projected`] — planar coordinates with 2D anisotropy.
 //! - [`conditional_simulate_binomial`] — count data on the logit scale. Returns samples on
 //!   **both** the logit and prevalence scales.
+//! - [`conditional_simulate_spacetime`] / `_simple` / `_universal` / `_binomial` — space-time
+//!   analogues generic over [`SpatialMetric`](crate::spacetime::metric::SpatialMetric)
+//!   (geographic or projected). The binomial variant also returns dual-scale samples.
 //!
 //! All variants accept a shared [`SimulationOptions`] (seed + optional target visit order).
 //!
@@ -43,6 +46,18 @@ use crate::kriging::ordinary::OrdinaryKrigingModel;
 use crate::kriging::simple::SimpleKrigingModel;
 use crate::kriging::universal::{UniversalKrigingModel, UniversalTrend};
 use crate::projected::{Anisotropy2D, ProjectedCoord, ProjectedDataset, ProjectedKrigingModel};
+use crate::spacetime::coord::SpaceTimeCoord;
+use crate::spacetime::dataset::SpaceTimeDataset;
+use crate::spacetime::kriging::binomial::{
+    SpaceTimeBinomialKrigingModel, SpaceTimeBinomialObservation,
+};
+use crate::spacetime::kriging::ordinary::SpaceTimeOrdinaryKrigingModel;
+use crate::spacetime::kriging::simple::SpaceTimeSimpleKrigingModel;
+use crate::spacetime::kriging::universal::{
+    SpaceTimeUniversalKrigingModel, SpaceTimeUniversalTrend,
+};
+use crate::spacetime::metric::{SpatialBasis, SpatialMetric};
+use crate::spacetime::variogram::SpaceTimeVariogram;
 use crate::utils::logistic;
 use crate::variogram::models::VariogramModel;
 
@@ -450,6 +465,194 @@ pub fn conditional_simulate_binomial(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Space–time SGS
+// ---------------------------------------------------------------------------
+
+/// Sequential Gaussian simulation using [`SpaceTimeOrdinaryKrigingModel`]. Generic over
+/// [`SpatialMetric`] so the same routine serves geographic and projected data.
+///
+/// Returns one sampled value per target in the original input order (regardless of the
+/// visit order specified by [`SimulationOptions::target_order`]).
+pub fn conditional_simulate_spacetime<M: SpatialMetric>(
+    metric: M,
+    conditioning_coords: &[SpaceTimeCoord<M::Coord>],
+    conditioning_values: &[Real],
+    targets: &[SpaceTimeCoord<M::Coord>],
+    variogram: SpaceTimeVariogram,
+    options: SimulationOptions,
+) -> Result<Vec<Real>, KrigingError> {
+    validate_continuous_inputs(conditioning_coords, conditioning_values)?;
+    let n_targets = targets.len();
+    let order = resolve_target_order(n_targets, options.target_order)?;
+
+    let mut rng = Rng::new(options.seed);
+    let mut all_coords = conditioning_coords.to_vec();
+    let mut all_values = conditioning_values.to_vec();
+    let mut out = vec![0.0 as Real; n_targets];
+
+    for &target_idx in &order {
+        let dataset = SpaceTimeDataset::new(all_coords.clone(), all_values.clone())?;
+        let model = SpaceTimeOrdinaryKrigingModel::new(metric, dataset, variogram)?;
+        let pred = model.predict(targets[target_idx])?;
+        let sigma = pred.variance.max(0.0).sqrt();
+        let sampled = pred.value + sigma * rng.next_standard_normal();
+        out[target_idx] = sampled;
+        all_coords.push(targets[target_idx]);
+        all_values.push(sampled);
+    }
+
+    Ok(out)
+}
+
+/// SGS using [`SpaceTimeSimpleKrigingModel`] with a known constant `mean`.
+pub fn conditional_simulate_spacetime_simple<M: SpatialMetric>(
+    metric: M,
+    conditioning_coords: &[SpaceTimeCoord<M::Coord>],
+    conditioning_values: &[Real],
+    targets: &[SpaceTimeCoord<M::Coord>],
+    variogram: SpaceTimeVariogram,
+    mean: Real,
+    options: SimulationOptions,
+) -> Result<Vec<Real>, KrigingError> {
+    validate_continuous_inputs(conditioning_coords, conditioning_values)?;
+    let n_targets = targets.len();
+    let order = resolve_target_order(n_targets, options.target_order)?;
+
+    let mut rng = Rng::new(options.seed);
+    let mut all_coords = conditioning_coords.to_vec();
+    let mut all_values = conditioning_values.to_vec();
+    let mut out = vec![0.0 as Real; n_targets];
+
+    for &target_idx in &order {
+        let dataset = SpaceTimeDataset::new(all_coords.clone(), all_values.clone())?;
+        let model = SpaceTimeSimpleKrigingModel::new(metric, dataset, variogram, mean)?;
+        let pred = model.predict(targets[target_idx])?;
+        let sigma = pred.variance.max(0.0).sqrt();
+        let sampled = pred.value + sigma * rng.next_standard_normal();
+        out[target_idx] = sampled;
+        all_coords.push(targets[target_idx]);
+        all_values.push(sampled);
+    }
+
+    Ok(out)
+}
+
+/// SGS using [`SpaceTimeUniversalKrigingModel`] with the given `trend`. Drift coefficients
+/// are re-estimated at every step from the growing conditioning set. Requires at least
+/// `trend.n_basis() + 1` conditioning stations.
+pub fn conditional_simulate_spacetime_universal<M: SpatialBasis>(
+    metric: M,
+    conditioning_coords: &[SpaceTimeCoord<M::Coord>],
+    conditioning_values: &[Real],
+    targets: &[SpaceTimeCoord<M::Coord>],
+    variogram: SpaceTimeVariogram,
+    trend: SpaceTimeUniversalTrend,
+    options: SimulationOptions,
+) -> Result<Vec<Real>, KrigingError> {
+    if conditioning_coords.len() != conditioning_values.len() {
+        return Err(KrigingError::DimensionMismatch(format!(
+            "conditioning_coords ({}) and conditioning_values ({}) must have equal length",
+            conditioning_coords.len(),
+            conditioning_values.len()
+        )));
+    }
+    let min_required = trend.n_basis() + 1;
+    if conditioning_coords.len() < min_required {
+        return Err(KrigingError::InsufficientData(min_required));
+    }
+    let n_targets = targets.len();
+    let order = resolve_target_order(n_targets, options.target_order)?;
+
+    let mut rng = Rng::new(options.seed);
+    let mut all_coords = conditioning_coords.to_vec();
+    let mut all_values = conditioning_values.to_vec();
+    let mut out = vec![0.0 as Real; n_targets];
+
+    for &target_idx in &order {
+        let dataset = SpaceTimeDataset::new(all_coords.clone(), all_values.clone())?;
+        let model = SpaceTimeUniversalKrigingModel::new(metric, dataset, variogram, trend)?;
+        let pred = model.predict(targets[target_idx])?;
+        let sigma = pred.variance.max(0.0).sqrt();
+        let sampled = pred.value + sigma * rng.next_standard_normal();
+        out[target_idx] = sampled;
+        all_coords.push(targets[target_idx]);
+        all_values.push(sampled);
+    }
+
+    Ok(out)
+}
+
+/// SGS using [`SpaceTimeBinomialKrigingModel`] for count data. Same dual-scale contract as
+/// [`conditional_simulate_binomial`]: simulation happens on the logit scale; the result
+/// carries both raw logit samples and back-transformed prevalence samples. Stations with
+/// `trials == 0` are dropped from the initial pool.
+#[allow(clippy::too_many_arguments)]
+pub fn conditional_simulate_spacetime_binomial<M: SpatialMetric>(
+    metric: M,
+    conditioning_coords: &[SpaceTimeCoord<M::Coord>],
+    successes: &[u32],
+    trials: &[u32],
+    targets: &[SpaceTimeCoord<M::Coord>],
+    variogram: SpaceTimeVariogram,
+    prior: BinomialPrior,
+    options: SimulationOptions,
+) -> Result<BinomialSimulationResult, KrigingError> {
+    if conditioning_coords.len() != successes.len() || successes.len() != trials.len() {
+        return Err(KrigingError::DimensionMismatch(format!(
+            "conditioning arrays must have equal length (coords={}, successes={}, trials={})",
+            conditioning_coords.len(),
+            successes.len(),
+            trials.len()
+        )));
+    }
+
+    let mut pool_coords: Vec<SpaceTimeCoord<M::Coord>> =
+        Vec::with_capacity(conditioning_coords.len());
+    let mut pool_logits: Vec<Real> = Vec::with_capacity(conditioning_coords.len());
+    for i in 0..conditioning_coords.len() {
+        if trials[i] == 0 {
+            continue;
+        }
+        let obs =
+            SpaceTimeBinomialObservation::new(conditioning_coords[i], successes[i], trials[i])?;
+        pool_coords.push(obs.coord());
+        pool_logits.push(obs.smoothed_logit_with_prior(prior));
+    }
+    if pool_coords.len() < 2 {
+        return Err(KrigingError::InsufficientData(2));
+    }
+
+    let n_targets = targets.len();
+    let order = resolve_target_order(n_targets, options.target_order)?;
+
+    let mut rng = Rng::new(options.seed);
+    let mut logit_out = vec![0.0 as Real; n_targets];
+    let mut prev_out = vec![0.0 as Real; n_targets];
+
+    for &target_idx in &order {
+        let model = SpaceTimeBinomialKrigingModel::from_precomputed_logits(
+            metric,
+            pool_coords.clone(),
+            pool_logits.clone(),
+            variogram,
+        )?;
+        let pred = model.predict(targets[target_idx])?;
+        let sigma = pred.variance.max(0.0).sqrt();
+        let logit_sample = pred.logit_value + sigma * rng.next_standard_normal();
+        let prevalence_sample = logistic(logit_sample);
+        logit_out[target_idx] = logit_sample;
+        prev_out[target_idx] = prevalence_sample;
+        pool_coords.push(targets[target_idx]);
+        pool_logits.push(logit_sample);
+    }
+
+    Ok(BinomialSimulationResult {
+        logit_samples: logit_out,
+        prevalence_samples: prev_out,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,5 +1040,289 @@ mod tests {
             (a.logit_samples[0] - b.logit_samples[0]).abs() > 1e-9,
             "different priors should produce different logit samples"
         );
+    }
+
+    // ----- Space–time SGS ---------------------------------------------------
+
+    use crate::spacetime::GeoMetric;
+
+    fn st_setup() -> (Vec<SpaceTimeCoord<GeoCoord>>, Vec<Real>, SpaceTimeVariogram) {
+        let coords = vec![
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.0, 0.0).unwrap(), 0.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.0, 1.0).unwrap(), 0.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(1.0, 0.0).unwrap(), 0.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(1.0, 1.0).unwrap(), 0.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.0, 0.0).unwrap(), 1.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(1.0, 1.0).unwrap(), 1.0).unwrap(),
+        ];
+        let values = vec![1.0, 2.0, 3.0, 4.0, 1.5, 4.5];
+        let spatial = VariogramModel::new(0.1, 5.0, 200.0, VariogramType::Exponential).unwrap();
+        let temporal = VariogramModel::new(0.05, 1.0, 2.0, VariogramType::Exponential).unwrap();
+        let vg = SpaceTimeVariogram::new_separable(spatial, temporal).unwrap();
+        (coords, values, vg)
+    }
+
+    #[test]
+    fn st_same_seed_gives_identical_realization() {
+        let (c, v, vg) = st_setup();
+        let targets = vec![
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.5, 0.5).unwrap(), 0.5).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.25, 0.75).unwrap(), 0.5).unwrap(),
+        ];
+        let a = conditional_simulate_spacetime(
+            GeoMetric,
+            &c,
+            &v,
+            &targets,
+            vg,
+            SimulationOptions::new(42),
+        )
+        .unwrap();
+        let b = conditional_simulate_spacetime(
+            GeoMetric,
+            &c,
+            &v,
+            &targets,
+            vg,
+            SimulationOptions::new(42),
+        )
+        .unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn st_different_seeds_give_different_realizations() {
+        let (c, v, vg) = st_setup();
+        let targets = vec![
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.5, 0.5).unwrap(), 0.5).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.25, 0.75).unwrap(), 0.5).unwrap(),
+        ];
+        let a = conditional_simulate_spacetime(
+            GeoMetric,
+            &c,
+            &v,
+            &targets,
+            vg,
+            SimulationOptions::new(1),
+        )
+        .unwrap();
+        let b = conditional_simulate_spacetime(
+            GeoMetric,
+            &c,
+            &v,
+            &targets,
+            vg,
+            SimulationOptions::new(2),
+        )
+        .unwrap();
+        assert!(a != b);
+    }
+
+    #[test]
+    fn st_realization_honors_conditioning_when_target_coincides() {
+        let (c, v, vg) = st_setup();
+        let targets = vec![c[2]];
+        let out = conditional_simulate_spacetime(
+            GeoMetric,
+            &c,
+            &v,
+            &targets,
+            vg,
+            SimulationOptions::new(7),
+        )
+        .unwrap();
+        // Kriging at a known conditioning location returns the observed value with ~zero
+        // variance, so the sample should equal the observation up to solver tolerance.
+        assert!(
+            (out[0] - v[2]).abs() < 1e-3,
+            "expected ~{}, got {}",
+            v[2],
+            out[0]
+        );
+    }
+
+    #[test]
+    fn st_rejects_mismatched_arrays() {
+        let (c, _, vg) = st_setup();
+        let v_bad = vec![1.0, 2.0];
+        let targets =
+            vec![SpaceTimeCoord::try_new(GeoCoord::try_new(0.5, 0.5).unwrap(), 0.5).unwrap()];
+        assert!(
+            conditional_simulate_spacetime(
+                GeoMetric,
+                &c,
+                &v_bad,
+                &targets,
+                vg,
+                SimulationOptions::new(1),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn st_simple_sim_runs_with_known_mean() {
+        let (c, v, vg) = st_setup();
+        let targets = vec![
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.5, 0.5).unwrap(), 0.5).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.25, 0.75).unwrap(), 0.5).unwrap(),
+        ];
+        let mean = v.iter().copied().sum::<Real>() / v.len() as Real;
+        let out = conditional_simulate_spacetime_simple(
+            GeoMetric,
+            &c,
+            &v,
+            &targets,
+            vg,
+            mean,
+            SimulationOptions::new(3),
+        )
+        .unwrap();
+        assert_eq!(out.len(), targets.len());
+        assert!(out.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn st_universal_sim_runs_with_linear_in_time_trend() {
+        let (c, v, vg) = st_setup();
+        let targets = vec![
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.5, 0.5).unwrap(), 0.5).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.25, 0.75).unwrap(), 0.5).unwrap(),
+        ];
+        let out = conditional_simulate_spacetime_universal(
+            GeoMetric,
+            &c,
+            &v,
+            &targets,
+            vg,
+            SpaceTimeUniversalTrend::LinearInTime,
+            SimulationOptions::new(5),
+        )
+        .unwrap();
+        assert_eq!(out.len(), targets.len());
+        assert!(out.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn st_universal_sim_rejects_insufficient_points_for_trend() {
+        let c = vec![
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.0, 0.0).unwrap(), 0.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.0, 1.0).unwrap(), 0.0).unwrap(),
+        ];
+        let v = vec![1.0, 2.0];
+        let spatial = VariogramModel::new(0.1, 5.0, 200.0, VariogramType::Exponential).unwrap();
+        let temporal = VariogramModel::new(0.05, 1.0, 2.0, VariogramType::Exponential).unwrap();
+        let vg = SpaceTimeVariogram::new_separable(spatial, temporal).unwrap();
+        let targets =
+            vec![SpaceTimeCoord::try_new(GeoCoord::try_new(0.5, 0.5).unwrap(), 0.0).unwrap()];
+        // LinearInSpaceAndTime requires 4 basis terms → at least 5 points.
+        let r = conditional_simulate_spacetime_universal(
+            GeoMetric,
+            &c,
+            &v,
+            &targets,
+            vg,
+            SpaceTimeUniversalTrend::LinearInSpaceAndTime,
+            SimulationOptions::new(1),
+        );
+        assert!(matches!(r, Err(KrigingError::InsufficientData(_))));
+    }
+
+    #[test]
+    fn st_binomial_sim_reports_both_scales_and_prevalence_in_range() {
+        let c = vec![
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.0, 0.0).unwrap(), 0.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.0, 1.0).unwrap(), 0.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(1.0, 0.0).unwrap(), 0.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(1.0, 1.0).unwrap(), 0.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.0, 0.0).unwrap(), 1.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(1.0, 1.0).unwrap(), 1.0).unwrap(),
+        ];
+        let successes = vec![3u32, 6, 8, 15, 4, 16];
+        let trials = vec![20u32, 20, 20, 20, 20, 20];
+        let targets = vec![
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.5, 0.5).unwrap(), 0.5).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.25, 0.75).unwrap(), 0.5).unwrap(),
+        ];
+        let spatial = VariogramModel::new(0.1, 5.0, 200.0, VariogramType::Exponential).unwrap();
+        let temporal = VariogramModel::new(0.05, 1.0, 2.0, VariogramType::Exponential).unwrap();
+        let vg = SpaceTimeVariogram::new_separable(spatial, temporal).unwrap();
+        let out = conditional_simulate_spacetime_binomial(
+            GeoMetric,
+            &c,
+            &successes,
+            &trials,
+            &targets,
+            vg,
+            BinomialPrior::default(),
+            SimulationOptions::new(11),
+        )
+        .unwrap();
+        assert_eq!(out.logit_samples.len(), targets.len());
+        assert_eq!(out.prevalence_samples.len(), targets.len());
+        for (l, p) in out.logit_samples.iter().zip(out.prevalence_samples.iter()) {
+            assert!(l.is_finite());
+            assert!(p.is_finite());
+            assert!(*p > 0.0 && *p < 1.0);
+            // p must equal logistic(l) by construction.
+            assert!((logistic(*l) - *p).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn st_binomial_sim_drops_zero_trials_from_pool() {
+        let c = vec![
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.0, 0.0).unwrap(), 0.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.0, 1.0).unwrap(), 0.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(1.0, 0.0).unwrap(), 0.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(1.0, 1.0).unwrap(), 0.0).unwrap(),
+        ];
+        // Only station 0 has trials == 0; the remaining 3 form the pool.
+        let successes = vec![0u32, 6, 8, 15];
+        let trials = vec![0u32, 20, 20, 20];
+        let targets =
+            vec![SpaceTimeCoord::try_new(GeoCoord::try_new(0.5, 0.5).unwrap(), 0.5).unwrap()];
+        let spatial = VariogramModel::new(0.1, 5.0, 200.0, VariogramType::Exponential).unwrap();
+        let temporal = VariogramModel::new(0.05, 1.0, 2.0, VariogramType::Exponential).unwrap();
+        let vg = SpaceTimeVariogram::new_separable(spatial, temporal).unwrap();
+        let out = conditional_simulate_spacetime_binomial(
+            GeoMetric,
+            &c,
+            &successes,
+            &trials,
+            &targets,
+            vg,
+            BinomialPrior::default(),
+            SimulationOptions::new(2),
+        )
+        .unwrap();
+        assert_eq!(out.logit_samples.len(), 1);
+        assert!(out.logit_samples[0].is_finite());
+    }
+
+    #[test]
+    fn st_binomial_sim_rejects_too_few_observable_stations() {
+        let c = vec![
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.0, 0.0).unwrap(), 0.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.0, 1.0).unwrap(), 0.0).unwrap(),
+        ];
+        let successes = vec![0u32, 6];
+        let trials = vec![0u32, 20];
+        let targets =
+            vec![SpaceTimeCoord::try_new(GeoCoord::try_new(0.5, 0.5).unwrap(), 0.5).unwrap()];
+        let spatial = VariogramModel::new(0.1, 5.0, 200.0, VariogramType::Exponential).unwrap();
+        let temporal = VariogramModel::new(0.05, 1.0, 2.0, VariogramType::Exponential).unwrap();
+        let vg = SpaceTimeVariogram::new_separable(spatial, temporal).unwrap();
+        let r = conditional_simulate_spacetime_binomial(
+            GeoMetric,
+            &c,
+            &successes,
+            &trials,
+            &targets,
+            vg,
+            BinomialPrior::default(),
+            SimulationOptions::new(1),
+        );
+        assert!(matches!(r, Err(KrigingError::InsufficientData(_))));
     }
 }

@@ -12,12 +12,16 @@
 //!   default distance is Haversine (great-circle, kilometers). This works globally, including
 //!   near the poles and across the antimeridian, to the precision allowed by the selected
 //!   floating-point type (see the `f64` feature below for double precision).
-//! - **2-D fields only.** Surfaces are functions of two coordinates. There is no 3-D or
-//!   space–time kriging in this crate.
+//! - **2-D spatial fields and 2+1-D spatio-temporal fields.** The root `kriging` module
+//!   covers surfaces that are functions of two spatial coordinates; the [`spacetime`] module
+//!   adds an additional scalar time axis with the same four kriging families (ordinary,
+//!   simple, universal, binomial). There is no 3-D (volumetric) kriging in this crate.
 //! - **Planar data is supported via [`projected`].** `ProjectedCoord` + Euclidean distance +
 //!   [`Anisotropy2D`] let you krige `(x, y)` data in any linear unit (meters, grid cells,
 //!   pixels). Convert between lat/lon and planar with [`ProjectedCoord::equirectangular`]
-//!   for small areas where the sphere-vs-plane distortion is negligible.
+//!   for small areas where the sphere-vs-plane distortion is negligible. The spatio-temporal
+//!   models are generic over the spatial geometry and accept both geographic and projected
+//!   coordinates via the [`spacetime::SpatialMetric`] trait.
 //!
 //! # WASM initialization
 //!
@@ -56,6 +60,9 @@
 //!   and prevalence surfaces.
 //! - [`variogram`] — Empirical variogram ([`compute_empirical_variogram`]), fitting
 //!   ([`fit_variogram`]), and parametric models ([`VariogramModel`], [`VariogramType`]).
+//! - [`spacetime`] — Spatio-temporal kriging (ordinary, simple, universal, binomial) with
+//!   separable and product-sum space-time variograms, empirical + parametric fitting, and
+//!   generic spatial metrics (geographic or projected).
 //! - [`distance`] — [`GeoCoord`] and Haversine distance.
 //! - [`geo_dataset`] — Coordinate–value datasets ([`GeoDataset`]).
 //! - [`error`] — [`KrigingError`].
@@ -99,6 +106,7 @@ pub mod kriging;
 pub(crate) mod matrix;
 pub mod projected;
 pub mod simulation;
+pub mod spacetime;
 pub mod utils;
 
 pub use utils::{Probability, clamp_probability, logistic, logit, logit_clamped};

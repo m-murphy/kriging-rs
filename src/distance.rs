@@ -11,11 +11,15 @@ pub struct GeoCoord {
     lon: Real,
 }
 
+/// Cached trigonometric form of a [`GeoCoord`] for repeated Haversine evaluations.
+///
+/// Construct with [`prepare_geo_coord`]; fields are crate-internal because their meaning is
+/// bound to the Haversine formula and not part of the stable API.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct PreparedGeoCoord {
-    lat_rad: Real,
-    lon_rad: Real,
-    cos_lat: Real,
+pub struct PreparedGeoCoord {
+    pub(crate) lat_rad: Real,
+    pub(crate) lon_rad: Real,
+    pub(crate) cos_lat: Real,
 }
 
 impl GeoCoord {
@@ -38,7 +42,7 @@ impl GeoCoord {
     }
 }
 
-pub(crate) fn prepare_geo_coord(coord: GeoCoord) -> PreparedGeoCoord {
+pub fn prepare_geo_coord(coord: GeoCoord) -> PreparedGeoCoord {
     let lat_rad = coord.lat().to_radians();
     let lon_rad = coord.lon().to_radians();
     PreparedGeoCoord {
@@ -57,10 +61,7 @@ pub fn haversine_distance(coord1: GeoCoord, coord2: GeoCoord) -> Real {
     EARTH_RADIUS_KM * c
 }
 
-pub(crate) fn haversine_distance_prepared(
-    coord1: PreparedGeoCoord,
-    coord2: PreparedGeoCoord,
-) -> Real {
+pub fn haversine_distance_prepared(coord1: PreparedGeoCoord, coord2: PreparedGeoCoord) -> Real {
     let a = haversine_a(coord1, coord2);
     let c = 2.0 * a.sqrt().atan2((1.0 - a).max(0.0).sqrt());
     EARTH_RADIUS_KM * c
