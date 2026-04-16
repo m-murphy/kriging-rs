@@ -52,7 +52,8 @@ pub fn haversine_distance(coord1: GeoCoord, coord2: GeoCoord) -> Real {
     let prepared1 = prepare_geo_coord(coord1);
     let prepared2 = prepare_geo_coord(coord2);
     let a = haversine_a(prepared1, prepared2);
-    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    // Clamp (1 - a) against f32 round-off so near-antipodal pairs don't produce NaN; matches WGSL.
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).max(0.0).sqrt());
     EARTH_RADIUS_KM * c
 }
 
@@ -61,7 +62,7 @@ pub(crate) fn haversine_distance_prepared(
     coord2: PreparedGeoCoord,
 ) -> Real {
     let a = haversine_a(coord1, coord2);
-    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).max(0.0).sqrt());
     EARTH_RADIUS_KM * c
 }
 
@@ -71,17 +72,33 @@ fn haversine_a(coord1: PreparedGeoCoord, coord2: PreparedGeoCoord) -> Real {
     (dlat * 0.5).sin().powi(2) + coord1.cos_lat * coord2.cos_lat * (dlon * 0.5).sin().powi(2)
 }
 
+/// Symmetric `n × n` distance matrix as a nested `Vec<Vec<Real>>`.
+///
+/// Kept for API compatibility. For hot paths prefer [`distance_matrix_flat`], which stores
+/// distances in a single contiguous row-major buffer (`matrix[i * n + j]`) and is much more
+/// cache-friendly — the nested version allocates `n + 1` separate heap blocks and scatters
+/// rows across memory.
 pub fn distance_matrix(coords: &[GeoCoord]) -> Vec<Vec<Real>> {
     let n = coords.len();
-    let mut matrix = vec![vec![0.0; n]; n];
+    let flat = distance_matrix_flat(coords);
+    (0..n).map(|i| flat[i * n..(i + 1) * n].to_vec()).collect()
+}
+
+/// Flat row-major `n × n` distance matrix. Entry `(i, j)` is at index `i * n + j`.
+///
+/// Single contiguous allocation, symmetric, zero diagonal. Filled only over the upper
+/// triangle to halve the Haversine calls.
+pub fn distance_matrix_flat(coords: &[GeoCoord]) -> Vec<Real> {
+    let n = coords.len();
+    let mut flat = vec![0.0 as Real; n * n];
     for i in 0..n {
         for j in (i + 1)..n {
             let d = haversine_distance(coords[i], coords[j]);
-            matrix[i][j] = d;
-            matrix[j][i] = d;
+            flat[i * n + j] = d;
+            flat[j * n + i] = d;
         }
     }
-    matrix
+    flat
 }
 
 #[cfg(test)]
@@ -117,6 +134,23 @@ mod tests {
         assert_relative_eq!(m[0][1], m[1][0], epsilon = 1e-6);
         assert_relative_eq!(m[0][2], m[2][0], epsilon = 1e-6);
         assert_relative_eq!(m[1][2], m[2][1], epsilon = 1e-6);
+    }
+
+    #[test]
+    fn distance_matrix_flat_matches_nested_layout() {
+        let coords = vec![
+            GeoCoord::try_new(0.0, 0.0).unwrap(),
+            GeoCoord::try_new(0.0, 1.0).unwrap(),
+            GeoCoord::try_new(1.0, 1.0).unwrap(),
+        ];
+        let nested = distance_matrix(&coords);
+        let flat = distance_matrix_flat(&coords);
+        assert_eq!(flat.len(), 9);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert_relative_eq!(nested[i][j], flat[i * 3 + j], epsilon = 1e-6);
+            }
+        }
     }
 
     #[test]

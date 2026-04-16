@@ -49,6 +49,11 @@ gpu = [
     "dep:futures-channel",
 ]
 gpu-blocking = ["gpu", "dep:pollster"]
+# Use `f64` as the floating-point type for coordinates, values, and variogram
+# parameters (default is `f32`). Improves conditioning for dense station layouts
+# at the cost of ~2x memory and slower SIMD. Incompatible with the `gpu` feature
+# because WGSL shaders currently hard-code `f32`.
+f64 = []
 
 
 [dev-dependencies]

@@ -267,6 +267,7 @@ fn binomial_pipeline_matches_manual_pipeline_at_fixed_seed() {
     let config = VariogramConfig {
         max_distance: None,
         n_bins: NonZeroUsize::new(10).unwrap(),
+        estimator: Default::default(),
     };
     let variogram_type = VariogramType::Exponential;
     let prior = BinomialPrior::default();

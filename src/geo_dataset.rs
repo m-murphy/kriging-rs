@@ -1,4 +1,16 @@
 //! Coordinate–value datasets for kriging (pairs of locations and observed values).
+//!
+//! A [`GeoDataset`] pairs a list of [`GeoCoord`] with a list of observed values. The
+//! constructor enforces the two invariants every downstream solver relies on:
+//!
+//! 1. `coords.len() == values.len()` (returns [`KrigingError::DimensionMismatch`] otherwise).
+//! 2. At least two observations are present (returns [`KrigingError::InsufficientData`]
+//!    otherwise — one point cannot define any covariance structure).
+//!
+//! Empty inputs (`coords.len() == 0`) are rejected under the same [`InsufficientData`]
+//! branch. Upstream modules (`compute_empirical_variogram`, `fit_variogram`, kriging model
+//! constructors) rely on this invariant and will similarly return a clear error rather than
+//! panic if given an empty or single-point dataset.
 
 use crate::Real;
 use crate::distance::GeoCoord;
@@ -12,7 +24,12 @@ pub struct GeoDataset {
 }
 
 impl GeoDataset {
-    /// Builds a dataset. Fails if `coords.len() != values.len()` or if there are fewer than two points.
+    /// Builds a dataset.
+    ///
+    /// Errors:
+    /// - [`KrigingError::DimensionMismatch`] when `coords.len() != values.len()`.
+    /// - [`KrigingError::InsufficientData`] when there are fewer than two points, **including
+    ///   the empty-input case**.
     pub fn new(coords: Vec<GeoCoord>, values: Vec<Real>) -> Result<Self, KrigingError> {
         if coords.len() != values.len() {
             return Err(KrigingError::DimensionMismatch(

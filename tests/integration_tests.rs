@@ -99,6 +99,7 @@ fn explicit_variogram_config_accepts_custom_settings() {
         &VariogramConfig {
             max_distance: Some(PositiveReal::try_new(200.0).unwrap()),
             n_bins: NonZeroUsize::new(4).unwrap(),
+            estimator: Default::default(),
         },
         VariogramType::Gaussian,
     );

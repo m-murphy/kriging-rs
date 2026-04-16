@@ -7,9 +7,12 @@
 pub mod empirical;
 pub mod fitting;
 pub mod models;
+pub mod nested;
 
 pub use empirical::{
-    EmpiricalVariogram, PositiveReal, VariogramConfig, compute_empirical_variogram,
+    EmpiricalEstimator, EmpiricalVariogram, PositiveReal, VariogramConfig,
+    compute_empirical_variogram,
 };
 pub use fitting::{FitResult, fit_variogram};
 pub use models::{VariogramModel, VariogramType};
+pub use nested::NestedVariogram;

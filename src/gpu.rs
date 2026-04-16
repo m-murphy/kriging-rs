@@ -178,6 +178,12 @@ fn encode_variogram_params(
         VariogramType::Matern => {
             return Err("Matérn variogram is not supported on GPU; use CPU path".to_string());
         }
+        VariogramType::Power => {
+            return Err("Power variogram is not supported on GPU; use CPU path".to_string());
+        }
+        VariogramType::HoleEffect => {
+            return Err("Hole-effect variogram is not supported on GPU; use CPU path".to_string());
+        }
     };
     Ok(VariogramGpuParams {
         n_train: n_train as u32,
@@ -375,6 +381,12 @@ pub async fn build_rhs_covariances_gpu(
     read_buffer_f32(&device, &queue, &out_buffer).await
 }
 
+/// Smoke test: verifies a GPU adapter is available and then squares each value **on the CPU**.
+///
+/// The name is a legacy of earlier iterations where this helper ran an actual WGSL shader.
+/// It is retained as an API-level probe for GPU availability with a trivial payload; do not
+/// rely on it for performance. For real GPU work, use [`build_rhs_covariances_gpu`].
+#[doc(alias = "gpu_probe_square")]
 pub async fn gpu_square(values: &[Real]) -> Result<Vec<Real>, String> {
     let support = detect_gpu_support().await;
     if !support.available {

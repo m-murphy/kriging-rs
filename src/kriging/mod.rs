@@ -7,3 +7,5 @@
 
 pub mod binomial;
 pub mod ordinary;
+pub mod simple;
+pub mod universal;

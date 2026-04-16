@@ -6,6 +6,28 @@
 //! model fitting, and Haversine-based geographic coordinates. Build with `wasm` for browser
 //! bindings or `gpu` for GPU-accelerated batch prediction.
 //!
+//! # Scope
+//!
+//! - **Geographic by default.** Coordinates are `(latitude, longitude)` in degrees and the
+//!   default distance is Haversine (great-circle, kilometers). This works globally, including
+//!   near the poles and across the antimeridian, to the precision allowed by the selected
+//!   floating-point type (see the `f64` feature below for double precision).
+//! - **2-D fields only.** Surfaces are functions of two coordinates. There is no 3-D or
+//!   space–time kriging in this crate.
+//! - **Planar data is supported via [`projected`].** `ProjectedCoord` + Euclidean distance +
+//!   [`Anisotropy2D`] let you krige `(x, y)` data in any linear unit (meters, grid cells,
+//!   pixels). Convert between lat/lon and planar with [`ProjectedCoord::equirectangular`]
+//!   for small areas where the sphere-vs-plane distortion is negligible.
+//!
+//! # WASM initialization
+//!
+//! When using the `kriging-rs-wasm` npm wrapper, you must call and `await` `init()` once
+//! before constructing any model. The wrapper guards against the JS-glue-before-WASM race
+//! (it only marks the module ready after the underlying instantiation resolves) — but if
+//! you build your own bindings, make sure the WebAssembly instance is fully available
+//! before calling constructors, otherwise you will see cryptic `TypeError`s from
+//! `wasm_bindgen`.
+//!
 //! # Quick example
 //!
 //! ```rust
@@ -48,16 +70,35 @@
 //! - `gpu` — WebGPU-based batch prediction (native and web).
 //! - `gpu-blocking` — Blocking GPU helpers on native (includes `gpu`).
 
-/// Floating-point type used for coordinates, values, and variogram parameters; currently `f32`.
+/// Floating-point type used for coordinates, values, and variogram parameters.
+///
+/// Defaults to `f32`. Enable the `f64` Cargo feature to switch to double precision at the
+/// cost of ~2x memory and slightly slower math; useful for dense station layouts where the
+/// `f32` kriging matrix is close to numerically singular. Incompatible with the `gpu`
+/// feature because WGSL shaders hard-code `f32`.
+#[cfg(not(feature = "f64"))]
 pub type Real = f32;
+#[cfg(feature = "f64")]
+pub type Real = f64;
 
+#[cfg(all(feature = "f64", feature = "gpu"))]
+compile_error!(
+    "features `f64` and `gpu` are mutually exclusive: WGSL shaders currently only support f32"
+);
+
+pub mod cv;
 pub mod distance;
 pub mod error;
 pub mod geo_dataset;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod kriging;
-pub mod matrix;
+/// Dense linear-system helpers used internally by kriging models. Not part of the stable
+/// public API — use the higher-level `*KrigingModel` types to predict values; direct solver
+/// access is a crate-internal detail that may be removed in a future release.
+pub(crate) mod matrix;
+pub mod projected;
+pub mod simulation;
 pub mod utils;
 
 pub use utils::{Probability, clamp_probability, logistic, logit, logit_clamped};
@@ -74,7 +115,16 @@ pub use gpu::{GpuBackend, GpuSupport, build_rhs_covariances_gpu, detect_gpu_supp
 pub use kriging::binomial::{
     BinomialKrigingModel, BinomialObservation, BinomialPrediction, BinomialPrior,
 };
-pub use kriging::ordinary::{OrdinaryKrigingModel, Prediction};
+pub use kriging::ordinary::{Neighborhood, OrdinaryKrigingModel, Prediction};
+pub use kriging::simple::SimpleKrigingModel;
+pub use kriging::universal::{UniversalKrigingModel, UniversalTrend};
+pub use projected::{
+    Anisotropy2D, DirectionalConfig, ProjectedCoord, ProjectedDataset, ProjectedKrigingModel,
+    compute_directional_empirical_variogram, euclidean_distance, euclidean_distance_squared,
+};
 pub use variogram::fitting::{FitResult, fit_variogram};
 pub use variogram::models::{VariogramModel, VariogramType};
-pub use variogram::{PositiveReal, VariogramConfig, compute_empirical_variogram};
+pub use variogram::nested::NestedVariogram;
+pub use variogram::{
+    EmpiricalEstimator, PositiveReal, VariogramConfig, compute_empirical_variogram,
+};

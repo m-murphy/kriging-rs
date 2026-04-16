@@ -118,15 +118,26 @@ impl BinomialPrior {
     }
 }
 
-/// Result of a binomial kriging prediction: prevalence (0–1), logit value, and variance.
+/// Result of a binomial kriging prediction: prevalence (0–1), logit value, logit-space variance,
+/// and a delta-method approximation of the variance on the prevalence scale.
 #[derive(Debug, Clone, Copy)]
 pub struct BinomialPrediction {
     /// Estimated prevalence at the target location (probability in (0, 1)).
     pub prevalence: Real,
     /// Logit of the prevalence (unbounded).
     pub logit_value: Real,
-    /// Kriging variance of the logit prediction.
+    /// Kriging variance of the logit prediction. This is **not** the variance of `prevalence`;
+    /// see [`prevalence_variance`](Self::prevalence_variance) for a delta-method approximation.
     pub variance: Real,
+    /// Delta-method approximation of the variance of `prevalence`:
+    /// `Var(p) ≈ [p(1 - p)]² · Var(logit)`. Use for approximate CIs on the probability scale.
+    pub prevalence_variance: Real,
+}
+
+#[inline]
+fn delta_prevalence_variance(prevalence: Real, logit_variance: Real) -> Real {
+    let factor = prevalence * (1.0 - prevalence);
+    factor * factor * logit_variance.max(0.0)
 }
 
 /// Fitted binomial kriging model for prevalence surface estimation.
@@ -163,11 +174,23 @@ impl BinomialKrigingModel {
         Self::from_precomputed_logits(coords, logits, variogram)
     }
 
-    pub(crate) fn from_precomputed_logits(
+    /// Build a binomial kriging model from pre-computed logit values.
+    ///
+    /// Useful when callers have applied their own smoothing, Laplace correction, or prior
+    /// transformation to the observed proportions and want kriging to interpolate directly
+    /// in logit space. `logits` must be finite (no NaN/±∞) and have the same length as
+    /// `coords`. Predictions back out prevalence via the logistic function, and
+    /// `prevalence_variance` is delta-method approximated from the kriging variance.
+    pub fn from_precomputed_logits(
         coords: Vec<GeoCoord>,
         logits: Vec<Real>,
         variogram: VariogramModel,
     ) -> Result<Self, KrigingError> {
+        if logits.iter().any(|v| !v.is_finite()) {
+            return Err(KrigingError::InvalidInput(
+                "logits must all be finite (no NaN/inf)".to_string(),
+            ));
+        }
         let dataset = GeoDataset::new(coords, logits)?;
         let ordinary_model = OrdinaryKrigingModel::new(dataset, variogram)?;
         Ok(Self { ordinary_model })
@@ -175,11 +198,7 @@ impl BinomialKrigingModel {
 
     pub fn predict(&self, coord: GeoCoord) -> Result<BinomialPrediction, KrigingError> {
         let pred = self.ordinary_model.predict(coord)?;
-        Ok(BinomialPrediction {
-            prevalence: logistic(pred.value),
-            logit_value: pred.value,
-            variance: pred.variance,
-        })
+        Ok(to_binomial_prediction(pred))
     }
 
     pub fn predict_batch(
@@ -187,14 +206,7 @@ impl BinomialKrigingModel {
         coords: &[GeoCoord],
     ) -> Result<Vec<BinomialPrediction>, KrigingError> {
         let ordinary = self.ordinary_model.predict_batch(coords)?;
-        Ok(ordinary
-            .into_iter()
-            .map(|pred| BinomialPrediction {
-                prevalence: logistic(pred.value),
-                logit_value: pred.value,
-                variance: pred.variance,
-            })
-            .collect())
+        Ok(ordinary.into_iter().map(to_binomial_prediction).collect())
     }
 
     #[cfg(feature = "gpu")]
@@ -203,14 +215,16 @@ impl BinomialKrigingModel {
         coords: &[GeoCoord],
     ) -> Result<Vec<BinomialPrediction>, KrigingError> {
         let ordinary = self.ordinary_model.predict_batch_gpu(coords).await?;
-        Ok(ordinary
-            .into_iter()
-            .map(|pred| BinomialPrediction {
-                prevalence: logistic(pred.value),
-                logit_value: pred.value,
-                variance: pred.variance,
-            })
-            .collect())
+        Ok(ordinary.into_iter().map(to_binomial_prediction).collect())
+    }
+
+    #[cfg(feature = "gpu")]
+    pub async fn predict_batch_gpu_or_cpu(
+        &self,
+        coords: &[GeoCoord],
+    ) -> Result<Vec<BinomialPrediction>, KrigingError> {
+        let ordinary = self.ordinary_model.predict_batch_gpu_or_cpu(coords).await?;
+        Ok(ordinary.into_iter().map(to_binomial_prediction).collect())
     }
 
     #[cfg(all(feature = "gpu-blocking", not(target_arch = "wasm32")))]
@@ -219,14 +233,28 @@ impl BinomialKrigingModel {
         coords: &[GeoCoord],
     ) -> Result<Vec<BinomialPrediction>, KrigingError> {
         let ordinary = self.ordinary_model.predict_batch_gpu_blocking(coords)?;
-        Ok(ordinary
-            .into_iter()
-            .map(|pred| BinomialPrediction {
-                prevalence: logistic(pred.value),
-                logit_value: pred.value,
-                variance: pred.variance,
-            })
-            .collect())
+        Ok(ordinary.into_iter().map(to_binomial_prediction).collect())
+    }
+
+    #[cfg(all(feature = "gpu-blocking", not(target_arch = "wasm32")))]
+    pub fn predict_batch_gpu_or_cpu_blocking(
+        &self,
+        coords: &[GeoCoord],
+    ) -> Result<Vec<BinomialPrediction>, KrigingError> {
+        let ordinary = self
+            .ordinary_model
+            .predict_batch_gpu_or_cpu_blocking(coords)?;
+        Ok(ordinary.into_iter().map(to_binomial_prediction).collect())
+    }
+}
+
+fn to_binomial_prediction(pred: crate::kriging::ordinary::Prediction) -> BinomialPrediction {
+    let prevalence = logistic(pred.value);
+    BinomialPrediction {
+        prevalence,
+        logit_value: pred.value,
+        variance: pred.variance,
+        prevalence_variance: delta_prevalence_variance(prevalence, pred.variance),
     }
 }
 

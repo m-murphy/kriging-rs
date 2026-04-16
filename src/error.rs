@@ -18,4 +18,6 @@ pub enum KrigingError {
     InvalidBinomialData(String),
     #[error("Backend unavailable: {0}")]
     BackendUnavailable(String),
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
 }

@@ -1,4 +1,5 @@
 use crate::Real;
+use crate::error::KrigingError;
 
 const PROB_EPSILON: Real = 1e-9;
 
@@ -7,10 +8,13 @@ const PROB_EPSILON: Real = 1e-9;
 pub struct Probability(Real);
 
 impl Probability {
-    /// Creates a probability. Fails if not in (0, 1) or not finite.
-    pub fn try_new(p: Real) -> Result<Self, &'static str> {
+    /// Creates a probability. Fails with [`KrigingError::InvalidInput`] if `p` is not finite
+    /// or not strictly in `(0, 1)`.
+    pub fn try_new(p: Real) -> Result<Self, KrigingError> {
         if !p.is_finite() || p <= 0.0 || p >= 1.0 {
-            return Err("probability must be finite and in (0, 1)");
+            return Err(KrigingError::InvalidInput(format!(
+                "probability must be finite and in (0, 1), got {p}"
+            )));
         }
         Ok(Self(p))
     }
