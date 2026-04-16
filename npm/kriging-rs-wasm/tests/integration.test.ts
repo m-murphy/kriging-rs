@@ -8,9 +8,30 @@ import {
   KrigingError,
   OrdinaryKriging,
   BinomialKriging,
+  SimpleKriging,
+  UniversalKriging,
+  ProjectedKriging,
   fitVariogram,
   interpolateOrdinaryToGrid,
   interpolateBinomialToGrid,
+  computeEmpiricalVariogram,
+  computeDirectionalEmpiricalVariogram,
+  leaveOneOut,
+  kFold,
+  leaveOneOutSimple,
+  kFoldSimple,
+  leaveOneOutUniversal,
+  kFoldUniversal,
+  leaveOneOutProjected,
+  kFoldProjected,
+  leaveOneOutBinomial,
+  kFoldBinomial,
+  conditionalSimulate,
+  conditionalSimulateSimple,
+  conditionalSimulateUniversal,
+  conditionalSimulateProjected,
+  conditionalSimulateBinomial,
+  evaluateNestedVariogram,
   VariogramType,
   type OrdinaryPrediction,
   type BinomialPrediction,
@@ -510,7 +531,12 @@ describe("Error handling", () => {
           lats: [0, 1],
           lons: [0, 1, 2],
           values: [1, 2, 3],
-          variogram: { variogramType: "gaussian", nugget: 0.01, sill: 1, range: 100 },
+          variogram: {
+            variogramType: "gaussian",
+            nugget: 0.01,
+            sill: 1,
+            range: 100,
+          },
         })
     ).toThrow(KrigingError);
   });
@@ -523,9 +549,925 @@ describe("Error handling", () => {
           lons: [0, 1],
           successes: [1, 2, 3],
           trials: [10, 10, 10],
-          variogram: { variogramType: "gaussian", nugget: 0.01, sill: 1, range: 100 },
+          variogram: {
+            variogramType: "gaussian",
+            nugget: 0.01,
+            sill: 1,
+            range: 100,
+          },
         })
     ).toThrow(KrigingError);
+  });
+});
+
+describe("Search neighborhood (ordinary kriging)", () => {
+  const lats = [0, 0, 1, 1, 2, 2];
+  const lons = [0, 1, 0, 1, 0, 1];
+  const values = [10, 12, 11, 13, 14, 15];
+  const variogram = {
+    variogramType: "exponential" as VariogramTypeName,
+    nugget: 0.01,
+    sill: 1.0,
+    range: 500.0,
+  };
+
+  test("setNeighborhood limits to k nearest and is reversible", () => {
+    const model = new OrdinaryKriging({ lats, lons, values, variogram });
+    try {
+      expect(model.neighborhood()).toBeNull();
+      model.setNeighborhood({ maxNeighbors: 3 });
+      expect(model.neighborhood()).toEqual({ maxNeighbors: 3 });
+      const pred = model.predict(0.5, 0.5);
+      expect(Number.isFinite(pred.value)).toBe(true);
+      model.setNeighborhood();
+      expect(model.neighborhood()).toBeNull();
+    } finally {
+      model.free();
+    }
+  });
+
+  test("setNeighborhood with invalid radius throws", () => {
+    const model = new OrdinaryKriging({ lats, lons, values, variogram });
+    try {
+      expect(() => model.setNeighborhood({ maxRadius: -1 })).toThrow(
+        KrigingError
+      );
+    } finally {
+      model.free();
+    }
+  });
+});
+
+describe("Simple kriging", () => {
+  const lats = [0, 0, 1, 1];
+  const lons = [0, 1, 0, 1];
+  const values = [10, 12, 11, 13];
+
+  test("SimpleKriging predicts with known mean", () => {
+    const model = new SimpleKriging({
+      lats,
+      lons,
+      values,
+      mean: 11.5,
+      variogram: {
+        variogramType: "exponential",
+        nugget: 0.01,
+        sill: 1,
+        range: 500,
+      },
+    });
+    try {
+      expect(model.mean).toBeCloseTo(11.5, 6);
+      const pred = model.predict(0.5, 0.5);
+      expect(Number.isFinite(pred.value)).toBe(true);
+      expect(pred.variance).toBeGreaterThanOrEqual(0);
+      const batch = model.predictBatchArrays([0.5, 0.25], [0.5, 0.25]);
+      expect(batch.values.length).toBe(2);
+      expect(batch.variances.length).toBe(2);
+    } finally {
+      model.free();
+    }
+  });
+});
+
+describe("Universal kriging", () => {
+  const lats = [0, 0, 1, 1];
+  const lons = [0, 1, 0, 1];
+  const values = [10, 12, 11, 13];
+
+  test("UniversalKriging with linear trend predicts finite values", () => {
+    const model = new UniversalKriging({
+      lats,
+      lons,
+      values,
+      trend: "linear",
+      variogram: {
+        variogramType: "exponential",
+        nugget: 0.01,
+        sill: 1,
+        range: 500,
+      },
+    });
+    try {
+      const pred = model.predict(0.5, 0.5);
+      expect(Number.isFinite(pred.value)).toBe(true);
+      expect(pred.variance).toBeGreaterThanOrEqual(0);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("UniversalKriging rejects unknown trend", () => {
+    expect(
+      () =>
+        new UniversalKriging({
+          lats,
+          lons,
+          values,
+          trend: "cubic" as unknown as "linear",
+          variogram: {
+            variogramType: "exponential",
+            nugget: 0.01,
+            sill: 1,
+            range: 500,
+          },
+        })
+    ).toThrow(KrigingError);
+  });
+});
+
+describe("Projected kriging", () => {
+  test("ProjectedKriging with 2D anisotropy predicts finite values", () => {
+    const xs = [0, 1000, 0, 1000];
+    const ys = [0, 0, 1000, 1000];
+    const values = [10, 11, 12, 13];
+    const model = new ProjectedKriging({
+      xs,
+      ys,
+      values,
+      variogram: {
+        variogramType: "spherical",
+        nugget: 0.1,
+        sill: 1.0,
+        range: 5000,
+      },
+      majorAngleDeg: 0,
+      rangeRatio: 0.5,
+    });
+    try {
+      const pred = model.predict(500, 500);
+      expect(Number.isFinite(pred.value)).toBe(true);
+      expect(pred.variance).toBeGreaterThanOrEqual(0);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("ProjectedKriging rejects range ratio outside (0, 1]", () => {
+    expect(
+      () =>
+        new ProjectedKriging({
+          xs: [0, 1, 0, 1],
+          ys: [0, 0, 1, 1],
+          values: [10, 11, 12, 13],
+          variogram: {
+            variogramType: "spherical",
+            nugget: 0.1,
+            sill: 1,
+            range: 5,
+          },
+          majorAngleDeg: 0,
+          rangeRatio: 2.0,
+        })
+    ).toThrow(KrigingError);
+  });
+});
+
+describe("Empirical variogram (direct)", () => {
+  const lats = [0, 0, 1, 1, 2, 2];
+  const lons = [0, 1, 0, 1, 0, 1];
+  const values = [10, 12, 11, 13, 14, 15];
+
+  test("computeEmpiricalVariogram returns non-empty bins", () => {
+    const out = computeEmpiricalVariogram({
+      sampleLats: lats,
+      sampleLons: lons,
+      values,
+      nBins: 5,
+    });
+    expect(out.distances.length).toBe(out.semivariances.length);
+    expect(out.counts.length).toBe(out.distances.length);
+    expect(out.distances.length).toBeGreaterThan(0);
+  });
+
+  test("Cressie-Hawkins estimator produces non-negative semivariances", () => {
+    const out = computeEmpiricalVariogram({
+      sampleLats: lats,
+      sampleLons: lons,
+      values,
+      nBins: 5,
+      estimator: "cressie-hawkins",
+    });
+    for (const s of out.semivariances) {
+      if (Number.isFinite(s)) expect(s).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  test("computeDirectionalEmpiricalVariogram respects tolerance", () => {
+    const xs = [0, 1, 2, 3, 4, 0, 1, 2, 3, 4];
+    const ys = [0, 0, 0, 0, 0, 1, 1, 1, 1, 1];
+    const values = xs.map((_, i) => i * 0.5 + ys[i] * 2);
+    const out = computeDirectionalEmpiricalVariogram({
+      xs,
+      ys,
+      values,
+      maxDistance: 5,
+      nBins: 4,
+      azimuthDeg: 0,
+      toleranceDeg: 15,
+    });
+    expect(out.distances.length).toBe(4);
+  });
+});
+
+describe("Cross-validation", () => {
+  const lats = [0, 0, 1, 1, 2, 2];
+  const lons = [0, 1, 0, 1, 0, 1];
+  const values = [10, 12, 11, 13, 14, 15];
+  const variogram = {
+    variogramType: "exponential" as VariogramTypeName,
+    nugget: 0.05,
+    sill: 1.0,
+    range: 500,
+  };
+
+  test("leaveOneOut returns one residual per station", () => {
+    const out = leaveOneOut({ lats, lons, values, variogram });
+    expect(out.residuals.length).toBe(values.length);
+    expect(out.summary.n).toBe(values.length);
+    for (const r of out.residuals) {
+      expect(Number.isFinite(r.predicted)).toBe(true);
+      expect(r.error).toBeCloseTo(r.observed - r.predicted, 6);
+    }
+    expect(Number.isFinite(out.summary.rmse)).toBe(true);
+  });
+
+  test("kFold returns residuals for all stations", () => {
+    const out = kFold({ lats, lons, values, variogram, k: 3 });
+    expect(out.residuals.length).toBe(values.length);
+    expect(out.summary.n).toBe(values.length);
+  });
+
+  test("kFold rejects k < 2", () => {
+    expect(() => kFold({ lats, lons, values, variogram, k: 1 })).toThrow(
+      KrigingError
+    );
+  });
+});
+
+describe("Cross-validation (per-variant)", () => {
+  const lats = [0, 0, 1, 1, 2, 2, 3, 3];
+  const lons = [0, 1, 0, 1, 0, 1, 0, 1];
+  const values = lats.map((lat, i) => 2 * lat + 3 * lons[i] + 1);
+  const mean = values.reduce((a, b) => a + b, 0) / values.length;
+  const variogram = {
+    variogramType: "exponential" as VariogramTypeName,
+    nugget: 0.05,
+    sill: 1.0,
+    range: 500,
+  };
+
+  test("leaveOneOutSimple returns one residual per station with known mean", () => {
+    const out = leaveOneOutSimple({ lats, lons, values, variogram, mean });
+    expect(out.residuals.length).toBe(values.length);
+    for (const r of out.residuals) {
+      expect(Number.isFinite(r.predicted)).toBe(true);
+      expect(Number.isFinite(r.variance)).toBe(true);
+    }
+  });
+
+  test("kFoldSimple covers every station exactly once", () => {
+    const out = kFoldSimple({ lats, lons, values, variogram, mean, k: 4 });
+    expect(out.residuals.length).toBe(values.length);
+    const seen = new Set<number>();
+    for (const r of out.residuals) {
+      expect(seen.has(r.index)).toBe(false);
+      seen.add(r.index);
+    }
+    expect(seen.size).toBe(values.length);
+  });
+
+  test("leaveOneOutUniversal with constant trend matches leaveOneOut (ordinary)", () => {
+    const ok = leaveOneOut({ lats, lons, values, variogram });
+    const uk = leaveOneOutUniversal({
+      lats,
+      lons,
+      values,
+      variogram,
+      trend: "constant",
+    });
+    expect(uk.residuals.length).toBe(ok.residuals.length);
+    for (let i = 0; i < ok.residuals.length; i++) {
+      expect(uk.residuals[i].predicted).toBeCloseTo(
+        ok.residuals[i].predicted,
+        6
+      );
+    }
+  });
+
+  test("kFoldUniversal with linear trend returns finite residuals", () => {
+    const out = kFoldUniversal({
+      lats,
+      lons,
+      values,
+      variogram,
+      trend: "linear",
+      k: 4,
+    });
+    expect(out.residuals.length).toBe(values.length);
+    for (const r of out.residuals) {
+      expect(Number.isFinite(r.predicted)).toBe(true);
+    }
+  });
+
+  test("leaveOneOutUniversal rejects unknown trend", () => {
+    expect(() =>
+      leaveOneOutUniversal({
+        lats,
+        lons,
+        values,
+        variogram,
+        // @ts-expect-error — deliberately invalid
+        trend: "cubic",
+      })
+    ).toThrow(KrigingError);
+  });
+
+  test("leaveOneOutProjected (isotropic) returns residuals in input order", () => {
+    // Planar grid; reuse lats/lons as xs/ys for structure.
+    const xs = lats;
+    const ys = lons;
+    const projectedVariogram = {
+      variogramType: "exponential" as VariogramTypeName,
+      nugget: 0.05,
+      sill: 1.0,
+      range: 5.0,
+    };
+    const out = leaveOneOutProjected({
+      xs,
+      ys,
+      values,
+      variogram: projectedVariogram,
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+    });
+    expect(out.residuals.length).toBe(values.length);
+    for (let i = 0; i < out.residuals.length; i++) {
+      expect(out.residuals[i].index).toBe(i);
+      expect(Number.isFinite(out.residuals[i].predicted)).toBe(true);
+    }
+  });
+
+  test("kFoldProjected rejects invalid rangeRatio", () => {
+    const xs = lats;
+    const ys = lons;
+    const projectedVariogram = {
+      variogramType: "exponential" as VariogramTypeName,
+      nugget: 0.05,
+      sill: 1.0,
+      range: 5.0,
+    };
+    expect(() =>
+      kFoldProjected({
+        xs,
+        ys,
+        values,
+        variogram: projectedVariogram,
+        majorAngleDeg: 0,
+        rangeRatio: 2,
+        k: 4,
+      })
+    ).toThrow(KrigingError);
+  });
+});
+
+describe("Cross-validation (binomial, both scales)", () => {
+  // Smooth logit gradient; prevalences ~ 0.1..0.9 across a 4x4 grid.
+  const coords: { lat: number; lon: number }[] = [];
+  const successes: number[] = [];
+  const trials: number[] = [];
+  const logistic = (x: number) => 1 / (1 + Math.exp(-x));
+  for (let i = 0; i < 4; i++) {
+    for (let j = 0; j < 4; j++) {
+      coords.push({ lat: i, lon: j });
+      const p = logistic(-2 + 0.5 * i + 0.5 * j);
+      const n = 40;
+      successes.push(Math.round(p * n));
+      trials.push(n);
+    }
+  }
+  const lats = coords.map((c) => c.lat);
+  const lons = coords.map((c) => c.lon);
+  const variogram = {
+    variogramType: "exponential" as VariogramTypeName,
+    nugget: 0.05,
+    sill: 2.0,
+    range: 5.0,
+  };
+
+  test("leaveOneOutBinomial reports both logit and prevalence scales in input order", () => {
+    const out = leaveOneOutBinomial({
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram,
+    });
+    expect(out.residuals.length).toBe(lats.length);
+    for (let i = 0; i < out.residuals.length; i++) {
+      const r = out.residuals[i];
+      expect(r.index).toBe(i);
+      expect(r.trials).toBe(trials[i]);
+      expect(r.successes).toBe(successes[i]);
+      expect(Number.isFinite(r.observedLogit)).toBe(true);
+      expect(Number.isFinite(r.predictedLogit)).toBe(true);
+      expect(Number.isFinite(r.logitVariance)).toBe(true);
+      expect(Number.isFinite(r.observedPrevalence)).toBe(true);
+      expect(Number.isFinite(r.predictedPrevalence)).toBe(true);
+      expect(Number.isFinite(r.prevalenceVariance)).toBe(true);
+      expect(r.predictedPrevalence).toBeGreaterThanOrEqual(0);
+      expect(r.predictedPrevalence).toBeLessThanOrEqual(1);
+      expect(r.logitError).toBeCloseTo(r.observedLogit - r.predictedLogit, 9);
+      expect(r.prevalenceError).toBeCloseTo(
+        r.observedPrevalence - r.predictedPrevalence,
+        9
+      );
+    }
+    expect(out.summary.n).toBe(lats.length);
+    expect(out.summary.nEvaluated).toBe(lats.length);
+    expect(Number.isFinite(out.summary.logit.rmse)).toBe(true);
+    expect(Number.isFinite(out.summary.prevalence.rmse)).toBe(true);
+  });
+
+  test("leaveOneOutBinomial handles trials==0 with NaN observations and excluded summary", () => {
+    const successesZ = successes.slice();
+    const trialsZ = trials.slice();
+    successesZ[0] = 0;
+    trialsZ[0] = 0;
+    const out = leaveOneOutBinomial({
+      lats,
+      lons,
+      successes: successesZ,
+      trials: trialsZ,
+      variogram,
+    });
+    const r0 = out.residuals[0];
+    expect(r0.trials).toBe(0);
+    expect(Number.isNaN(r0.observedLogit)).toBe(true);
+    expect(Number.isNaN(r0.observedPrevalence)).toBe(true);
+    expect(Number.isNaN(r0.logitError)).toBe(true);
+    expect(Number.isNaN(r0.prevalenceError)).toBe(true);
+    // Prediction still populated.
+    expect(Number.isFinite(r0.predictedLogit)).toBe(true);
+    expect(Number.isFinite(r0.predictedPrevalence)).toBe(true);
+    // Summary excludes the zero-trials station.
+    expect(out.summary.n).toBe(lats.length);
+    expect(out.summary.nEvaluated).toBe(lats.length - 1);
+    expect(out.summary.logit.n).toBe(lats.length - 1);
+    expect(out.summary.prevalence.n).toBe(lats.length - 1);
+  });
+
+  test("kFoldBinomial covers every station exactly once", () => {
+    const out = kFoldBinomial({
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram,
+      k: 4,
+    });
+    expect(out.residuals.length).toBe(lats.length);
+    const seen = new Set<number>();
+    for (const r of out.residuals) {
+      expect(seen.has(r.index)).toBe(false);
+      seen.add(r.index);
+    }
+    expect(seen.size).toBe(lats.length);
+  });
+
+  test("leaveOneOutBinomial accepts custom Beta(alpha, beta) prior", () => {
+    const out = leaveOneOutBinomial({
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram,
+      priorAlpha: 1,
+      priorBeta: 1,
+    });
+    expect(out.residuals.length).toBe(lats.length);
+    expect(Number.isFinite(out.summary.prevalence.rmse)).toBe(true);
+  });
+
+  test("leaveOneOutBinomial rejects partial prior specification", () => {
+    expect(() =>
+      leaveOneOutBinomial({
+        lats,
+        lons,
+        successes,
+        trials,
+        variogram,
+        priorAlpha: 1,
+      })
+    ).toThrow(KrigingError);
+  });
+});
+
+describe("Conditional simulation", () => {
+  const condLats = [0, 0, 1, 1];
+  const condLons = [0, 1, 0, 1];
+  const condValues = [10, 12, 11, 13];
+  const targetLats = [0.5, 0.25, 0.75];
+  const targetLons = [0.5, 0.25, 0.75];
+  const variogram = {
+    variogramType: "exponential" as VariogramTypeName,
+    nugget: 0.05,
+    sill: 1.0,
+    range: 500,
+  };
+
+  test("conditionalSimulate is deterministic under fixed seed", () => {
+    const a = conditionalSimulate({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      conditioningValues: condValues,
+      targetLats,
+      targetLons,
+      variogram,
+      seed: 42,
+    });
+    const b = conditionalSimulate({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      conditioningValues: condValues,
+      targetLats,
+      targetLons,
+      variogram,
+      seed: 42,
+    });
+    expect(a.length).toBe(targetLats.length);
+    expect(Array.from(a)).toEqual(Array.from(b));
+  });
+
+  test("different seeds produce different realizations", () => {
+    const a = conditionalSimulate({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      conditioningValues: condValues,
+      targetLats,
+      targetLons,
+      variogram,
+      seed: 1,
+    });
+    const b = conditionalSimulate({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      conditioningValues: condValues,
+      targetLats,
+      targetLons,
+      variogram,
+      seed: 2,
+    });
+    expect(Array.from(a)).not.toEqual(Array.from(b));
+  });
+});
+
+describe("Conditional simulation (per-variant)", () => {
+  const condLats = [0, 0, 1, 1];
+  const condLons = [0, 1, 0, 1];
+  const condValues = [10, 12, 11, 13];
+  const targetLats = [0.5, 0.25, 0.75];
+  const targetLons = [0.5, 0.25, 0.75];
+  const variogram = {
+    variogramType: "exponential" as VariogramTypeName,
+    nugget: 0.05,
+    sill: 1.0,
+    range: 500,
+  };
+
+  test("conditionalSimulateSimple is deterministic and returns finite samples", () => {
+    const a = conditionalSimulateSimple({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      conditioningValues: condValues,
+      targetLats,
+      targetLons,
+      variogram,
+      mean: 11.5,
+      seed: 101,
+    });
+    const b = conditionalSimulateSimple({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      conditioningValues: condValues,
+      targetLats,
+      targetLons,
+      variogram,
+      mean: 11.5,
+      seed: 101,
+    });
+    expect(a.length).toBe(targetLats.length);
+    expect(Array.from(a)).toEqual(Array.from(b));
+    for (const v of a) expect(Number.isFinite(v)).toBe(true);
+  });
+
+  test("conditionalSimulateUniversal with constant trend ≈ conditionalSimulate", () => {
+    // Constant universal trend is mathematically equivalent to ordinary kriging.
+    // Both use the same seeded RNG path, so realizations should match exactly.
+    const ord = conditionalSimulate({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      conditioningValues: condValues,
+      targetLats,
+      targetLons,
+      variogram,
+      seed: 7,
+    });
+    const uni = conditionalSimulateUniversal({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      conditioningValues: condValues,
+      targetLats,
+      targetLons,
+      variogram,
+      trend: "constant",
+      seed: 7,
+    });
+    expect(uni.length).toBe(targetLats.length);
+    for (let i = 0; i < ord.length; i += 1) {
+      expect(Math.abs(uni[i] - ord[i])).toBeLessThan(1e-6);
+    }
+  });
+
+  test("conditionalSimulateUniversal rejects too-few conditioning points for linear trend", () => {
+    expect(() =>
+      conditionalSimulateUniversal({
+        conditioningLats: [0, 0, 1],
+        conditioningLons: [0, 1, 0],
+        conditioningValues: [10, 12, 11],
+        targetLats: [0.5],
+        targetLons: [0.5],
+        variogram,
+        trend: "linear",
+        seed: 0,
+      })
+    ).toThrow(KrigingError);
+  });
+
+  test("conditionalSimulateProjected is deterministic on planar coordinates", () => {
+    const xs = [0, 0, 1, 1];
+    const ys = [0, 1, 0, 1];
+    const values = [10, 12, 11, 13];
+    const targetXs = [0.5, 0.25];
+    const targetYs = [0.5, 0.75];
+    const vg = {
+      variogramType: "exponential" as VariogramTypeName,
+      nugget: 0.05,
+      sill: 1.0,
+      range: 2.0,
+    };
+    const a = conditionalSimulateProjected({
+      conditioningXs: xs,
+      conditioningYs: ys,
+      conditioningValues: values,
+      targetXs,
+      targetYs,
+      variogram: vg,
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+      seed: 13,
+    });
+    const b = conditionalSimulateProjected({
+      conditioningXs: xs,
+      conditioningYs: ys,
+      conditioningValues: values,
+      targetXs,
+      targetYs,
+      variogram: vg,
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+      seed: 13,
+    });
+    expect(a.length).toBe(targetXs.length);
+    expect(Array.from(a)).toEqual(Array.from(b));
+    for (const v of a) expect(Number.isFinite(v)).toBe(true);
+  });
+});
+
+describe("Conditional simulation (binomial, both scales)", () => {
+  const condLats = [0, 0, 1, 1];
+  const condLons = [0, 1, 0, 1];
+  const successes = [3, 7, 4, 9];
+  const trials = [10, 12, 9, 15];
+  const targetLats = [0.5, 0.25];
+  const targetLons = [0.5, 0.75];
+  const variogram = {
+    variogramType: "exponential" as VariogramTypeName,
+    nugget: 0.05,
+    sill: 1.0,
+    range: 500,
+  };
+
+  test("conditionalSimulateBinomial reports both scales consistently", () => {
+    const result = conditionalSimulateBinomial({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      successes,
+      trials,
+      targetLats,
+      targetLons,
+      variogram,
+      seed: 42,
+    });
+    expect(result.logitSamples.length).toBe(targetLats.length);
+    expect(result.prevalenceSamples.length).toBe(targetLats.length);
+    for (let i = 0; i < result.logitSamples.length; i += 1) {
+      const logit = result.logitSamples[i];
+      const prev = result.prevalenceSamples[i];
+      expect(Number.isFinite(logit)).toBe(true);
+      expect(prev).toBeGreaterThan(0);
+      expect(prev).toBeLessThan(1);
+      const expected = 1 / (1 + Math.exp(-logit));
+      expect(Math.abs(prev - expected)).toBeLessThan(1e-6);
+    }
+  });
+
+  test("conditionalSimulateBinomial is deterministic for same seed", () => {
+    const a = conditionalSimulateBinomial({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      successes,
+      trials,
+      targetLats,
+      targetLons,
+      variogram,
+      seed: 99,
+    });
+    const b = conditionalSimulateBinomial({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      successes,
+      trials,
+      targetLats,
+      targetLons,
+      variogram,
+      seed: 99,
+    });
+    expect(Array.from(a.logitSamples)).toEqual(Array.from(b.logitSamples));
+    expect(Array.from(a.prevalenceSamples)).toEqual(
+      Array.from(b.prevalenceSamples)
+    );
+  });
+
+  test("conditionalSimulateBinomial drops trials === 0 stations from conditioning", () => {
+    const withZero = conditionalSimulateBinomial({
+      conditioningLats: [...condLats, 0.5],
+      conditioningLons: [...condLons, 0.5],
+      successes: [...successes, 0],
+      trials: [...trials, 0],
+      targetLats,
+      targetLons,
+      variogram,
+      seed: 4,
+    });
+    const without = conditionalSimulateBinomial({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      successes,
+      trials,
+      targetLats,
+      targetLons,
+      variogram,
+      seed: 4,
+    });
+    expect(Array.from(withZero.logitSamples)).toEqual(
+      Array.from(without.logitSamples)
+    );
+    expect(Array.from(withZero.prevalenceSamples)).toEqual(
+      Array.from(without.prevalenceSamples)
+    );
+  });
+
+  test("conditionalSimulateBinomial rejects lopsided priors", () => {
+    expect(() =>
+      conditionalSimulateBinomial({
+        conditioningLats: condLats,
+        conditioningLons: condLons,
+        successes,
+        trials,
+        targetLats,
+        targetLons,
+        variogram,
+        priorAlpha: 2,
+        seed: 0,
+      })
+    ).toThrow(KrigingError);
+  });
+
+  test("conditionalSimulateBinomial with custom prior differs from default", () => {
+    const defaultPrior = conditionalSimulateBinomial({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      successes,
+      trials,
+      targetLats,
+      targetLons,
+      variogram,
+      seed: 55,
+    });
+    const customPrior = conditionalSimulateBinomial({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      successes,
+      trials,
+      targetLats,
+      targetLons,
+      variogram,
+      priorAlpha: 2,
+      priorBeta: 5,
+      seed: 55,
+    });
+    expect(
+      Math.abs(defaultPrior.logitSamples[0] - customPrior.logitSamples[0])
+    ).toBeGreaterThan(1e-9);
+  });
+});
+
+describe("Binomial kriging: fromPrecomputedLogits", () => {
+  test("builds from externally supplied logits", () => {
+    const lats = [0, 0, 1, 1];
+    const lons = [0, 1, 0, 1];
+    const logits = [-1.5, 0.0, 0.5, 1.5];
+    const model = BinomialKriging.fromPrecomputedLogits({
+      lats,
+      lons,
+      logits,
+      variogram: {
+        variogramType: "exponential",
+        nugget: 0.05,
+        sill: 1,
+        range: 500,
+      },
+    });
+    try {
+      const pred = model.predict(0.5, 0.5);
+      expect(pred.prevalence).toBeGreaterThanOrEqual(0);
+      expect(pred.prevalence).toBeLessThanOrEqual(1);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("rejects non-finite logits", () => {
+    expect(() =>
+      BinomialKriging.fromPrecomputedLogits({
+        lats: [0, 0, 1],
+        lons: [0, 1, 0],
+        logits: [0, Number.POSITIVE_INFINITY, 1],
+        variogram: {
+          variogramType: "exponential",
+          nugget: 0.05,
+          sill: 1,
+          range: 500,
+        },
+      })
+    ).toThrow(KrigingError);
+  });
+});
+
+describe("Nested variograms", () => {
+  test("evaluateNestedVariogram sums components on the semivariance scale", () => {
+    const distances = [0, 100, 500, 1000];
+    const out = evaluateNestedVariogram(
+      [
+        { variogramType: "exponential", nugget: 0.1, sill: 0.5, range: 200 },
+        { variogramType: "spherical", nugget: 0.0, sill: 0.5, range: 800 },
+      ],
+      distances
+    );
+    expect(out.distances.length).toBe(distances.length);
+    expect(out.semivariances.length).toBe(distances.length);
+    expect(out.covariances.length).toBe(distances.length);
+    for (let i = 0; i < out.semivariances.length; i++) {
+      expect(Number.isFinite(out.semivariances[i])).toBe(true);
+      expect(out.semivariances[i]).toBeGreaterThanOrEqual(0);
+    }
+    expect(out.semivariances[out.semivariances.length - 1]).toBeGreaterThan(
+      out.semivariances[0]
+    );
+  });
+
+  test("evaluateNestedVariogram rejects empty components", () => {
+    expect(() => evaluateNestedVariogram([], [1, 2, 3])).toThrow(KrigingError);
+  });
+});
+
+describe("fitVariogram estimator option", () => {
+  test("Cressie-Hawkins estimator runs and returns finite params", () => {
+    const lats = [0, 0, 1, 1, 2, 2];
+    const lons = [0, 1, 0, 1, 0, 1];
+    const values = [10, 12, 11, 13, 14, 15];
+    const fit = fitVariogram({
+      sampleLats: lats,
+      sampleLons: lons,
+      values,
+      variogramType: "exponential",
+      estimator: "cressie-hawkins",
+      nBins: 5,
+    });
+    expect(Number.isFinite(fit.nugget)).toBe(true);
+    expect(Number.isFinite(fit.sill)).toBe(true);
+    expect(Number.isFinite(fit.range)).toBe(true);
   });
 });
 

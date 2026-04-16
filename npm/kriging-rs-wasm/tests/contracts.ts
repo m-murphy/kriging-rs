@@ -79,7 +79,10 @@ const fromFittedOrdinary = OrdinaryKriging.fromFitted({
   fittedVariogram: fit,
   nuggetOverride: 0.05,
 });
-const _fromFittedPred: OrdinaryPrediction = fromFittedOrdinary.predict(0.5, 0.5);
+const _fromFittedPred: OrdinaryPrediction = fromFittedOrdinary.predict(
+  0.5,
+  0.5
+);
 const gridOpts: PredictGridOptions = {
   west: 0,
   south: 0,
@@ -88,7 +91,8 @@ const gridOpts: PredictGridOptions = {
   xCells: 5,
   yCells: 4,
 };
-const ordinaryGrid: OrdinaryGridOutput = fromFittedOrdinary.predictGrid(gridOpts);
+const ordinaryGrid: OrdinaryGridOutput =
+  fromFittedOrdinary.predictGrid(gridOpts);
 const _ordinaryGridType: OrdinaryGridOutput = ordinaryGrid;
 const fittedBatch = fittedOrdinary.predictBatch(lats, lons);
 const _fittedBatchItemType: OrdinaryPrediction = fittedBatch[0];
@@ -102,7 +106,12 @@ const binomial = new BinomialKriging({
   lons,
   successes,
   trials,
-  variogram: { variogramType: "exponential", nugget: 0.01, sill: 1.0, range: 100 },
+  variogram: {
+    variogramType: "exponential",
+    nugget: 0.01,
+    sill: 1.0,
+    range: 100,
+  },
 });
 const bPred = binomial.predict(0.4, 0.4);
 const _bPredType: BinomialPrediction = bPred;
@@ -117,7 +126,10 @@ const binomialFromFitted = BinomialKriging.fromFittedVariogram({
   trials,
   fittedVariogram: fit,
 });
-const _binomialFromFittedPred: BinomialPrediction = binomialFromFitted.predict(0.4, 0.4);
+const _binomialFromFittedPred: BinomialPrediction = binomialFromFitted.predict(
+  0.4,
+  0.4
+);
 
 const binomialFromFittedPrior = BinomialKriging.fromFittedVariogramWithPrior({
   lats,
@@ -130,7 +142,8 @@ const binomialFromFittedPrior = BinomialKriging.fromFittedVariogramWithPrior({
 });
 const _binomialFromFittedPriorPred: BinomialPrediction =
   binomialFromFittedPrior.predict(0.4, 0.4);
-const binomialGrid: BinomialGridOutput = binomialFromFittedPrior.predictGrid(gridOpts);
+const binomialGrid: BinomialGridOutput =
+  binomialFromFittedPrior.predictGrid(gridOpts);
 const _binomialGridType: BinomialGridOutput = binomialGrid;
 
 const _oneShotOrdinary: OrdinaryGridOutput = interpolateOrdinaryToGrid({
