@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Cross-validation for every kriging variant.** Previously ordinary-only; now each variant has its own leave-one-out and K-fold helper:
+  - Rust: `leave_one_out_simple` / `k_fold_simple`, `leave_one_out_universal` / `k_fold_universal`, `leave_one_out_projected` / `k_fold_projected`, `leave_one_out_binomial` / `k_fold_binomial`. Internal fold iteration is now factored into shared helpers (`for_each_loo_fold`, `for_each_k_fold`) so adding new variants is trivial.
+  - WASM / TypeScript: `leaveOneOutSimple`, `kFoldSimple`, `leaveOneOutUniversal`, `kFoldUniversal`, `leaveOneOutProjected`, `kFoldProjected`, `leaveOneOutBinomial`, `kFoldBinomial`.
+  - Existing `leave_one_out` / `k_fold` (and JS `leaveOneOut` / `kFold`) are unchanged — no breaking change.
+- **Binomial CV reports both scales.** New `BinomialCvResidual` / `BinomialCvSummary` (Rust) and `BinomialCvResidual` / `BinomialCvSummary` / `BinomialCvResult` (TS) carry per-station observed/predicted values and variances on **both** the logit scale (directly comparable to continuous kriging; calibratable via MSDR) and the prevalence scale (delta-method variance). Stations with `trials == 0` retain their index with `NaN` observed fields; the summary aggregates on each scale skip them automatically.
+- **Conditional simulation for every kriging variant.** Previously ordinary-only; now each variant has its own sequential Gaussian simulation helper:
+  - Rust: `conditional_simulate_simple`, `conditional_simulate_universal`, `conditional_simulate_projected`, `conditional_simulate_binomial`. Target-order validation is now factored into a shared `resolve_target_order` helper.
+  - WASM / TypeScript: `conditionalSimulateSimple`, `conditionalSimulateUniversal`, `conditionalSimulateProjected`, `conditionalSimulateBinomial`.
+  - Existing `conditional_simulate` (and JS `conditionalSimulate`) are unchanged — no breaking change.
+- **Binomial simulation reports both scales.** New `BinomialSimulationResult` (Rust and TS) carries `logit_samples` / `logitSamples` (unbounded) and `prevalence_samples` / `prevalenceSamples` (in `(0, 1)`, by construction equal to `logistic(logit_samples)`). Simulation happens on the logit scale; stations with `trials == 0` are dropped from the initial conditioning pool. Accepts optional `priorAlpha` / `priorBeta` matching the binomial kriging model.
+- **WASM / npm feature parity** – The `kriging-rs-wasm` wrapper now mirrors the full Rust feature surface:
+  - `OrdinaryKriging.setNeighborhood({ maxNeighbors?, maxRadius? })` and `neighborhood()` for search-neighborhood configuration.
+  - New `SimpleKriging` (known-mean) and `UniversalKriging` (with `"constant"`, `"linear"`, `"quadratic"` trend) classes.
+  - New `ProjectedKriging` class for planar `(x, y)` kriging with 2D anisotropy (`majorAngleDeg`, `rangeRatio`).
+  - `BinomialKriging.fromPrecomputedLogits(...)` factory that bypasses empirical-Bayes shrinkage.
+  - Top-level functions `computeEmpiricalVariogram`, `computeDirectionalEmpiricalVariogram`, `leaveOneOut`, `kFold`, `conditionalSimulate`, and `evaluateNestedVariogram`.
+  - `fitVariogram` and `computeEmpiricalVariogram` now accept `estimator: "classical" | "cressie-hawkins"`.
+  - Extended `VariogramTypeName` to include `"power"` and `"holeeffect"`.
+- **Rust** – `OrdinaryKrigingModel::set_neighborhood` (in-place variant of `with_neighborhood`) for FFI-friendly updates without consuming `self`.
+
 ## [0.2.3] - 2026-04-06
 
 ### Fixed

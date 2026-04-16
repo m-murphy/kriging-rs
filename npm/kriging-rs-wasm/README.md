@@ -30,9 +30,25 @@ const pred = model.predict(37.705, -122.435);
 | Export | Purpose |
 |--------|---------|
 | `init` | Initialize the WASM module (call and await once before any other API). |
-| `OrdinaryKriging` | Spatial interpolation of **continuous** values (e.g. temperature, elevation). |
-| `BinomialKriging` | **Prevalence/proportion** surfaces from count data (successes out of trials). |
-| `fitVariogram` | Fit a variogram model to sample data; use the result to build an `OrdinaryKriging` model. |
+| `OrdinaryKriging` | Spatial interpolation of **continuous** values (e.g. temperature, elevation). Supports search neighborhoods via `setNeighborhood` / `neighborhood`. |
+| `SimpleKriging` | Ordinary kriging's fixed-mean analogue; requires a known `mean`. |
+| `UniversalKriging` | Kriging with a polynomial drift basis (`"constant"` / `"linear"` / `"quadratic"` in lat/lon). |
+| `ProjectedKriging` | Planar kriging on `(x, y)` coordinates with 2D anisotropy (`majorAngleDeg`, `rangeRatio`). |
+| `BinomialKriging` | **Prevalence/proportion** surfaces from count data (successes out of trials). Also `fromPrecomputedLogits` to bypass empirical-Bayes shrinkage. |
+| `fitVariogram` | Fit a variogram model to sample data; optional `estimator: "classical" \| "cressie-hawkins"`. Use the result to build an `OrdinaryKriging` model. |
+| `computeEmpiricalVariogram` | Compute the (isotropic) empirical variogram cloud directly, without fitting a parametric model. |
+| `computeDirectionalEmpiricalVariogram` | Directional empirical variogram on planar `(x, y)` data for diagnosing anisotropy. |
+| `leaveOneOut` / `kFold` | Cross-validation on ordinary kriging. |
+| `leaveOneOutSimple` / `kFoldSimple` | Cross-validation on simple kriging (known, constant mean). |
+| `leaveOneOutUniversal` / `kFoldUniversal` | Cross-validation on universal kriging with a constant / linear / quadratic drift; drift refit per fold. |
+| `leaveOneOutProjected` / `kFoldProjected` | Cross-validation on projected (planar) kriging with optional 2-D anisotropy. |
+| `leaveOneOutBinomial` / `kFoldBinomial` | Cross-validation on binomial kriging; reports residuals on **both** the logit and prevalence scales. |
+| `conditionalSimulate` | Sequential Gaussian simulation (ordinary kriging); deterministic for a given `seed`. |
+| `conditionalSimulateSimple` | SGS with simple kriging (known `mean`). |
+| `conditionalSimulateUniversal` | SGS with universal kriging (polynomial drift refit per step). |
+| `conditionalSimulateProjected` | SGS on planar `(x, y)` coordinates with optional 2-D anisotropy. |
+| `conditionalSimulateBinomial` | SGS for count data on the logit scale; returns samples on **both** the logit and prevalence scales. |
+| `evaluateNestedVariogram` | Evaluate a nested (additive) variogram at given distances for offline inspection/plotting. |
 | `interpolateOrdinaryToGrid` | One-shot: fit + build + predict on grid + free; returns value and variance grids. |
 | `interpolateBinomialToGrid` | One-shot: fit + build + predict on grid + free; returns prevalence and variance grids. |
 | `VariogramType` | Enum for variogram model type (optional; you can pass string names like `"exponential"` instead). |
@@ -87,7 +103,7 @@ The library loads WASM synchronously after you call `init()` (optionally with pr
 
 Call and await `init()` once before using any other API. **VariogramType** (e.g. `VariogramType.Exponential`) is only safe to use after `init()` has been awaited; accessing it before init will throw when the value is used. You can pass string names like `"exponential"` instead.
 
-Supported variogram types: `"spherical"`, `"exponential"`, `"gaussian"`, `"cubic"`, `"stable"`, `"matern"`. You can pass the model type as a string (e.g. `"exponential"`) or as `VariogramType.Exponential`. For `stable` and `matern`, pass an optional `shape` when constructing a model; `fitVariogram` returns a `shape` field when the fitted model is stable or Matérn.
+Supported variogram types: `"spherical"`, `"exponential"`, `"gaussian"`, `"cubic"`, `"stable"`, `"matern"`, `"power"`, `"holeeffect"`. You can pass the model type as a string (e.g. `"exponential"`) or as `VariogramType.Exponential`. For `stable` and `matern`, pass an optional `shape` when constructing a model; `fitVariogram` returns a `shape` field when the fitted model is stable or Matérn.
 
 ### Ordinary kriging
 
@@ -220,6 +236,272 @@ const { values, variances } = model.predictGrid({
 
 **Grid layout:** Results are 2D arrays (not flat). Row index = latitude index, column index = longitude index. First row (`j = 0`) = south, last row = north; first column (`i = 0`) = west, last column = east. So `values[j][i]` is the prediction at the cell with latitude row `j` and longitude column `i`. Internally the library uses row-major order (south to north, then west to east within each row). Ordinary kriging returns `{ values, variances }`; binomial returns `{ prevalences, logitValues, variances }`, all with shape `[yCells][xCells]`.
 
+### Search neighborhoods (ordinary kriging)
+
+By default every prediction uses all sample stations, which scales as O(n³) per model build and O(n) per prediction. For large datasets or locally-supported variograms you can restrict each prediction to the closest stations (by count and/or radius):
+
+```ts
+const model = new OrdinaryKriging({ lats, lons, values, variogram });
+
+model.setNeighborhood({ maxNeighbors: 32, maxRadius: 50 }); // km
+// ...predict(), predictBatch(), predictBatchArrays() all now use the neighborhood
+const current = model.neighborhood(); // { maxNeighbors: 32, maxRadius: 50 }
+
+model.setNeighborhood({}); // clear; back to full-data fast path
+```
+
+If both are given, the intersection is used (top-K within radius). `maxRadius` must be finite and positive.
+
+### Simple kriging (known mean)
+
+Use `SimpleKriging` when the spatial mean is known or estimated externally. The residual system uses the supplied `mean` as a fixed offset rather than estimating it from the data.
+
+```ts
+import { SimpleKriging } from "kriging-rs-wasm";
+
+const model = new SimpleKriging({
+  lats, lons, values,
+  variogram: { variogramType: "exponential", nugget: 0.01, sill: 1.0, range: 50 },
+  mean: 12.3,
+});
+const { values: preds, variances } = model.predictBatchArrays(gridLats, gridLons);
+model.free();
+```
+
+### Universal kriging (polynomial drift)
+
+Use `UniversalKriging` when the field has a systematic trend in lat/lon that ordinary kriging would smear into its residual variogram.
+
+```ts
+import { UniversalKriging } from "kriging-rs-wasm";
+
+const model = new UniversalKriging({
+  lats, lons, values,
+  variogram: { variogramType: "exponential", nugget: 0.01, sill: 1.0, range: 50 },
+  trend: "linear", // "constant" | "linear" | "quadratic"
+});
+```
+
+- `"constant"` — equivalent to ordinary kriging.
+- `"linear"` — drift basis `[1, lat, lon]`.
+- `"quadratic"` — `[1, lat, lon, lat², lat·lon, lon²]`.
+
+### Projected (planar) kriging with 2D anisotropy
+
+For already-projected coordinates (e.g. meters in a local frame), use `ProjectedKriging`. Distances are Euclidean, and 2D anisotropy is expressed as a rotation angle plus a minor-to-major range ratio:
+
+```ts
+import { ProjectedKriging } from "kriging-rs-wasm";
+
+const model = new ProjectedKriging({
+  xs, ys, values,
+  variogram: { variogramType: "exponential", nugget: 0.01, sill: 1.0, range: 500 },
+  majorAngleDeg: 30,    // CCW from +x
+  rangeRatio: 0.5,      // minor / major range, in (0, 1]
+});
+```
+
+### Binomial kriging from pre-computed logits
+
+When you have finite logit estimates from an external fit (e.g. a mean-field model) and want to skip the default empirical-Bayes shrinkage:
+
+```ts
+const model = BinomialKriging.fromPrecomputedLogits({
+  lats, lons,
+  logits, // Float64Array / number[] of finite logit values per station
+  variogram: { variogramType: "exponential", nugget: 0.01, sill: 1.0, range: 100 },
+});
+```
+
+Non-finite logits throw `KrigingError` with code `invalid_input`.
+
+### Empirical variograms (without fitting)
+
+For diagnostics, or when you want to plug the empirical cloud into a custom fitter:
+
+```ts
+import { computeEmpiricalVariogram, computeDirectionalEmpiricalVariogram } from "kriging-rs-wasm";
+
+// Isotropic (geographic lat/lon; Haversine distance in km)
+const iso = computeEmpiricalVariogram({
+  sampleLats: lats, sampleLons: lons, values,
+  nBins: 20,                  // default 12
+  estimator: "cressie-hawkins", // or "classical" (default)
+});
+// iso.distances, iso.semivariances (Float64Array), iso.counts (Uint32Array)
+
+// Directional (planar x/y; Euclidean distance)
+const azimuth = computeDirectionalEmpiricalVariogram({
+  xs, ys, values,
+  maxDistance: 2000,
+  nBins: 20,
+  azimuthDeg: 0,     // along +x
+  toleranceDeg: 22.5,
+});
+```
+
+The same `estimator` option is accepted by `fitVariogram({ ..., estimator: "cressie-hawkins" })` for robust fits.
+
+### Cross-validation
+
+Diagnose predictive skill and variogram calibration via leave-one-out or K-fold CV. Per-station residuals include observed/predicted values and kriging variance; the summary reports `n`, `meanError`, `rmse`, and `msdr` (mean squared deviation ratio; ≈ 1 when the variogram is well calibrated). Folds are deterministic round-robin (station `i` → fold `i % k`); shuffle inputs for randomized folds.
+
+Every kriging variant ships a CV entry point:
+
+```ts
+import {
+  leaveOneOut,
+  kFold,
+  leaveOneOutSimple,
+  kFoldSimple,
+  leaveOneOutUniversal,
+  kFoldUniversal,
+  leaveOneOutProjected,
+  kFoldProjected,
+  leaveOneOutBinomial,
+  kFoldBinomial,
+} from "kriging-rs-wasm";
+
+// Ordinary (no trend, unknown mean).
+const ordinary = leaveOneOut({ lats, lons, values, variogram });
+const ordinaryK = kFold({ lats, lons, values, variogram, k: 10 });
+
+// Simple (known mean; held fixed across folds).
+const simple = leaveOneOutSimple({ lats, lons, values, variogram, mean: 12.5 });
+
+// Universal (polynomial drift; refit per fold, no leakage).
+const universal = leaveOneOutUniversal({
+  lats, lons, values, variogram,
+  trend: "linear", // "constant" | "linear" | "quadratic"
+});
+
+// Projected (planar x/y; optional 2-D anisotropy).
+const projected = leaveOneOutProjected({
+  xs, ys, values, variogram,
+  majorAngleDeg: 45,
+  rangeRatio: 0.5, // pass 1 for isotropic
+});
+```
+
+All of the above return `{ residuals, summary, arrays }` where `arrays` contains typed `Float64Array`/`Uint32Array` views suitable for plotting.
+
+#### Binomial cross-validation (both scales)
+
+Binomial CV is special: a held-out station has a logit-scale observation (natural for MSDR and variogram calibration) **and** a prevalence-scale observation (natural for probability-scale error metrics). `leaveOneOutBinomial` / `kFoldBinomial` report both, along with a two-sided summary.
+
+```ts
+const binomial = leaveOneOutBinomial({
+  lats, lons, successes, trials, variogram,
+  // priorAlpha, priorBeta — optional; must appear together, defaults to Beta(½, ½).
+});
+
+// Each residual carries both scales:
+const r = binomial.residuals[0];
+r.observedLogit;          // NaN when trials[i] === 0
+r.predictedLogit;
+r.logitVariance;          // kriging variance on logit scale
+r.observedPrevalence;     // NaN when trials[i] === 0
+r.predictedPrevalence;    // in [0, 1]
+r.prevalenceVariance;     // delta-method approximation
+r.logitError;             // observedLogit − predictedLogit (NaN for trials === 0)
+r.prevalenceError;        // observedPrevalence − predictedPrevalence (NaN for trials === 0)
+
+// Summary reports both scales; aggregates skip trials === 0 automatically.
+binomial.summary.n;            // total residuals (includes trials === 0)
+binomial.summary.nEvaluated;   // residuals with trials > 0
+binomial.summary.logit;        // { n, meanError, rmse, msdr }
+binomial.summary.prevalence;   // { n, meanError, rmse, msdr }
+```
+
+Stations with `trials[i] === 0` are unobservable: they contribute no training fold and their observed fields are `NaN`, but the model's prediction is still populated so you can audit which stations were unobservable.
+
+### Conditional simulation (Sequential Gaussian Simulation)
+
+Generate realizations of the spatial process conditioned on observed stations. Deterministic for a given `seed`; pass a different seed for each realization. One helper per kriging variant, mirroring the cross-validation surface:
+
+| Helper | When to use |
+| --- | --- |
+| `conditionalSimulate` | Ordinary kriging — unknown mean, no trend. |
+| `conditionalSimulateSimple` | You have an externally known **mean** (climatology, pooled historical average). |
+| `conditionalSimulateUniversal` | The process has a known polynomial drift (`"constant"`, `"linear"`, `"quadratic"`). |
+| `conditionalSimulateProjected` | Data is on planar `(x, y)` coordinates; optional 2-D geometric anisotropy. |
+| `conditionalSimulateBinomial` | Count data (`successes`, `trials`). Simulation happens on the logit scale; result is reported on **both** scales. |
+
+```ts
+import {
+  conditionalSimulate,
+  conditionalSimulateSimple,
+  conditionalSimulateUniversal,
+  conditionalSimulateProjected,
+  conditionalSimulateBinomial,
+} from "kriging-rs-wasm";
+
+// Ordinary (no trend)
+const sample = conditionalSimulate({
+  conditioningLats: lats,
+  conditioningLons: lons,
+  conditioningValues: values,
+  targetLats: gridLats,
+  targetLons: gridLons,
+  variogram,
+  seed: 42n,                 // bigint or number; default 0n
+  // targetOrder: Uint32Array.of(...) // optional visit order; default is input order
+});
+// sample: Float64Array, length === targetLats.length
+
+// Simple (known mean)
+const simple = conditionalSimulateSimple({
+  conditioningLats: lats, conditioningLons: lons, conditioningValues: values,
+  targetLats: gridLats, targetLons: gridLons,
+  variogram, mean: 11.5, seed: 7,
+});
+
+// Universal (polynomial drift refit at each step)
+const uni = conditionalSimulateUniversal({
+  conditioningLats: lats, conditioningLons: lons, conditioningValues: values,
+  targetLats: gridLats, targetLons: gridLons,
+  variogram, trend: "linear", seed: 7,
+});
+
+// Projected (planar, optional anisotropy)
+const proj = conditionalSimulateProjected({
+  conditioningXs: xs, conditioningYs: ys, conditioningValues: values,
+  targetXs: gridXs, targetYs: gridYs,
+  variogram, majorAngleDeg: 30, rangeRatio: 0.5, seed: 7,
+});
+
+// Binomial (dual-scale output)
+const bin = conditionalSimulateBinomial({
+  conditioningLats: lats, conditioningLons: lons,
+  successes, trials,
+  targetLats: gridLats, targetLons: gridLons,
+  variogram, seed: 7,
+  // priorAlpha: 1, priorBeta: 1   // optional; default Beta(½, ½)
+});
+bin.logitSamples;      // Float64Array — simulated logit values (unbounded)
+bin.prevalenceSamples; // Float64Array — logistic(logitSamples), in (0, 1)
+```
+
+Binomial stations with `trials[i] === 0` are dropped from the initial conditioning pool (they carry no information); the simulator still requires at least two remaining valid stations. Every variant honors the observed data exactly (up to solver tolerance) and visits targets in input order unless `targetOrder` is supplied.
+
+### Nested variogram evaluation
+
+Evaluate an additive composite variogram (e.g. short-range exponential plus long-range spherical) at a set of distances. The model is summed on the semivariance scale; covariance is derived via `C₀ − γ(h)`.
+
+```ts
+import { evaluateNestedVariogram } from "kriging-rs-wasm";
+
+const { distances: h, semivariances, covariances } = evaluateNestedVariogram(
+  [
+    { variogramType: "exponential", nugget: 0.0, sill: 0.3, range: 5 },
+    { variogramType: "spherical",  nugget: 0.0, sill: 0.7, range: 50 },
+  ],
+  [0, 1, 2, 5, 10, 25, 50, 75, 100],
+);
+```
+
+Nested variograms are not yet accepted by the kriging constructors; this entry point is for offline evaluation and plotting.
+
 ### One-shot interpolate to grid
 
 For the common flow "fit variogram → build model → predict on grid → free", you can use a single call:
@@ -264,7 +546,7 @@ If `predictBatchGpu` is called without a GPU build, it throws.
 
 ## Error handling
 
-Constructors (`OrdinaryKriging`, `BinomialKriging`, `BinomialKriging.newWithPrior`) and `fitVariogram` throw on invalid inputs or model build failure (e.g. singular covariance). Errors are rethrown as `KrigingError` with the underlying cause attached as `cause`. For UI-friendly messages, use the optional **`code`** property (when present), which is one of: `not_loaded`, `model_freed`, `mismatched_arrays`, `invalid_variogram`, `invalid_bins`, `singular_covariance`, `too_few_points`, `unknown_variogram`, `invalid_input`. Not every error has a code.
+Constructors (`OrdinaryKriging`, `SimpleKriging`, `UniversalKriging`, `ProjectedKriging`, `BinomialKriging`, `BinomialKriging.newWithPrior`, `BinomialKriging.fromPrecomputedLogits`), `fitVariogram`, and the top-level helpers (`computeEmpiricalVariogram`, `computeDirectionalEmpiricalVariogram`, `leaveOneOut`, `kFold`, `leaveOneOutSimple`, `kFoldSimple`, `leaveOneOutUniversal`, `kFoldUniversal`, `leaveOneOutProjected`, `kFoldProjected`, `leaveOneOutBinomial`, `kFoldBinomial`, `conditionalSimulate`, `conditionalSimulateSimple`, `conditionalSimulateUniversal`, `conditionalSimulateProjected`, `conditionalSimulateBinomial`, `evaluateNestedVariogram`) throw on invalid inputs or model build failure (e.g. singular covariance). Errors are rethrown as `KrigingError` with the underlying cause attached as `cause`. For UI-friendly messages, use the optional **`code`** property (when present), which is one of: `not_loaded`, `model_freed`, `mismatched_arrays`, `invalid_variogram`, `invalid_bins`, `singular_covariance`, `too_few_points`, `unknown_variogram`, `invalid_input`, `backend_unavailable`, `internal_error`. Not every error has a code. `backend_unavailable` specifically indicates that the WASM package was built without the export in question (e.g. without the `gpu` feature), so the API can't fulfill the call in the current build.
 
 Typical causes:
 
