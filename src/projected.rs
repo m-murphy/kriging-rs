@@ -20,7 +20,9 @@ use std::num::NonZeroUsize;
 use crate::Real;
 use crate::distance::GeoCoord;
 use crate::error::KrigingError;
+use crate::kriging::binomial::{BinomialPrediction, BinomialPrior};
 use crate::kriging::ordinary::{Prediction, kriging_diagonal_jitter};
+use crate::utils::{Probability, logistic, logit};
 use crate::variogram::empirical::{EmpiricalVariogram, PositiveReal};
 use crate::variogram::models::VariogramModel;
 
@@ -407,6 +409,176 @@ impl ProjectedKrigingModel {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Binomial kriging on projected coordinates
+// ---------------------------------------------------------------------------
+
+/// A single binomial observation on projected (planar) coordinates.
+///
+/// This is the [`crate::BinomialObservation`] equivalent for
+/// [`BinomialProjectedKrigingModel`] / planar prevalence mapping.
+#[derive(Debug, Clone, Copy)]
+pub struct ProjectedBinomialObservation {
+    coord: ProjectedCoord,
+    successes: u32,
+    trials: u32,
+}
+
+impl ProjectedBinomialObservation {
+    /// Validates `trials > 0` and `successes <= trials`.
+    pub fn new(coord: ProjectedCoord, successes: u32, trials: u32) -> Result<Self, KrigingError> {
+        if trials == 0 {
+            return Err(KrigingError::InvalidBinomialData(
+                "trials must be greater than 0".to_string(),
+            ));
+        }
+        if successes > trials {
+            return Err(KrigingError::InvalidBinomialData(format!(
+                "successes ({}) cannot exceed trials ({})",
+                successes, trials
+            )));
+        }
+        Ok(Self {
+            coord,
+            successes,
+            trials,
+        })
+    }
+
+    #[inline]
+    pub fn coord(self) -> ProjectedCoord {
+        self.coord
+    }
+
+    #[inline]
+    pub fn successes(self) -> u32 {
+        self.successes
+    }
+
+    #[inline]
+    pub fn trials(self) -> u32 {
+        self.trials
+    }
+
+    pub fn smoothed_probability_with_prior(&self, prior: BinomialPrior) -> Real {
+        let s = self.successes as Real;
+        let n = self.trials as Real;
+        (s + prior.alpha()) / (n + prior.alpha() + prior.beta())
+    }
+
+    pub fn smoothed_logit_with_prior(&self, prior: BinomialPrior) -> Real {
+        let p = self.smoothed_probability_with_prior(prior);
+        logit(Probability::from_known_in_range(p))
+    }
+}
+
+#[inline]
+fn delta_prevalence_variance(prevalence: Real, logit_variance: Real) -> Real {
+    let factor = prevalence * (1.0 - prevalence);
+    factor * factor * logit_variance.max(0.0)
+}
+
+fn binomial_prediction_from(pred: Prediction) -> BinomialPrediction {
+    let prevalence = logistic(pred.value);
+    BinomialPrediction {
+        prevalence,
+        logit_value: pred.value,
+        variance: pred.variance,
+        prevalence_variance: delta_prevalence_variance(prevalence, pred.variance),
+    }
+}
+
+/// Binomial kriging on projected (planar) coordinates with optional 2-D
+/// geometric anisotropy.
+///
+/// This is the planar/anisotropic counterpart of
+/// [`crate::BinomialKrigingModel`]. Kriging happens on the **logit** scale,
+/// using empirical-Bayes-smoothed log-odds derived from `(successes, trials)`
+/// counts and a Beta prior. Predictions report both the logit value (with its
+/// kriging variance) and the back-transformed prevalence (with a delta-method
+/// variance approximation). See [`BinomialPrediction`].
+///
+/// Use [`Anisotropy2D::isotropic`] to disable anisotropy.
+#[derive(Debug, Clone)]
+pub struct BinomialProjectedKrigingModel {
+    inner: ProjectedKrigingModel,
+}
+
+impl BinomialProjectedKrigingModel {
+    /// Build a binomial projected kriging model from `(coord, successes, trials)`
+    /// observations and a (possibly anisotropic) variogram. Uses
+    /// `BinomialPrior::default()` (Jeffreys' Beta(½, ½)) for empirical-Bayes
+    /// smoothing of the logit values.
+    pub fn new(
+        observations: Vec<ProjectedBinomialObservation>,
+        variogram: VariogramModel,
+        anisotropy: Anisotropy2D,
+    ) -> Result<Self, KrigingError> {
+        Self::new_with_prior(
+            observations,
+            variogram,
+            anisotropy,
+            BinomialPrior::default(),
+        )
+    }
+
+    /// As [`new`](Self::new), with an explicit Beta prior.
+    pub fn new_with_prior(
+        observations: Vec<ProjectedBinomialObservation>,
+        variogram: VariogramModel,
+        anisotropy: Anisotropy2D,
+        prior: BinomialPrior,
+    ) -> Result<Self, KrigingError> {
+        if observations.len() < 2 {
+            return Err(KrigingError::InsufficientData(2));
+        }
+        let coords: Vec<ProjectedCoord> = observations.iter().map(|o| o.coord()).collect();
+        let logits: Vec<Real> = observations
+            .iter()
+            .map(|o| o.smoothed_logit_with_prior(prior))
+            .collect();
+        Self::from_precomputed_logits(coords, logits, variogram, anisotropy)
+    }
+
+    /// Build a binomial projected model from pre-computed logit values.
+    ///
+    /// Useful when the caller wants to apply a custom logit transform (e.g. a
+    /// different prior, manual Laplace correction, or pre-fit smoothing).
+    /// `logits` must be finite and have the same length as `coords`.
+    pub fn from_precomputed_logits(
+        coords: Vec<ProjectedCoord>,
+        logits: Vec<Real>,
+        variogram: VariogramModel,
+        anisotropy: Anisotropy2D,
+    ) -> Result<Self, KrigingError> {
+        if logits.iter().any(|v| !v.is_finite()) {
+            return Err(KrigingError::InvalidInput(
+                "logits must all be finite (no NaN/inf)".to_string(),
+            ));
+        }
+        let dataset = ProjectedDataset::new(coords, logits)?;
+        let inner = ProjectedKrigingModel::new(dataset, variogram, anisotropy)?;
+        Ok(Self { inner })
+    }
+
+    pub fn anisotropy(&self) -> Anisotropy2D {
+        self.inner.anisotropy()
+    }
+
+    pub fn predict(&self, coord: ProjectedCoord) -> Result<BinomialPrediction, KrigingError> {
+        let pred = self.inner.predict(coord)?;
+        Ok(binomial_prediction_from(pred))
+    }
+
+    pub fn predict_batch(
+        &self,
+        coords: &[ProjectedCoord],
+    ) -> Result<Vec<BinomialPrediction>, KrigingError> {
+        let preds = self.inner.predict_batch(coords)?;
+        Ok(preds.into_iter().map(binomial_prediction_from).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,5 +725,64 @@ mod tests {
         assert!(DirectionalConfig::new(0.0, 0.0).is_err());
         assert!(DirectionalConfig::new(0.0, 91.0).is_err());
         assert!(DirectionalConfig::new(Real::NAN, 5.0).is_err());
+    }
+
+    #[test]
+    fn binomial_projected_recovers_smoothed_logit_at_collocated_point() {
+        let obs = vec![
+            ProjectedBinomialObservation::new(ProjectedCoord::new(0.0, 0.0), 3, 10).unwrap(),
+            ProjectedBinomialObservation::new(ProjectedCoord::new(10.0, 0.0), 7, 10).unwrap(),
+            ProjectedBinomialObservation::new(ProjectedCoord::new(0.0, 10.0), 5, 10).unwrap(),
+        ];
+        let variogram = VariogramModel::new(0.01, 1.0, 30.0, VariogramType::Exponential).unwrap();
+        let prior = BinomialPrior::default();
+        let model = BinomialProjectedKrigingModel::new_with_prior(
+            obs.clone(),
+            variogram,
+            Anisotropy2D::isotropic(),
+            prior,
+        )
+        .unwrap();
+        let pred = model.predict(obs[0].coord()).unwrap();
+        let expected_logit = obs[0].smoothed_logit_with_prior(prior);
+        assert!((pred.logit_value - expected_logit).abs() < 1e-3);
+        assert!(pred.prevalence > 0.0 && pred.prevalence < 1.0);
+        assert!(pred.variance >= 0.0);
+        assert!(pred.prevalence_variance >= 0.0);
+    }
+
+    #[test]
+    fn binomial_projected_anisotropy_pulls_predictions_along_major_axis() {
+        // Two stations along x-axis with low prevalence, two along y-axis with high.
+        let obs = vec![
+            ProjectedBinomialObservation::new(ProjectedCoord::new(-5.0, 0.0), 1, 10).unwrap(),
+            ProjectedBinomialObservation::new(ProjectedCoord::new(5.0, 0.0), 1, 10).unwrap(),
+            ProjectedBinomialObservation::new(ProjectedCoord::new(0.0, 5.0), 9, 10).unwrap(),
+            ProjectedBinomialObservation::new(ProjectedCoord::new(0.0, -5.0), 9, 10).unwrap(),
+        ];
+        let variogram = VariogramModel::new(0.01, 1.0, 20.0, VariogramType::Exponential).unwrap();
+        let iso =
+            BinomialProjectedKrigingModel::new(obs.clone(), variogram, Anisotropy2D::isotropic())
+                .unwrap();
+        let aniso = BinomialProjectedKrigingModel::new(
+            obs.clone(),
+            variogram,
+            Anisotropy2D::new(0.0, 0.2).unwrap(),
+        )
+        .unwrap();
+        let target = ProjectedCoord::new(0.0, 0.0);
+        let iso_pred = iso.predict(target).unwrap();
+        let aniso_pred = aniso.predict(target).unwrap();
+        // Anisotropy weights x-axis (low prevalence) more heavily.
+        assert!(aniso_pred.prevalence < iso_pred.prevalence);
+    }
+
+    #[test]
+    fn binomial_projected_rejects_too_few_observations() {
+        let one =
+            vec![ProjectedBinomialObservation::new(ProjectedCoord::new(0.0, 0.0), 1, 5).unwrap()];
+        let variogram = VariogramModel::new(0.01, 1.0, 10.0, VariogramType::Exponential).unwrap();
+        let r = BinomialProjectedKrigingModel::new(one, variogram, Anisotropy2D::isotropic());
+        assert!(r.is_err());
     }
 }

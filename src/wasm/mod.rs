@@ -8,10 +8,12 @@ use js_sys::{Float64Array, Object, Reflect, Uint32Array};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
+use crate::aggregate::{PolygonAggregationSummary, polygon_weighted_summaries_batch};
 use crate::cv::{
-    BinomialCvResidual, BinomialCvSummary, k_fold, k_fold_binomial, k_fold_projected,
-    k_fold_simple, k_fold_universal, leave_one_out, leave_one_out_binomial,
-    leave_one_out_projected, leave_one_out_simple, leave_one_out_universal,
+    BinomialCvResidual, BinomialCvSummary, k_fold, k_fold_binomial, k_fold_binomial_projected,
+    k_fold_projected, k_fold_simple, k_fold_universal, leave_one_out, leave_one_out_binomial,
+    leave_one_out_binomial_projected, leave_one_out_projected, leave_one_out_simple,
+    leave_one_out_universal,
 };
 use crate::distance::GeoCoord;
 use crate::geo_dataset::GeoDataset;
@@ -22,13 +24,16 @@ use crate::kriging::ordinary::{Neighborhood, OrdinaryKrigingModel};
 use crate::kriging::simple::SimpleKrigingModel;
 use crate::kriging::universal::{UniversalKrigingModel, UniversalTrend};
 use crate::projected::{
-    Anisotropy2D, DirectionalConfig, ProjectedCoord, ProjectedDataset, ProjectedKrigingModel,
+    Anisotropy2D, BinomialProjectedKrigingModel, DirectionalConfig, ProjectedBinomialObservation,
+    ProjectedCoord, ProjectedDataset, ProjectedKrigingModel,
     compute_directional_empirical_variogram,
 };
 use crate::simulation::{
-    BinomialSimulationResult, SimulationOptions, conditional_simulate,
-    conditional_simulate_binomial, conditional_simulate_projected, conditional_simulate_simple,
-    conditional_simulate_universal,
+    BinomialSimulationManyResult, BinomialSimulationResult, SimulationOptions,
+    conditional_simulate, conditional_simulate_binomial, conditional_simulate_binomial_projected,
+    conditional_simulate_many, conditional_simulate_many_binomial,
+    conditional_simulate_many_binomial_projected, conditional_simulate_projected,
+    conditional_simulate_simple, conditional_simulate_universal,
 };
 use crate::variogram::empirical::{EmpiricalEstimator, PositiveReal, VariogramConfig};
 use crate::variogram::fitting::fit_variogram;
@@ -1265,6 +1270,213 @@ impl WasmProjectedKriging {
 }
 
 // ---------------------------------------------------------------------------
+// Projected binomial kriging
+// ---------------------------------------------------------------------------
+
+fn build_projected_binomial_observations(
+    xs: &[f64],
+    ys: &[f64],
+    successes: &[u32],
+    trials: &[u32],
+) -> Result<Vec<ProjectedBinomialObservation>, JsValue> {
+    if xs.len() != ys.len() || xs.len() != successes.len() || xs.len() != trials.len() {
+        return Err(coded_err(
+            "xs, ys, successes and trials must have the same length",
+            "mismatched_arrays",
+        ));
+    }
+    let mut out = Vec::with_capacity(xs.len());
+    for i in 0..xs.len() {
+        let coord = ProjectedCoord::new(xs[i] as Real, ys[i] as Real);
+        out.push(
+            ProjectedBinomialObservation::new(coord, successes[i], trials[i])
+                .map_err(kriging_err_to_js)?,
+        );
+    }
+    Ok(out)
+}
+
+#[wasm_bindgen]
+pub struct WasmBinomialProjectedKriging {
+    inner: BinomialProjectedKrigingModel,
+}
+
+#[wasm_bindgen]
+impl WasmBinomialProjectedKriging {
+    /// Construct a binomial projected kriging model on planar `(x, y)`
+    /// coordinates. Mirrors [`WasmBinomialKriging::fromArrays`] but with
+    /// 2-D anisotropy (`majorAngleDeg`, `rangeRatio`). Uses
+    /// `BinomialPrior::default()` (Jeffreys' Beta(½, ½)) for empirical-Bayes
+    /// smoothing of the per-station logits.
+    #[wasm_bindgen(js_name = fromArrays)]
+    pub fn from_arrays(
+        xs: &[f64],
+        ys: &[f64],
+        successes: &[u32],
+        trials: &[u32],
+        variogram_type: &str,
+        nugget: f64,
+        sill: f64,
+        range: f64,
+        shape: Option<f64>,
+        major_angle_deg: f64,
+        range_ratio: f64,
+    ) -> Result<WasmBinomialProjectedKriging, JsValue> {
+        let observations = build_projected_binomial_observations(xs, ys, successes, trials)?;
+        let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
+        let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
+            .map_err(kriging_err_to_js)?;
+        let inner = BinomialProjectedKrigingModel::new(observations, model, anisotropy)
+            .map_err(kriging_err_to_js)?;
+        Ok(Self { inner })
+    }
+
+    /// As [`fromArrays`](Self::from_arrays), with an explicit Beta prior.
+    #[wasm_bindgen(js_name = fromArraysWithPrior)]
+    pub fn from_arrays_with_prior(
+        xs: &[f64],
+        ys: &[f64],
+        successes: &[u32],
+        trials: &[u32],
+        variogram_type: &str,
+        nugget: f64,
+        sill: f64,
+        range: f64,
+        shape: Option<f64>,
+        major_angle_deg: f64,
+        range_ratio: f64,
+        prior_alpha: f64,
+        prior_beta: f64,
+    ) -> Result<WasmBinomialProjectedKriging, JsValue> {
+        let observations = build_projected_binomial_observations(xs, ys, successes, trials)?;
+        let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
+        let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
+            .map_err(kriging_err_to_js)?;
+        let prior = BinomialPrior::new(prior_alpha as Real, prior_beta as Real)
+            .map_err(kriging_err_to_js)?;
+        let inner =
+            BinomialProjectedKrigingModel::new_with_prior(observations, model, anisotropy, prior)
+                .map_err(kriging_err_to_js)?;
+        Ok(Self { inner })
+    }
+
+    /// Build a projected binomial model from caller-supplied logit values,
+    /// bypassing the empirical-Bayes shrinkage step.
+    #[wasm_bindgen(js_name = fromPrecomputedLogits)]
+    pub fn from_precomputed_logits(
+        xs: &[f64],
+        ys: &[f64],
+        logits: &[f64],
+        variogram_type: &str,
+        nugget: f64,
+        sill: f64,
+        range: f64,
+        shape: Option<f64>,
+        major_angle_deg: f64,
+        range_ratio: f64,
+    ) -> Result<WasmBinomialProjectedKriging, JsValue> {
+        if xs.len() != ys.len() || xs.len() != logits.len() {
+            return Err(coded_err(
+                "xs, ys and logits must have the same length",
+                "mismatched_arrays",
+            ));
+        }
+        let coords: Vec<ProjectedCoord> = xs
+            .iter()
+            .zip(ys.iter())
+            .map(|(&x, &y)| ProjectedCoord::new(x as Real, y as Real))
+            .collect();
+        let logits_real: Vec<Real> = logits.iter().map(|v| *v as Real).collect();
+        let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
+        let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
+            .map_err(kriging_err_to_js)?;
+        let inner = BinomialProjectedKrigingModel::from_precomputed_logits(
+            coords,
+            logits_real,
+            model,
+            anisotropy,
+        )
+        .map_err(kriging_err_to_js)?;
+        Ok(Self { inner })
+    }
+
+    pub fn predict(&self, x: f64, y: f64) -> Result<JsValue, JsValue> {
+        let coord = ProjectedCoord::new(x as Real, y as Real);
+        let pred = self.inner.predict(coord).map_err(kriging_err_to_js)?;
+        serde_wasm_bindgen::to_value(&JsBinomialPrediction {
+            prevalence: pred.prevalence as f64,
+            logit_value: pred.logit_value as f64,
+            variance: pred.variance as f64,
+            prevalence_variance: pred.prevalence_variance as f64,
+        })
+        .map_err(err_to_js)
+    }
+
+    #[wasm_bindgen(js_name = predictBatch)]
+    pub fn predict_batch(&self, xs: &[f64], ys: &[f64]) -> Result<JsValue, JsValue> {
+        if xs.len() != ys.len() {
+            return Err(coded_err(
+                "xs and ys must have the same length",
+                "mismatched_arrays",
+            ));
+        }
+        let coords: Vec<ProjectedCoord> = xs
+            .iter()
+            .zip(ys.iter())
+            .map(|(&x, &y)| ProjectedCoord::new(x as Real, y as Real))
+            .collect();
+        let out = self
+            .inner
+            .predict_batch(&coords)
+            .map_err(kriging_err_to_js)?;
+        serde_wasm_bindgen::to_value(&map_binomial_predictions(out)).map_err(err_to_js)
+    }
+
+    #[wasm_bindgen(js_name = predictBatchArrays)]
+    pub fn predict_batch_arrays(&self, xs: &[f64], ys: &[f64]) -> Result<JsValue, JsValue> {
+        if xs.len() != ys.len() {
+            return Err(coded_err(
+                "xs and ys must have the same length",
+                "mismatched_arrays",
+            ));
+        }
+        let coords: Vec<ProjectedCoord> = xs
+            .iter()
+            .zip(ys.iter())
+            .map(|(&x, &y)| ProjectedCoord::new(x as Real, y as Real))
+            .collect();
+        let out = self
+            .inner
+            .predict_batch(&coords)
+            .map_err(kriging_err_to_js)?;
+        let (prevalences, logit_values, variances, prevalence_variances) =
+            split_binomial_predictions(out);
+        let result = Object::new();
+        set_object_field(
+            &result,
+            "prevalences",
+            &Float64Array::from(prevalences.as_slice()).into(),
+        )?;
+        set_object_field(
+            &result,
+            "logitValues",
+            &Float64Array::from(logit_values.as_slice()).into(),
+        )?;
+        set_object_field(
+            &result,
+            "variances",
+            &Float64Array::from(variances.as_slice()).into(),
+        )?;
+        set_object_field(
+            &result,
+            "prevalenceVariances",
+            &Float64Array::from(prevalence_variances.as_slice()).into(),
+        )?;
+        Ok(result.into())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cross-validation
 // ---------------------------------------------------------------------------
 
@@ -1741,6 +1953,86 @@ pub fn wasm_k_fold_binomial(
     binomial_cv_result_to_js(residuals)
 }
 
+/// Leave-one-out CV over projected binomial kriging on planar `(x, y)` coordinates with
+/// optional 2-D geometric anisotropy. Pass `rangeRatio = 1.0` for isotropic. Returns the
+/// same dual-scale (logit + prevalence) residual buffers as
+/// [`leaveOneOutBinomial`](wasm_leave_one_out_binomial).
+#[wasm_bindgen(js_name = leaveOneOutBinomialProjected)]
+pub fn wasm_leave_one_out_binomial_projected(
+    xs: &[f64],
+    ys: &[f64],
+    successes: &[u32],
+    trials: &[u32],
+    major_angle_deg: f64,
+    range_ratio: f64,
+    variogram_type: &str,
+    nugget: f64,
+    sill: f64,
+    range: f64,
+    shape: Option<f64>,
+    prior_alpha: Option<f64>,
+    prior_beta: Option<f64>,
+) -> Result<JsValue, JsValue> {
+    if xs.len() != ys.len() || xs.len() != successes.len() || xs.len() != trials.len() {
+        return Err(coded_err(
+            "xs, ys, successes and trials must have the same length",
+            "mismatched_arrays",
+        ));
+    }
+    let coords: Vec<ProjectedCoord> = xs
+        .iter()
+        .zip(ys.iter())
+        .map(|(&x, &y)| ProjectedCoord::new(x as Real, y as Real))
+        .collect();
+    let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
+    let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
+        .map_err(kriging_err_to_js)?;
+    let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
+    let residuals =
+        leave_one_out_binomial_projected(&coords, successes, trials, model, anisotropy, prior)
+            .map_err(kriging_err_to_js)?;
+    binomial_cv_result_to_js(residuals)
+}
+
+/// K-fold CV over projected binomial kriging.
+#[wasm_bindgen(js_name = kFoldBinomialProjected)]
+pub fn wasm_k_fold_binomial_projected(
+    xs: &[f64],
+    ys: &[f64],
+    successes: &[u32],
+    trials: &[u32],
+    major_angle_deg: f64,
+    range_ratio: f64,
+    k: usize,
+    variogram_type: &str,
+    nugget: f64,
+    sill: f64,
+    range: f64,
+    shape: Option<f64>,
+    prior_alpha: Option<f64>,
+    prior_beta: Option<f64>,
+) -> Result<JsValue, JsValue> {
+    if xs.len() != ys.len() || xs.len() != successes.len() || xs.len() != trials.len() {
+        return Err(coded_err(
+            "xs, ys, successes and trials must have the same length",
+            "mismatched_arrays",
+        ));
+    }
+    let coords: Vec<ProjectedCoord> = xs
+        .iter()
+        .zip(ys.iter())
+        .map(|(&x, &y)| ProjectedCoord::new(x as Real, y as Real))
+        .collect();
+    let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
+    let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
+        .map_err(kriging_err_to_js)?;
+    let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
+    let residuals =
+        k_fold_binomial_projected(&coords, successes, trials, model, anisotropy, prior, k)
+            .map_err(kriging_err_to_js)?;
+    binomial_cv_result_to_js(residuals)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JsBinomialCvSummary {
@@ -2028,6 +2320,277 @@ pub fn wasm_conditional_simulate_binomial(
     binomial_simulation_to_js(result)
 }
 
+pub(super) fn binomial_many_simulation_to_js(
+    result: BinomialSimulationManyResult,
+) -> Result<JsValue, JsValue> {
+    let logit: Vec<f64> = result.logit_samples.into_iter().map(|v| v as f64).collect();
+    let prev: Vec<f64> = result
+        .prevalence_samples
+        .into_iter()
+        .map(|v| v as f64)
+        .collect();
+    let out = Object::new();
+    set_object_field(
+        &out,
+        "nRealizations",
+        &JsValue::from_f64(result.n_realizations as f64),
+    )?;
+    set_object_field(
+        &out,
+        "nTargets",
+        &JsValue::from_f64(result.n_targets as f64),
+    )?;
+    set_object_field(
+        &out,
+        "logitSamples",
+        &Float64Array::from(logit.as_slice()).into(),
+    )?;
+    set_object_field(
+        &out,
+        "prevalenceSamples",
+        &Float64Array::from(prev.as_slice()).into(),
+    )?;
+    Ok(out.into())
+}
+
+/// Multi-realization SGS using ordinary kriging. Returns a flat row-major `Float64Array` of
+/// length `nRealizations * targetLats.len()` where row `k` is identical to a single-call
+/// `conditionalSimulate(seed = baseSeed + k, …)`.
+#[wasm_bindgen(js_name = conditionalSimulateMany)]
+#[allow(clippy::too_many_arguments)]
+pub fn wasm_conditional_simulate_many(
+    conditioning_lats: &[f64],
+    conditioning_lons: &[f64],
+    conditioning_values: &[f64],
+    target_lats: &[f64],
+    target_lons: &[f64],
+    variogram_type: &str,
+    nugget: f64,
+    sill: f64,
+    range: f64,
+    shape: Option<f64>,
+    n_realizations: u32,
+    base_seed: u64,
+    target_order: Option<Vec<u32>>,
+) -> Result<JsValue, JsValue> {
+    if conditioning_values.len() != conditioning_lats.len() {
+        return Err(coded_err(
+            "conditioningValues must match conditioningLats/Lons length",
+            "mismatched_arrays",
+        ));
+    }
+    let cond_coords = to_coords(conditioning_lats, conditioning_lons)?;
+    let cond_values: Vec<Real> = conditioning_values.iter().map(|v| *v as Real).collect();
+    let targets = to_coords(target_lats, target_lons)?;
+    let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
+    let order = target_order.map(|v| v.into_iter().map(|x| x as usize).collect());
+    let samples = conditional_simulate_many(
+        &cond_coords,
+        &cond_values,
+        &targets,
+        model,
+        n_realizations as usize,
+        base_seed,
+        order,
+    )
+    .map_err(kriging_err_to_js)?;
+    let samples_f64: Vec<f64> = samples.into_iter().map(|v| v as f64).collect();
+    Ok(Float64Array::from(samples_f64.as_slice()).into())
+}
+
+/// Multi-realization SGS for binomial (count) data. Returns an object with
+/// `nRealizations`, `nTargets`, and flat row-major `logitSamples` / `prevalenceSamples`
+/// `Float64Array`s of length `nRealizations * nTargets`. Row `k` is identical to a
+/// single-call `conditionalSimulateBinomial(seed = baseSeed + k, …)`.
+#[wasm_bindgen(js_name = conditionalSimulateManyBinomial)]
+#[allow(clippy::too_many_arguments)]
+pub fn wasm_conditional_simulate_many_binomial(
+    conditioning_lats: &[f64],
+    conditioning_lons: &[f64],
+    successes: &[u32],
+    trials: &[u32],
+    target_lats: &[f64],
+    target_lons: &[f64],
+    variogram_type: &str,
+    nugget: f64,
+    sill: f64,
+    range: f64,
+    shape: Option<f64>,
+    prior_alpha: Option<f64>,
+    prior_beta: Option<f64>,
+    n_realizations: u32,
+    base_seed: u64,
+    target_order: Option<Vec<u32>>,
+) -> Result<JsValue, JsValue> {
+    if conditioning_lats.len() != conditioning_lons.len()
+        || conditioning_lats.len() != successes.len()
+        || conditioning_lats.len() != trials.len()
+    {
+        return Err(coded_err(
+            "conditioning arrays (lats, lons, successes, trials) must have the same length",
+            "mismatched_arrays",
+        ));
+    }
+    let cond_coords = to_coords(conditioning_lats, conditioning_lons)?;
+    let targets = to_coords(target_lats, target_lons)?;
+    let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
+    let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
+    let order = target_order.map(|v| v.into_iter().map(|x| x as usize).collect());
+    let result = conditional_simulate_many_binomial(
+        &cond_coords,
+        successes,
+        trials,
+        &targets,
+        model,
+        prior,
+        n_realizations as usize,
+        base_seed,
+        order,
+    )
+    .map_err(kriging_err_to_js)?;
+    binomial_many_simulation_to_js(result)
+}
+
+/// Sequential Gaussian simulation for binomial (count) data on projected (planar)
+/// coordinates with optional 2-D geometric anisotropy. Same shape as
+/// [`conditionalSimulateBinomial`](wasm_conditional_simulate_binomial), but operating
+/// on `(x, y)` rather than `(lat, lon)`.
+#[wasm_bindgen(js_name = conditionalSimulateBinomialProjected)]
+#[allow(clippy::too_many_arguments)]
+pub fn wasm_conditional_simulate_binomial_projected(
+    conditioning_xs: &[f64],
+    conditioning_ys: &[f64],
+    successes: &[u32],
+    trials: &[u32],
+    target_xs: &[f64],
+    target_ys: &[f64],
+    major_angle_deg: f64,
+    range_ratio: f64,
+    variogram_type: &str,
+    nugget: f64,
+    sill: f64,
+    range: f64,
+    shape: Option<f64>,
+    prior_alpha: Option<f64>,
+    prior_beta: Option<f64>,
+    seed: u64,
+    target_order: Option<Vec<u32>>,
+) -> Result<JsValue, JsValue> {
+    if conditioning_xs.len() != conditioning_ys.len()
+        || conditioning_xs.len() != successes.len()
+        || conditioning_xs.len() != trials.len()
+    {
+        return Err(coded_err(
+            "conditioning arrays (xs, ys, successes, trials) must have the same length",
+            "mismatched_arrays",
+        ));
+    }
+    if target_xs.len() != target_ys.len() {
+        return Err(coded_err(
+            "targetXs and targetYs must have the same length",
+            "mismatched_arrays",
+        ));
+    }
+    let cond_coords: Vec<ProjectedCoord> = conditioning_xs
+        .iter()
+        .zip(conditioning_ys.iter())
+        .map(|(&x, &y)| ProjectedCoord::new(x as Real, y as Real))
+        .collect();
+    let targets: Vec<ProjectedCoord> = target_xs
+        .iter()
+        .zip(target_ys.iter())
+        .map(|(&x, &y)| ProjectedCoord::new(x as Real, y as Real))
+        .collect();
+    let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
+    let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
+        .map_err(kriging_err_to_js)?;
+    let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
+    let options = parse_simulation_options(seed, target_order);
+    let result = conditional_simulate_binomial_projected(
+        &cond_coords,
+        successes,
+        trials,
+        &targets,
+        model,
+        anisotropy,
+        prior,
+        options,
+    )
+    .map_err(kriging_err_to_js)?;
+    binomial_simulation_to_js(result)
+}
+
+/// Multi-realization SGS for projected binomial (count) data. See
+/// [`conditionalSimulateManyBinomial`](wasm_conditional_simulate_many_binomial) for
+/// the result shape; differs only in using `(x, y)` coordinates with 2-D anisotropy.
+#[wasm_bindgen(js_name = conditionalSimulateManyBinomialProjected)]
+#[allow(clippy::too_many_arguments)]
+pub fn wasm_conditional_simulate_many_binomial_projected(
+    conditioning_xs: &[f64],
+    conditioning_ys: &[f64],
+    successes: &[u32],
+    trials: &[u32],
+    target_xs: &[f64],
+    target_ys: &[f64],
+    major_angle_deg: f64,
+    range_ratio: f64,
+    variogram_type: &str,
+    nugget: f64,
+    sill: f64,
+    range: f64,
+    shape: Option<f64>,
+    prior_alpha: Option<f64>,
+    prior_beta: Option<f64>,
+    n_realizations: u32,
+    base_seed: u64,
+    target_order: Option<Vec<u32>>,
+) -> Result<JsValue, JsValue> {
+    if conditioning_xs.len() != conditioning_ys.len()
+        || conditioning_xs.len() != successes.len()
+        || conditioning_xs.len() != trials.len()
+    {
+        return Err(coded_err(
+            "conditioning arrays (xs, ys, successes, trials) must have the same length",
+            "mismatched_arrays",
+        ));
+    }
+    if target_xs.len() != target_ys.len() {
+        return Err(coded_err(
+            "targetXs and targetYs must have the same length",
+            "mismatched_arrays",
+        ));
+    }
+    let cond_coords: Vec<ProjectedCoord> = conditioning_xs
+        .iter()
+        .zip(conditioning_ys.iter())
+        .map(|(&x, &y)| ProjectedCoord::new(x as Real, y as Real))
+        .collect();
+    let targets: Vec<ProjectedCoord> = target_xs
+        .iter()
+        .zip(target_ys.iter())
+        .map(|(&x, &y)| ProjectedCoord::new(x as Real, y as Real))
+        .collect();
+    let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
+    let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
+        .map_err(kriging_err_to_js)?;
+    let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
+    let order = target_order.map(|v| v.into_iter().map(|x| x as usize).collect());
+    let result = conditional_simulate_many_binomial_projected(
+        &cond_coords,
+        successes,
+        trials,
+        &targets,
+        model,
+        anisotropy,
+        prior,
+        n_realizations as usize,
+        base_seed,
+        order,
+    )
+    .map_err(kriging_err_to_js)?;
+    binomial_many_simulation_to_js(result)
+}
+
 // ---------------------------------------------------------------------------
 // Nested variograms
 // ---------------------------------------------------------------------------
@@ -2090,4 +2653,121 @@ pub fn wasm_evaluate_nested_variogram(
         &Float64Array::from(covariances.as_slice()).into(),
     )?;
     Ok(result.into())
+}
+
+// ---------------------------------------------------------------------------
+// Polygon aggregation over ensembles
+// ---------------------------------------------------------------------------
+
+fn summary_to_js(summary: &PolygonAggregationSummary) -> Result<JsValue, JsValue> {
+    let obj = Object::new();
+    set_object_field(
+        &obj,
+        "nRealizations",
+        &JsValue::from_f64(summary.n_realizations as f64),
+    )?;
+    set_object_field(
+        &obj,
+        "totalWeight",
+        &JsValue::from_f64(summary.total_weight as f64),
+    )?;
+    set_object_field(&obj, "mean", &JsValue::from_f64(summary.mean as f64))?;
+    match summary.variance {
+        Some(v) => set_object_field(&obj, "variance", &JsValue::from_f64(v as f64))?,
+        None => set_object_field(&obj, "variance", &JsValue::NULL)?,
+    }
+    let probs: Vec<f64> = summary.quantiles.iter().map(|(p, _)| *p as f64).collect();
+    let vals: Vec<f64> = summary.quantiles.iter().map(|(_, v)| *v as f64).collect();
+    set_object_field(
+        &obj,
+        "quantileProbabilities",
+        &Float64Array::from(probs.as_slice()).into(),
+    )?;
+    set_object_field(
+        &obj,
+        "quantileValues",
+        &Float64Array::from(vals.as_slice()).into(),
+    )?;
+    Ok(obj.into())
+}
+
+/// Aggregate one or more polygons over a flat row-major ensemble buffer of
+/// shape `nRealizations × nTargets`.
+///
+/// Polygons are passed in CSR-style: `polygonIndices` and `polygonWeights` are
+/// the concatenated cell lists, and `polygonOffsets` (length
+/// `nPolygons + 1`) marks the start of each polygon's slice. Each polygon must
+/// be non-empty, indices must lie in `[0, nTargets)`, weights must be finite
+/// and non-negative, and at least one weight per polygon must be positive.
+///
+/// Returns a JS array of summary objects (one per polygon) with fields:
+/// `{ nRealizations, totalWeight, mean, variance | null,
+///    quantileProbabilities, quantileValues }`. Quantiles are reported in the
+/// order supplied via `quantiles`.
+#[wasm_bindgen(js_name = aggregatePolygonsOverEnsemble)]
+#[allow(clippy::too_many_arguments)]
+pub fn wasm_aggregate_polygons_over_ensemble(
+    samples: &[f64],
+    n_realizations: u32,
+    n_targets: u32,
+    polygon_indices: &[u32],
+    polygon_weights: &[f64],
+    polygon_offsets: &[u32],
+    quantiles: &[f64],
+) -> Result<JsValue, JsValue> {
+    if polygon_offsets.is_empty() {
+        return Err(coded_err(
+            "polygonOffsets must contain at least [0]",
+            "invalid_input",
+        ));
+    }
+    if polygon_offsets[0] != 0 {
+        return Err(coded_err("polygonOffsets[0] must be 0", "invalid_input"));
+    }
+    let total = polygon_offsets[polygon_offsets.len() - 1] as usize;
+    if total != polygon_indices.len() || total != polygon_weights.len() {
+        return Err(coded_err(
+            "polygonIndices and polygonWeights must have length polygonOffsets[last]",
+            "mismatched_arrays",
+        ));
+    }
+    for w in polygon_offsets.windows(2) {
+        if w[1] < w[0] {
+            return Err(coded_err(
+                "polygonOffsets must be non-decreasing",
+                "invalid_input",
+            ));
+        }
+    }
+
+    // Materialize Real-typed buffers once, then build slice tuples per polygon.
+    let samples_real: Vec<Real> = samples.iter().map(|v| *v as Real).collect();
+    let weights_real: Vec<Real> = polygon_weights.iter().map(|v| *v as Real).collect();
+    let indices_usize: Vec<usize> = polygon_indices.iter().map(|i| *i as usize).collect();
+    let probs_real: Vec<Real> = quantiles.iter().map(|v| *v as Real).collect();
+
+    let n_polys = polygon_offsets.len() - 1;
+    let polys: Vec<(&[usize], &[Real])> = (0..n_polys)
+        .map(|p| {
+            let lo = polygon_offsets[p] as usize;
+            let hi = polygon_offsets[p + 1] as usize;
+            (&indices_usize[lo..hi], &weights_real[lo..hi])
+        })
+        .collect();
+
+    let summaries = polygon_weighted_summaries_batch(
+        &samples_real,
+        n_realizations as usize,
+        n_targets as usize,
+        &polys,
+        &probs_real,
+    )
+    .map_err(kriging_err_to_js)?;
+
+    let arr = js_sys::Array::new_with_length(summaries.len() as u32);
+    for (i, s) in summaries.iter().enumerate() {
+        let val = summary_to_js(s)?;
+        arr.set(i as u32, val);
+    }
+    Ok(arr.into())
 }

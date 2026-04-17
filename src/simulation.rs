@@ -45,7 +45,10 @@ use crate::kriging::binomial::{BinomialKrigingModel, BinomialObservation, Binomi
 use crate::kriging::ordinary::OrdinaryKrigingModel;
 use crate::kriging::simple::SimpleKrigingModel;
 use crate::kriging::universal::{UniversalKrigingModel, UniversalTrend};
-use crate::projected::{Anisotropy2D, ProjectedCoord, ProjectedDataset, ProjectedKrigingModel};
+use crate::projected::{
+    Anisotropy2D, BinomialProjectedKrigingModel, ProjectedBinomialObservation, ProjectedCoord,
+    ProjectedDataset, ProjectedKrigingModel,
+};
 use crate::spacetime::coord::SpaceTimeCoord;
 use crate::spacetime::dataset::SpaceTimeDataset;
 use crate::spacetime::kriging::binomial::{
@@ -145,6 +148,24 @@ pub struct BinomialSimulationResult {
     /// Simulated logit values (unbounded).
     pub logit_samples: Vec<Real>,
     /// Simulated prevalence values in (0, 1).
+    pub prevalence_samples: Vec<Real>,
+}
+
+/// Result of a multi-realization binomial conditional simulation.
+///
+/// Each field is a flat row-major buffer of length `n_realizations * n_targets`. Row `k`
+/// (entries `[k * n_targets .. (k + 1) * n_targets]`) holds realization `k` in the
+/// **original** target input order. By construction
+/// `prevalence_samples[i] = logistic(logit_samples[i])` element-wise.
+#[derive(Debug, Clone)]
+pub struct BinomialSimulationManyResult {
+    /// Number of independent realizations stacked into the buffers.
+    pub n_realizations: usize,
+    /// Number of target locations per realization.
+    pub n_targets: usize,
+    /// Simulated logit values, row-major `[n_realizations * n_targets]`.
+    pub logit_samples: Vec<Real>,
+    /// Simulated prevalence values, row-major `[n_realizations * n_targets]`.
     pub prevalence_samples: Vec<Real>,
 }
 
@@ -377,6 +398,162 @@ pub fn conditional_simulate_projected(
     }
 
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Binomial projected SGS (dual-scale, planar + anisotropy)
+// ---------------------------------------------------------------------------
+
+/// Sequential Gaussian simulation for binomial (count) data on **projected**
+/// (planar) coordinates with optional 2-D geometric anisotropy.
+///
+/// Mirrors [`conditional_simulate_binomial`] but runs the kriging step on a
+/// [`BinomialProjectedKrigingModel`]. Returns dual-scale logit and prevalence
+/// samples in the original target order.
+#[allow(clippy::too_many_arguments)]
+pub fn conditional_simulate_binomial_projected(
+    conditioning_coords: &[ProjectedCoord],
+    successes: &[u32],
+    trials: &[u32],
+    targets: &[ProjectedCoord],
+    variogram: VariogramModel,
+    anisotropy: Anisotropy2D,
+    prior: BinomialPrior,
+    options: SimulationOptions,
+) -> Result<BinomialSimulationResult, KrigingError> {
+    if conditioning_coords.len() != successes.len() || successes.len() != trials.len() {
+        return Err(KrigingError::DimensionMismatch(format!(
+            "conditioning arrays must have equal length (coords={}, successes={}, trials={})",
+            conditioning_coords.len(),
+            successes.len(),
+            trials.len()
+        )));
+    }
+    let mut pool_coords: Vec<ProjectedCoord> = Vec::with_capacity(conditioning_coords.len());
+    let mut pool_logits: Vec<Real> = Vec::with_capacity(conditioning_coords.len());
+    for i in 0..conditioning_coords.len() {
+        if trials[i] == 0 {
+            continue;
+        }
+        let obs =
+            ProjectedBinomialObservation::new(conditioning_coords[i], successes[i], trials[i])?;
+        pool_coords.push(obs.coord());
+        pool_logits.push(obs.smoothed_logit_with_prior(prior));
+    }
+    if pool_coords.len() < 2 {
+        return Err(KrigingError::InsufficientData(2));
+    }
+
+    let n_targets = targets.len();
+    let order = resolve_target_order(n_targets, options.target_order)?;
+    let mut rng = Rng::new(options.seed);
+    let mut logit_out = vec![0.0 as Real; n_targets];
+    let mut prev_out = vec![0.0 as Real; n_targets];
+
+    for &target_idx in &order {
+        let model = BinomialProjectedKrigingModel::from_precomputed_logits(
+            pool_coords.clone(),
+            pool_logits.clone(),
+            variogram,
+            anisotropy,
+        )?;
+        let pred = model.predict(targets[target_idx])?;
+        let sigma = pred.variance.max(0.0).sqrt();
+        let logit_sample = pred.logit_value + sigma * rng.next_standard_normal();
+        let prevalence_sample = logistic(logit_sample);
+        logit_out[target_idx] = logit_sample;
+        prev_out[target_idx] = prevalence_sample;
+        pool_coords.push(targets[target_idx]);
+        pool_logits.push(logit_sample);
+    }
+
+    Ok(BinomialSimulationResult {
+        logit_samples: logit_out,
+        prevalence_samples: prev_out,
+    })
+}
+
+/// Multi-realization SGS for binomial data on projected coordinates. Mirrors
+/// [`conditional_simulate_many_binomial`]: EB-smoothed logits are computed
+/// once from the conditioning pool and reused across realizations. The k-th
+/// row of either output buffer is bit-identical to a single call to
+/// [`conditional_simulate_binomial_projected`] with `seed = base_seed + k`.
+#[allow(clippy::too_many_arguments)]
+pub fn conditional_simulate_many_binomial_projected(
+    conditioning_coords: &[ProjectedCoord],
+    successes: &[u32],
+    trials: &[u32],
+    targets: &[ProjectedCoord],
+    variogram: VariogramModel,
+    anisotropy: Anisotropy2D,
+    prior: BinomialPrior,
+    n_realizations: usize,
+    base_seed: u64,
+    target_order: Option<Vec<usize>>,
+) -> Result<BinomialSimulationManyResult, KrigingError> {
+    validate_n_realizations(n_realizations)?;
+    if conditioning_coords.len() != successes.len() || successes.len() != trials.len() {
+        return Err(KrigingError::DimensionMismatch(format!(
+            "conditioning arrays must have equal length (coords={}, successes={}, trials={})",
+            conditioning_coords.len(),
+            successes.len(),
+            trials.len()
+        )));
+    }
+    let mut initial_coords: Vec<ProjectedCoord> = Vec::with_capacity(conditioning_coords.len());
+    let mut initial_logits: Vec<Real> = Vec::with_capacity(conditioning_coords.len());
+    for i in 0..conditioning_coords.len() {
+        if trials[i] == 0 {
+            continue;
+        }
+        let obs =
+            ProjectedBinomialObservation::new(conditioning_coords[i], successes[i], trials[i])?;
+        initial_coords.push(obs.coord());
+        initial_logits.push(obs.smoothed_logit_with_prior(prior));
+    }
+    if initial_coords.len() < 2 {
+        return Err(KrigingError::InsufficientData(2));
+    }
+
+    let n_targets = targets.len();
+    let order = resolve_target_order(n_targets, target_order)?;
+    let initial_n = initial_coords.len();
+
+    let mut pool_coords = initial_coords;
+    let mut pool_logits = initial_logits;
+    let mut logit_out = vec![0.0 as Real; n_realizations * n_targets];
+    let mut prev_out = vec![0.0 as Real; n_realizations * n_targets];
+
+    for k in 0..n_realizations {
+        let seed = base_seed.wrapping_add(k as u64);
+        let mut rng = Rng::new(seed);
+        let row_off = k * n_targets;
+        for &target_idx in &order {
+            let model = BinomialProjectedKrigingModel::from_precomputed_logits(
+                pool_coords.clone(),
+                pool_logits.clone(),
+                variogram,
+                anisotropy,
+            )?;
+            let pred = model.predict(targets[target_idx])?;
+            let sigma = pred.variance.max(0.0).sqrt();
+            let logit_sample = pred.logit_value + sigma * rng.next_standard_normal();
+            let prevalence_sample = logistic(logit_sample);
+            logit_out[row_off + target_idx] = logit_sample;
+            prev_out[row_off + target_idx] = prevalence_sample;
+            pool_coords.push(targets[target_idx]);
+            pool_logits.push(logit_sample);
+        }
+        pool_coords.truncate(initial_n);
+        pool_logits.truncate(initial_n);
+    }
+
+    Ok(BinomialSimulationManyResult {
+        n_realizations,
+        n_targets,
+        logit_samples: logit_out,
+        prevalence_samples: prev_out,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -653,6 +830,281 @@ pub fn conditional_simulate_spacetime_binomial<M: SpatialMetric>(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Multi-realization variants
+// ---------------------------------------------------------------------------
+//
+// These mirror the single-realization functions but draw `n_realizations`
+// independent samples in one Rust call. Each realization uses
+// `Rng::new(base_seed.wrapping_add(k as u64))` so the k-th realization is
+// **bit-identical** to calling the single-realization function with that seed.
+//
+// The conditioning pool is reset to its original contents between realizations
+// (the per-target factorization itself cannot be amortized across realizations
+// because every target appends a new sample to the pool). Doing the loop in
+// Rust avoids per-realization input validation and — for the WASM bridge —
+// per-realization JS<->WASM boundary overhead. The binomial variants
+// additionally pre-compute the EB-smoothed initial logit pool exactly once
+// instead of once per realization.
+
+fn validate_n_realizations(n: usize) -> Result<(), KrigingError> {
+    if n == 0 {
+        return Err(KrigingError::InvalidInput(
+            "n_realizations must be >= 1".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Multi-realization SGS using ordinary kriging.
+///
+/// Returns a flat row-major `Vec<Real>` of length `n_realizations * n_targets`. The k-th
+/// row is identical to calling [`conditional_simulate`] with `seed = base_seed + k`.
+pub fn conditional_simulate_many(
+    conditioning_coords: &[GeoCoord],
+    conditioning_values: &[Real],
+    targets: &[GeoCoord],
+    variogram: VariogramModel,
+    n_realizations: usize,
+    base_seed: u64,
+    target_order: Option<Vec<usize>>,
+) -> Result<Vec<Real>, KrigingError> {
+    validate_n_realizations(n_realizations)?;
+    validate_continuous_inputs(conditioning_coords, conditioning_values)?;
+    let n_targets = targets.len();
+    let order = resolve_target_order(n_targets, target_order)?;
+    let initial_n = conditioning_coords.len();
+
+    let mut all_coords = conditioning_coords.to_vec();
+    let mut all_values = conditioning_values.to_vec();
+    let mut out = vec![0.0 as Real; n_realizations * n_targets];
+
+    for k in 0..n_realizations {
+        let seed = base_seed.wrapping_add(k as u64);
+        let mut rng = Rng::new(seed);
+        let row_off = k * n_targets;
+        for &target_idx in &order {
+            let dataset = GeoDataset::new(all_coords.clone(), all_values.clone())?;
+            let model = OrdinaryKrigingModel::new(dataset, variogram)?;
+            let pred = model.predict(targets[target_idx])?;
+            let sigma = pred.variance.max(0.0).sqrt();
+            let sampled = pred.value + sigma * rng.next_standard_normal();
+            out[row_off + target_idx] = sampled;
+            all_coords.push(targets[target_idx]);
+            all_values.push(sampled);
+        }
+        all_coords.truncate(initial_n);
+        all_values.truncate(initial_n);
+    }
+    Ok(out)
+}
+
+/// Multi-realization SGS using ordinary space-time kriging. Same row-major contract as
+/// [`conditional_simulate_many`].
+#[allow(clippy::too_many_arguments)]
+pub fn conditional_simulate_many_spacetime<M: SpatialMetric>(
+    metric: M,
+    conditioning_coords: &[SpaceTimeCoord<M::Coord>],
+    conditioning_values: &[Real],
+    targets: &[SpaceTimeCoord<M::Coord>],
+    variogram: SpaceTimeVariogram,
+    n_realizations: usize,
+    base_seed: u64,
+    target_order: Option<Vec<usize>>,
+) -> Result<Vec<Real>, KrigingError> {
+    validate_n_realizations(n_realizations)?;
+    validate_continuous_inputs(conditioning_coords, conditioning_values)?;
+    let n_targets = targets.len();
+    let order = resolve_target_order(n_targets, target_order)?;
+    let initial_n = conditioning_coords.len();
+
+    let mut all_coords = conditioning_coords.to_vec();
+    let mut all_values = conditioning_values.to_vec();
+    let mut out = vec![0.0 as Real; n_realizations * n_targets];
+
+    for k in 0..n_realizations {
+        let seed = base_seed.wrapping_add(k as u64);
+        let mut rng = Rng::new(seed);
+        let row_off = k * n_targets;
+        for &target_idx in &order {
+            let dataset = SpaceTimeDataset::new(all_coords.clone(), all_values.clone())?;
+            let model = SpaceTimeOrdinaryKrigingModel::new(metric, dataset, variogram)?;
+            let pred = model.predict(targets[target_idx])?;
+            let sigma = pred.variance.max(0.0).sqrt();
+            let sampled = pred.value + sigma * rng.next_standard_normal();
+            out[row_off + target_idx] = sampled;
+            all_coords.push(targets[target_idx]);
+            all_values.push(sampled);
+        }
+        all_coords.truncate(initial_n);
+        all_values.truncate(initial_n);
+    }
+    Ok(out)
+}
+
+/// Multi-realization SGS for binomial (count) data.
+///
+/// EB-smoothed logits are computed **once** from the initial conditioning pool and reused
+/// across realizations. Returns dual-scale row-major buffers; the k-th row of either field
+/// is bit-identical to calling [`conditional_simulate_binomial`] with `seed = base_seed + k`.
+#[allow(clippy::too_many_arguments)]
+pub fn conditional_simulate_many_binomial(
+    conditioning_coords: &[GeoCoord],
+    successes: &[u32],
+    trials: &[u32],
+    targets: &[GeoCoord],
+    variogram: VariogramModel,
+    prior: BinomialPrior,
+    n_realizations: usize,
+    base_seed: u64,
+    target_order: Option<Vec<usize>>,
+) -> Result<BinomialSimulationManyResult, KrigingError> {
+    validate_n_realizations(n_realizations)?;
+    if conditioning_coords.len() != successes.len() || successes.len() != trials.len() {
+        return Err(KrigingError::DimensionMismatch(format!(
+            "conditioning arrays must have equal length (coords={}, successes={}, trials={})",
+            conditioning_coords.len(),
+            successes.len(),
+            trials.len()
+        )));
+    }
+
+    let mut initial_coords: Vec<GeoCoord> = Vec::with_capacity(conditioning_coords.len());
+    let mut initial_logits: Vec<Real> = Vec::with_capacity(conditioning_coords.len());
+    for i in 0..conditioning_coords.len() {
+        if trials[i] == 0 {
+            continue;
+        }
+        let obs = BinomialObservation::new(conditioning_coords[i], successes[i], trials[i])?;
+        initial_coords.push(obs.coord());
+        initial_logits.push(obs.smoothed_logit_with_prior(prior));
+    }
+    if initial_coords.len() < 2 {
+        return Err(KrigingError::InsufficientData(2));
+    }
+
+    let n_targets = targets.len();
+    let order = resolve_target_order(n_targets, target_order)?;
+    let initial_n = initial_coords.len();
+
+    let mut pool_coords = initial_coords;
+    let mut pool_logits = initial_logits;
+    let mut logit_out = vec![0.0 as Real; n_realizations * n_targets];
+    let mut prev_out = vec![0.0 as Real; n_realizations * n_targets];
+
+    for k in 0..n_realizations {
+        let seed = base_seed.wrapping_add(k as u64);
+        let mut rng = Rng::new(seed);
+        let row_off = k * n_targets;
+        for &target_idx in &order {
+            let model = BinomialKrigingModel::from_precomputed_logits(
+                pool_coords.clone(),
+                pool_logits.clone(),
+                variogram,
+            )?;
+            let pred = model.predict(targets[target_idx])?;
+            let sigma = pred.variance.max(0.0).sqrt();
+            let logit_sample = pred.logit_value + sigma * rng.next_standard_normal();
+            let prevalence_sample = logistic(logit_sample);
+            logit_out[row_off + target_idx] = logit_sample;
+            prev_out[row_off + target_idx] = prevalence_sample;
+            pool_coords.push(targets[target_idx]);
+            pool_logits.push(logit_sample);
+        }
+        pool_coords.truncate(initial_n);
+        pool_logits.truncate(initial_n);
+    }
+
+    Ok(BinomialSimulationManyResult {
+        n_realizations,
+        n_targets,
+        logit_samples: logit_out,
+        prevalence_samples: prev_out,
+    })
+}
+
+/// Multi-realization SGS for space-time binomial data. See
+/// [`conditional_simulate_many_binomial`] for the row-major output contract.
+#[allow(clippy::too_many_arguments)]
+pub fn conditional_simulate_many_spacetime_binomial<M: SpatialMetric>(
+    metric: M,
+    conditioning_coords: &[SpaceTimeCoord<M::Coord>],
+    successes: &[u32],
+    trials: &[u32],
+    targets: &[SpaceTimeCoord<M::Coord>],
+    variogram: SpaceTimeVariogram,
+    prior: BinomialPrior,
+    n_realizations: usize,
+    base_seed: u64,
+    target_order: Option<Vec<usize>>,
+) -> Result<BinomialSimulationManyResult, KrigingError> {
+    validate_n_realizations(n_realizations)?;
+    if conditioning_coords.len() != successes.len() || successes.len() != trials.len() {
+        return Err(KrigingError::DimensionMismatch(format!(
+            "conditioning arrays must have equal length (coords={}, successes={}, trials={})",
+            conditioning_coords.len(),
+            successes.len(),
+            trials.len()
+        )));
+    }
+
+    let mut initial_coords: Vec<SpaceTimeCoord<M::Coord>> =
+        Vec::with_capacity(conditioning_coords.len());
+    let mut initial_logits: Vec<Real> = Vec::with_capacity(conditioning_coords.len());
+    for i in 0..conditioning_coords.len() {
+        if trials[i] == 0 {
+            continue;
+        }
+        let obs =
+            SpaceTimeBinomialObservation::new(conditioning_coords[i], successes[i], trials[i])?;
+        initial_coords.push(obs.coord());
+        initial_logits.push(obs.smoothed_logit_with_prior(prior));
+    }
+    if initial_coords.len() < 2 {
+        return Err(KrigingError::InsufficientData(2));
+    }
+
+    let n_targets = targets.len();
+    let order = resolve_target_order(n_targets, target_order)?;
+    let initial_n = initial_coords.len();
+
+    let mut pool_coords = initial_coords;
+    let mut pool_logits = initial_logits;
+    let mut logit_out = vec![0.0 as Real; n_realizations * n_targets];
+    let mut prev_out = vec![0.0 as Real; n_realizations * n_targets];
+
+    for k in 0..n_realizations {
+        let seed = base_seed.wrapping_add(k as u64);
+        let mut rng = Rng::new(seed);
+        let row_off = k * n_targets;
+        for &target_idx in &order {
+            let model = SpaceTimeBinomialKrigingModel::from_precomputed_logits(
+                metric,
+                pool_coords.clone(),
+                pool_logits.clone(),
+                variogram,
+            )?;
+            let pred = model.predict(targets[target_idx])?;
+            let sigma = pred.variance.max(0.0).sqrt();
+            let logit_sample = pred.logit_value + sigma * rng.next_standard_normal();
+            let prevalence_sample = logistic(logit_sample);
+            logit_out[row_off + target_idx] = logit_sample;
+            prev_out[row_off + target_idx] = prevalence_sample;
+            pool_coords.push(targets[target_idx]);
+            pool_logits.push(logit_sample);
+        }
+        pool_coords.truncate(initial_n);
+        pool_logits.truncate(initial_n);
+    }
+
+    Ok(BinomialSimulationManyResult {
+        n_realizations,
+        n_targets,
+        logit_samples: logit_out,
+        prevalence_samples: prev_out,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -864,6 +1316,98 @@ mod tests {
         assert_eq!(a, b);
         for x in &a {
             assert!(x.is_finite());
+        }
+    }
+
+    // ---- Binomial projected -----------------------------------------------
+
+    fn binomial_projected_setup() -> (Vec<ProjectedCoord>, Vec<u32>, Vec<u32>, VariogramModel) {
+        let coords = vec![
+            ProjectedCoord::new(0.0, 0.0),
+            ProjectedCoord::new(0.0, 1.0),
+            ProjectedCoord::new(1.0, 0.0),
+            ProjectedCoord::new(1.0, 1.0),
+        ];
+        let successes = vec![3, 7, 4, 9];
+        let trials = vec![10, 12, 9, 15];
+        let vg = VariogramModel::new(0.1, 1.0, 1.5, VariogramType::Exponential).unwrap();
+        (coords, successes, trials, vg)
+    }
+
+    #[test]
+    fn binomial_projected_simulation_is_deterministic_for_same_seed() {
+        let (coords, successes, trials, vg) = binomial_projected_setup();
+        let targets = vec![ProjectedCoord::new(0.5, 0.5)];
+        let a = conditional_simulate_binomial_projected(
+            &coords,
+            &successes,
+            &trials,
+            &targets,
+            vg,
+            Anisotropy2D::isotropic(),
+            BinomialPrior::default(),
+            SimulationOptions::new(11),
+        )
+        .unwrap();
+        let b = conditional_simulate_binomial_projected(
+            &coords,
+            &successes,
+            &trials,
+            &targets,
+            vg,
+            Anisotropy2D::isotropic(),
+            BinomialPrior::default(),
+            SimulationOptions::new(11),
+        )
+        .unwrap();
+        assert_eq!(a.logit_samples, b.logit_samples);
+        assert_eq!(a.prevalence_samples, b.prevalence_samples);
+        for p in &a.prevalence_samples {
+            assert!(*p > 0.0 && *p < 1.0);
+        }
+    }
+
+    #[test]
+    fn binomial_projected_many_matches_seeded_singles() {
+        let (coords, successes, trials, vg) = binomial_projected_setup();
+        let targets = vec![
+            ProjectedCoord::new(0.25, 0.25),
+            ProjectedCoord::new(0.75, 0.5),
+        ];
+        let n_real = 3usize;
+        let base = 100u64;
+        let many = conditional_simulate_many_binomial_projected(
+            &coords,
+            &successes,
+            &trials,
+            &targets,
+            vg,
+            Anisotropy2D::isotropic(),
+            BinomialPrior::default(),
+            n_real,
+            base,
+            None,
+        )
+        .unwrap();
+        assert_eq!(many.n_realizations, n_real);
+        assert_eq!(many.n_targets, targets.len());
+        for k in 0..n_real {
+            let one = conditional_simulate_binomial_projected(
+                &coords,
+                &successes,
+                &trials,
+                &targets,
+                vg,
+                Anisotropy2D::isotropic(),
+                BinomialPrior::default(),
+                SimulationOptions::new(base + k as u64),
+            )
+            .unwrap();
+            for j in 0..targets.len() {
+                let off = k * targets.len() + j;
+                assert!((many.logit_samples[off] - one.logit_samples[j]).abs() < 1e-9);
+                assert!((many.prevalence_samples[off] - one.prevalence_samples[j]).abs() < 1e-9);
+            }
         }
     }
 
@@ -1324,5 +1868,191 @@ mod tests {
             SimulationOptions::new(1),
         );
         assert!(matches!(r, Err(KrigingError::InsufficientData(_))));
+    }
+
+    // ---- Multi-realization variants ----------------------------------------
+
+    /// Tight contract: the k-th row of `_many` MUST equal a fresh single-realization call
+    /// using `seed = base_seed + k`. This is the primary correctness guarantee for the
+    /// shared-input path.
+    #[test]
+    fn many_ordinary_matches_per_realization_single_call() {
+        let (c, v, vg) = setup();
+        let targets = vec![
+            GeoCoord::try_new(0.5, 0.5).unwrap(),
+            GeoCoord::try_new(0.25, 0.75).unwrap(),
+            GeoCoord::try_new(0.75, 0.25).unwrap(),
+        ];
+        let n_real = 4usize;
+        let base_seed = 100u64;
+        let many = conditional_simulate_many(&c, &v, &targets, vg, n_real, base_seed, None)
+            .expect("many ordinary call");
+        assert_eq!(many.len(), n_real * targets.len());
+        for k in 0..n_real {
+            let one = conditional_simulate(
+                &c,
+                &v,
+                &targets,
+                vg,
+                SimulationOptions::new(base_seed + k as u64),
+            )
+            .unwrap();
+            let row = &many[k * targets.len()..(k + 1) * targets.len()];
+            assert_eq!(
+                row,
+                one.as_slice(),
+                "row {k} must match per-seed single call"
+            );
+        }
+    }
+
+    #[test]
+    fn many_ordinary_rejects_zero_realizations() {
+        let (c, v, vg) = setup();
+        let targets = vec![GeoCoord::try_new(0.5, 0.5).unwrap()];
+        let r = conditional_simulate_many(&c, &v, &targets, vg, 0, 0, None);
+        assert!(matches!(r, Err(KrigingError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn many_binomial_matches_per_realization_single_call() {
+        let (c, s, t, vg) = binomial_setup();
+        let targets = vec![
+            GeoCoord::try_new(0.5, 0.5).unwrap(),
+            GeoCoord::try_new(0.25, 0.75).unwrap(),
+        ];
+        let prior = BinomialPrior::default();
+        let n_real = 3usize;
+        let base_seed = 555u64;
+        let many = conditional_simulate_many_binomial(
+            &c, &s, &t, &targets, vg, prior, n_real, base_seed, None,
+        )
+        .expect("many binomial call");
+        assert_eq!(many.n_realizations, n_real);
+        assert_eq!(many.n_targets, targets.len());
+        assert_eq!(many.logit_samples.len(), n_real * targets.len());
+        assert_eq!(many.prevalence_samples.len(), n_real * targets.len());
+        for k in 0..n_real {
+            let one = conditional_simulate_binomial(
+                &c,
+                &s,
+                &t,
+                &targets,
+                vg,
+                prior,
+                SimulationOptions::new(base_seed + k as u64),
+            )
+            .unwrap();
+            let lo = k * targets.len();
+            let hi = lo + targets.len();
+            assert_eq!(
+                &many.logit_samples[lo..hi],
+                one.logit_samples.as_slice(),
+                "logit row {k}"
+            );
+            assert_eq!(
+                &many.prevalence_samples[lo..hi],
+                one.prevalence_samples.as_slice(),
+                "prevalence row {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn many_binomial_drops_zero_trial_stations() {
+        let (mut c, mut s, mut t, vg) = binomial_setup();
+        c.insert(2, GeoCoord::try_new(0.5, 0.5).unwrap());
+        s.insert(2, 0);
+        t.insert(2, 0);
+        let targets = vec![GeoCoord::try_new(0.75, 0.25).unwrap()];
+        let prior = BinomialPrior::default();
+        let with_zero =
+            conditional_simulate_many_binomial(&c, &s, &t, &targets, vg, prior, 2, 9, None)
+                .unwrap();
+        let (c2, s2, t2, _) = binomial_setup();
+        let without =
+            conditional_simulate_many_binomial(&c2, &s2, &t2, &targets, vg, prior, 2, 9, None)
+                .unwrap();
+        assert_eq!(with_zero.logit_samples, without.logit_samples);
+        assert_eq!(with_zero.prevalence_samples, without.prevalence_samples);
+    }
+
+    #[test]
+    fn many_spacetime_matches_per_realization_single_call() {
+        let (c, v, vg) = st_setup();
+        let targets = vec![
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.5, 0.5).unwrap(), 0.5).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.25, 0.75).unwrap(), 0.5).unwrap(),
+        ];
+        let n_real = 3usize;
+        let base_seed = 12345u64;
+        let many = conditional_simulate_many_spacetime(
+            GeoMetric, &c, &v, &targets, vg, n_real, base_seed, None,
+        )
+        .expect("many st call");
+        assert_eq!(many.len(), n_real * targets.len());
+        for k in 0..n_real {
+            let one = conditional_simulate_spacetime(
+                GeoMetric,
+                &c,
+                &v,
+                &targets,
+                vg,
+                SimulationOptions::new(base_seed + k as u64),
+            )
+            .unwrap();
+            let row = &many[k * targets.len()..(k + 1) * targets.len()];
+            assert_eq!(row, one.as_slice(), "row {k}");
+        }
+    }
+
+    #[test]
+    fn many_spacetime_binomial_matches_per_realization_single_call() {
+        let c = vec![
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.0, 0.0).unwrap(), 0.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.0, 1.0).unwrap(), 0.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(1.0, 0.0).unwrap(), 0.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(1.0, 1.0).unwrap(), 0.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.0, 0.0).unwrap(), 1.0).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(1.0, 1.0).unwrap(), 1.0).unwrap(),
+        ];
+        let successes = vec![3u32, 6, 8, 15, 4, 16];
+        let trials = vec![20u32, 20, 20, 20, 20, 20];
+        let targets = vec![
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.5, 0.5).unwrap(), 0.5).unwrap(),
+            SpaceTimeCoord::try_new(GeoCoord::try_new(0.25, 0.75).unwrap(), 0.5).unwrap(),
+        ];
+        let spatial = VariogramModel::new(0.1, 5.0, 200.0, VariogramType::Exponential).unwrap();
+        let temporal = VariogramModel::new(0.05, 1.0, 2.0, VariogramType::Exponential).unwrap();
+        let vg = SpaceTimeVariogram::new_separable(spatial, temporal).unwrap();
+        let prior = BinomialPrior::default();
+        let n_real = 3usize;
+        let base_seed = 77u64;
+        let many = conditional_simulate_many_spacetime_binomial(
+            GeoMetric, &c, &successes, &trials, &targets, vg, prior, n_real, base_seed, None,
+        )
+        .unwrap();
+        assert_eq!(many.n_realizations, n_real);
+        assert_eq!(many.n_targets, targets.len());
+        for k in 0..n_real {
+            let one = conditional_simulate_spacetime_binomial(
+                GeoMetric,
+                &c,
+                &successes,
+                &trials,
+                &targets,
+                vg,
+                prior,
+                SimulationOptions::new(base_seed + k as u64),
+            )
+            .unwrap();
+            let lo = k * targets.len();
+            let hi = lo + targets.len();
+            assert_eq!(&many.logit_samples[lo..hi], one.logit_samples.as_slice());
+            assert_eq!(
+                &many.prevalence_samples[lo..hi],
+                one.prevalence_samples.as_slice()
+            );
+        }
     }
 }

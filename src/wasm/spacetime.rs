@@ -24,10 +24,10 @@ use crate::variogram::empirical::{EmpiricalEstimator, PositiveReal};
 use crate::variogram::models::{VariogramModel, VariogramType};
 
 use super::{
-    JsBinomialPrediction, JsPrediction, binomial_cv_result_to_js, binomial_simulation_to_js,
-    coded_err, cv_result_to_js, err_to_js, kriging_err_to_js, map_binomial_predictions,
-    map_predictions, parse_binomial_prior, parse_simulation_options, parse_variogram,
-    set_object_field, split_binomial_predictions, split_predictions,
+    JsBinomialPrediction, JsPrediction, binomial_cv_result_to_js, binomial_many_simulation_to_js,
+    binomial_simulation_to_js, coded_err, cv_result_to_js, err_to_js, kriging_err_to_js,
+    map_binomial_predictions, map_predictions, parse_binomial_prior, parse_simulation_options,
+    parse_variogram, set_object_field, split_binomial_predictions, split_predictions,
 };
 
 const FAMILY_HELP: &str = "family must be 'separable' or 'productSum'";
@@ -1726,4 +1726,159 @@ pub fn wasm_conditional_simulate_spacetime_binomial(
     )
     .map_err(kriging_err_to_js)?;
     binomial_simulation_to_js(result)
+}
+
+/// Multi-realization SGS over space-time ordinary kriging on geographic coordinates.
+/// Returns a flat row-major `Float64Array` of length `nRealizations * nTargets`. Row `k`
+/// matches a single-call `conditionalSimulateSpaceTime(seed = baseSeed + k, …)`.
+#[wasm_bindgen(js_name = conditionalSimulateSpaceTimeMany)]
+#[allow(clippy::too_many_arguments)]
+pub fn wasm_conditional_simulate_spacetime_many(
+    conditioning_lats: &[f64],
+    conditioning_lons: &[f64],
+    conditioning_times: &[f64],
+    conditioning_values: &[f64],
+    target_lats: &[f64],
+    target_lons: &[f64],
+    target_times: &[f64],
+    family: &str,
+    spatial_type: &str,
+    spatial_nugget: f64,
+    spatial_sill: f64,
+    spatial_range: f64,
+    spatial_shape: Option<f64>,
+    temporal_type: &str,
+    temporal_nugget: f64,
+    temporal_sill: f64,
+    temporal_range: f64,
+    temporal_shape: Option<f64>,
+    k1: Option<f64>,
+    k2: Option<f64>,
+    k3: Option<f64>,
+    n_realizations: u32,
+    base_seed: u64,
+    target_order: Option<Vec<u32>>,
+) -> Result<JsValue, JsValue> {
+    if conditioning_values.len() != conditioning_lats.len() {
+        return Err(coded_err(
+            "conditioningValues must match conditioning lats/lons/times length",
+            "mismatched_arrays",
+        ));
+    }
+    let cond_coords =
+        st_build_geo_coords(conditioning_lats, conditioning_lons, conditioning_times)?;
+    let cond_values: Vec<Real> = conditioning_values.iter().map(|v| *v as Real).collect();
+    let targets = st_build_geo_coords(target_lats, target_lons, target_times)?;
+    let vg = st_parse_spacetime_variogram_all(
+        family,
+        spatial_type,
+        spatial_nugget,
+        spatial_sill,
+        spatial_range,
+        spatial_shape,
+        temporal_type,
+        temporal_nugget,
+        temporal_sill,
+        temporal_range,
+        temporal_shape,
+        k1,
+        k2,
+        k3,
+    )?;
+    let order = target_order.map(|v| v.into_iter().map(|x| x as usize).collect());
+    let samples = crate::simulation::conditional_simulate_many_spacetime(
+        GeoMetric,
+        &cond_coords,
+        &cond_values,
+        &targets,
+        vg,
+        n_realizations as usize,
+        base_seed,
+        order,
+    )
+    .map_err(kriging_err_to_js)?;
+    let samples_f64: Vec<f64> = samples.iter().map(|v| *v as f64).collect();
+    Ok(Float64Array::from(samples_f64.as_slice()).into())
+}
+
+/// Multi-realization SGS for space-time binomial kriging. Returns an object with
+/// `nRealizations`, `nTargets`, and flat row-major `logitSamples` / `prevalenceSamples`
+/// `Float64Array`s. Row `k` matches a single-call
+/// `conditionalSimulateSpaceTimeBinomial(seed = baseSeed + k, …)`.
+#[wasm_bindgen(js_name = conditionalSimulateSpaceTimeManyBinomial)]
+#[allow(clippy::too_many_arguments)]
+pub fn wasm_conditional_simulate_spacetime_many_binomial(
+    conditioning_lats: &[f64],
+    conditioning_lons: &[f64],
+    conditioning_times: &[f64],
+    successes: &[u32],
+    trials: &[u32],
+    target_lats: &[f64],
+    target_lons: &[f64],
+    target_times: &[f64],
+    family: &str,
+    spatial_type: &str,
+    spatial_nugget: f64,
+    spatial_sill: f64,
+    spatial_range: f64,
+    spatial_shape: Option<f64>,
+    temporal_type: &str,
+    temporal_nugget: f64,
+    temporal_sill: f64,
+    temporal_range: f64,
+    temporal_shape: Option<f64>,
+    k1: Option<f64>,
+    k2: Option<f64>,
+    k3: Option<f64>,
+    prior_alpha: Option<f64>,
+    prior_beta: Option<f64>,
+    n_realizations: u32,
+    base_seed: u64,
+    target_order: Option<Vec<u32>>,
+) -> Result<JsValue, JsValue> {
+    if conditioning_lats.len() != conditioning_lons.len()
+        || conditioning_lats.len() != conditioning_times.len()
+        || conditioning_lats.len() != successes.len()
+        || conditioning_lats.len() != trials.len()
+    {
+        return Err(coded_err(
+            "conditioning arrays (lats, lons, times, successes, trials) must have the same length",
+            "mismatched_arrays",
+        ));
+    }
+    let cond_coords =
+        st_build_geo_coords(conditioning_lats, conditioning_lons, conditioning_times)?;
+    let targets = st_build_geo_coords(target_lats, target_lons, target_times)?;
+    let vg = st_parse_spacetime_variogram_all(
+        family,
+        spatial_type,
+        spatial_nugget,
+        spatial_sill,
+        spatial_range,
+        spatial_shape,
+        temporal_type,
+        temporal_nugget,
+        temporal_sill,
+        temporal_range,
+        temporal_shape,
+        k1,
+        k2,
+        k3,
+    )?;
+    let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
+    let order = target_order.map(|v| v.into_iter().map(|x| x as usize).collect());
+    let result = crate::simulation::conditional_simulate_many_spacetime_binomial(
+        GeoMetric,
+        &cond_coords,
+        successes,
+        trials,
+        &targets,
+        vg,
+        prior,
+        n_realizations as usize,
+        base_seed,
+        order,
+    )
+    .map_err(kriging_err_to_js)?;
+    binomial_many_simulation_to_js(result)
 }

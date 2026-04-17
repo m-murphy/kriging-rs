@@ -31,7 +31,10 @@ use crate::kriging::binomial::{BinomialKrigingModel, BinomialObservation, Binomi
 use crate::kriging::ordinary::OrdinaryKrigingModel;
 use crate::kriging::simple::SimpleKrigingModel;
 use crate::kriging::universal::{UniversalKrigingModel, UniversalTrend};
-use crate::projected::{Anisotropy2D, ProjectedCoord, ProjectedDataset, ProjectedKrigingModel};
+use crate::projected::{
+    Anisotropy2D, BinomialProjectedKrigingModel, ProjectedBinomialObservation, ProjectedCoord,
+    ProjectedDataset, ProjectedKrigingModel,
+};
 use crate::spacetime::coord::SpaceTimeCoord;
 use crate::spacetime::dataset::SpaceTimeDataset;
 use crate::spacetime::kriging::binomial::{
@@ -702,6 +705,120 @@ pub fn k_fold_binomial(
 }
 
 // ---------------------------------------------------------------------------
+// Binomial projected kriging CV (planar / anisotropic)
+// ---------------------------------------------------------------------------
+
+fn build_projected_binomial_observations(
+    coords: &[ProjectedCoord],
+    successes: &[u32],
+    trials: &[u32],
+    indices: &[usize],
+) -> Result<Vec<ProjectedBinomialObservation>, KrigingError> {
+    indices
+        .iter()
+        .filter(|&&i| trials[i] > 0)
+        .map(|&i| ProjectedBinomialObservation::new(coords[i], successes[i], trials[i]))
+        .collect()
+}
+
+fn validate_projected_binomial_lengths(
+    n_coords: usize,
+    n_successes: usize,
+    n_trials: usize,
+) -> Result<(), KrigingError> {
+    if n_coords != n_successes || n_successes != n_trials {
+        return Err(KrigingError::DimensionMismatch(format!(
+            "binomial projected CV: coords ({}), successes ({}), trials ({}) must match",
+            n_coords, n_successes, n_trials
+        )));
+    }
+    Ok(())
+}
+
+/// Leave-one-out CV for [`BinomialProjectedKrigingModel`]. Returns
+/// [`BinomialCvResidual`]s with both logit- and prevalence-scale residuals,
+/// matching the geographic [`leave_one_out_binomial`] semantics. Stations with
+/// `trials == 0` produce residuals whose observed fields are `NaN` and never
+/// participate in any training fold.
+pub fn leave_one_out_binomial_projected(
+    coords: &[ProjectedCoord],
+    successes: &[u32],
+    trials: &[u32],
+    variogram: VariogramModel,
+    anisotropy: Anisotropy2D,
+    prior: BinomialPrior,
+) -> Result<Vec<BinomialCvResidual>, KrigingError> {
+    validate_projected_binomial_lengths(coords.len(), successes.len(), trials.len())?;
+    let n = coords.len();
+    let mut out = Vec::with_capacity(n);
+    for_each_loo_fold(n, |train, test| {
+        let i = test[0];
+        let observations = build_projected_binomial_observations(coords, successes, trials, train)?;
+        if observations.len() < 2 {
+            return Err(KrigingError::InsufficientData(2));
+        }
+        let model = BinomialProjectedKrigingModel::new_with_prior(
+            observations,
+            variogram,
+            anisotropy,
+            prior,
+        )?;
+        let pred = model.predict(coords[i])?;
+        out.push(make_binomial_residual(
+            i,
+            successes[i],
+            trials[i],
+            pred.logit_value,
+            pred.variance,
+        ));
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// K-fold CV for [`BinomialProjectedKrigingModel`]. See
+/// [`leave_one_out_binomial_projected`] for fold semantics.
+pub fn k_fold_binomial_projected(
+    coords: &[ProjectedCoord],
+    successes: &[u32],
+    trials: &[u32],
+    variogram: VariogramModel,
+    anisotropy: Anisotropy2D,
+    prior: BinomialPrior,
+    k: usize,
+) -> Result<Vec<BinomialCvResidual>, KrigingError> {
+    validate_projected_binomial_lengths(coords.len(), successes.len(), trials.len())?;
+    let n = coords.len();
+    validate_k(n, k)?;
+    let mut results: Vec<Option<BinomialCvResidual>> = vec![None; n];
+    for_each_k_fold(n, k, |train, test| {
+        let observations = build_projected_binomial_observations(coords, successes, trials, train)?;
+        if observations.len() < 2 {
+            return Err(KrigingError::InsufficientData(2));
+        }
+        let model = BinomialProjectedKrigingModel::new_with_prior(
+            observations,
+            variogram,
+            anisotropy,
+            prior,
+        )?;
+        let test_coords: Vec<ProjectedCoord> = test.iter().map(|&j| coords[j]).collect();
+        let preds = model.predict_batch(&test_coords)?;
+        for (&idx, pred) in test.iter().zip(preds.iter()) {
+            results[idx] = Some(make_binomial_residual(
+                idx,
+                successes[idx],
+                trials[idx],
+                pred.logit_value,
+                pred.variance,
+            ));
+        }
+        Ok(())
+    })?;
+    Ok(results.into_iter().flatten().collect())
+}
+
+// ---------------------------------------------------------------------------
 // Space–time kriging CV
 // ---------------------------------------------------------------------------
 
@@ -1289,6 +1406,71 @@ mod tests {
             &successes,
             &trials,
             variogram,
+            BinomialPrior::default(),
+            4,
+        )
+        .unwrap();
+        assert_eq!(residuals.len(), coords.len());
+        let mut seen = vec![false; coords.len()];
+        for r in &residuals {
+            assert!(!seen[r.index]);
+            seen[r.index] = true;
+        }
+        assert!(seen.iter().all(|b| *b));
+    }
+
+    fn binomial_projected_grid_points() -> (Vec<ProjectedCoord>, Vec<u32>, Vec<u32>) {
+        let mut coords = Vec::new();
+        let mut successes = Vec::new();
+        let mut trials = Vec::new();
+        for i in 0..4 {
+            for j in 0..4 {
+                let x = i as Real;
+                let y = j as Real;
+                let p = logistic(-2.0 + 0.5 * x + 0.5 * y);
+                let n = 40u32;
+                let s = (p * n as Real).round() as u32;
+                coords.push(ProjectedCoord::new(x, y));
+                successes.push(s);
+                trials.push(n);
+            }
+        }
+        (coords, successes, trials)
+    }
+
+    #[test]
+    fn binomial_projected_loo_returns_one_residual_per_station_in_order() {
+        let (coords, successes, trials) = binomial_projected_grid_points();
+        let variogram = VariogramModel::new(0.05, 2.0, 5.0, VariogramType::Exponential).unwrap();
+        let residuals = leave_one_out_binomial_projected(
+            &coords,
+            &successes,
+            &trials,
+            variogram,
+            Anisotropy2D::isotropic(),
+            BinomialPrior::default(),
+        )
+        .unwrap();
+        assert_eq!(residuals.len(), coords.len());
+        for (i, r) in residuals.iter().enumerate() {
+            assert_eq!(r.index, i);
+            assert!(r.predicted_logit.is_finite());
+            assert!(r.predicted_prevalence > 0.0 && r.predicted_prevalence < 1.0);
+            assert!(r.logit_variance >= 0.0);
+            assert!(r.prevalence_variance >= 0.0);
+        }
+    }
+
+    #[test]
+    fn binomial_projected_k_fold_covers_every_station_exactly_once() {
+        let (coords, successes, trials) = binomial_projected_grid_points();
+        let variogram = VariogramModel::new(0.05, 2.0, 5.0, VariogramType::Exponential).unwrap();
+        let residuals = k_fold_binomial_projected(
+            &coords,
+            &successes,
+            &trials,
+            variogram,
+            Anisotropy2D::isotropic(),
             BinomialPrior::default(),
             4,
         )

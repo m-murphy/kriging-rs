@@ -93,6 +93,7 @@ compile_error!(
     "features `f64` and `gpu` are mutually exclusive: WGSL shaders currently only support f32"
 );
 
+pub mod aggregate;
 pub mod cv;
 pub mod distance;
 pub mod error;
@@ -127,7 +128,8 @@ pub use kriging::ordinary::{Neighborhood, OrdinaryKrigingModel, Prediction};
 pub use kriging::simple::SimpleKrigingModel;
 pub use kriging::universal::{UniversalKrigingModel, UniversalTrend};
 pub use projected::{
-    Anisotropy2D, DirectionalConfig, ProjectedCoord, ProjectedDataset, ProjectedKrigingModel,
+    Anisotropy2D, BinomialProjectedKrigingModel, DirectionalConfig, ProjectedBinomialObservation,
+    ProjectedCoord, ProjectedDataset, ProjectedKrigingModel,
     compute_directional_empirical_variogram, euclidean_distance, euclidean_distance_squared,
 };
 pub use variogram::fitting::{FitResult, fit_variogram};
