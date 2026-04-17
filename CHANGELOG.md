@@ -5,18 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
 ## [0.3.0] - 2026-04-16
 
 0.3.0 is a large feature release. Highlights:
 
 - A new **spatio-temporal kriging** module that extends the 2-D surface with a time axis.
 - **Cross-validation** (leave-one-out and K-fold) and **conditional simulation** (Sequential Gaussian Simulation) — both new to the project — shipped for every kriging variant in both 2-D and space-time.
+- A focused **disease prevalence mapping cookbook**: tightened one-shot binomial interpolation, fast multi-realization SGS, generic ensemble aggregators, grid-shaped binomial simulation, polygon roll-ups, projected binomial kriging, and date-aware space-time helpers.
 - The remaining `kriging-rs-wasm` feature parity gaps from 0.2.x are filled (`SimpleKriging`, `UniversalKriging`, `ProjectedKriging`, neighborhoods, more variogram families).
 - A round of TypeScript ergonomics: discriminated-union variograms, `fromFitted`, `Symbol.dispose`, date helpers, fixed-time grids, and multi-realization SGS.
 
 ### Added
+
+#### Disease prevalence mapping cookbook (TypeScript + Rust)
+
+A focused workflow for the project's primary use case: building, validating,
+sampling, and reporting prevalence surfaces from binomial count data.
+
+- **Tightened one-shot binomial interpolation.** `interpolateBinomialToGrid`
+  now fits the variogram on the same EB-smoothed logits used by
+  `BinomialKriging`, accepts a `prior` and an `estimator` (`"classical" |
+  "cressie-hawkins"`), exposes the resulting `fittedVariogram` on the result,
+  and can run leave-one-out / k-fold CV in the same call via
+  `withCv: true | "loo" | { k }`. The new `BinomialCvSummary` (both logit and
+  prevalence scales) is reported alongside the grid.
+- **Multi-realization SGS — fast path.** New Rust entry points
+  `conditional_simulate_many{,_spacetime}{,_binomial}` amortize the
+  conditioning factorization across realizations and ship behind WASM bridges
+  (`conditionalSimulateMany{,Binomial}` and the ST variants now do a single
+  JS↔WASM crossing per ensemble).
+- **Generic ensemble aggregators.** Pure-TS `ensembleMean`, `ensembleVariance`,
+  `ensembleQuantiles`, and `ensembleExceedanceProbability` operate over the
+  flat row-major buffers produced by the `*Many*` simulators.
+- **Grid-shaped binomial simulation.** `simulateBinomialGrid`,
+  `simulateBinomialGridEnsemble`, and `simulateBinomialGridSummary` build
+  conditioning + target geometry from a `GeoGridBounds` and return either
+  nested `[yCells][xCells]` arrays (single realization), a flat ensemble
+  buffer (many realizations), or per-cell mean / variance / quantile /
+  exceedance maps (one-shot summary).
+- **Polygon aggregation over ensembles.** New Rust `aggregate` module
+  (`polygon_weighted_summary`, `polygon_weighted_summaries_batch`) reduces an
+  ensemble buffer to per-polygon mean / variance / quantiles using
+  `(indices, weights)` cell lists; bridged through WASM as
+  `aggregatePolygonsOverEnsemble`. The TS `aggregatePrevalenceByPolygon` and
+  `polygonCellsFromMask` helpers wrap this for population-weighted
+  district-level reporting.
+- **Projected binomial kriging.** New Rust `BinomialProjectedKrigingModel`
+  with `ProjectedBinomialObservation` (Beta priors and pre-computed logits
+  supported), CV (`leave_one_out_binomial_projected`,
+  `k_fold_binomial_projected`), SGS
+  (`conditional_simulate_binomial_projected`,
+  `conditional_simulate_many_binomial_projected`), and a WASM bridge
+  (`WasmBinomialProjectedKriging`). The TS layer ships
+  `BinomialProjectedKriging` plus `leaveOneOutBinomialProjected`,
+  `kFoldBinomialProjected`, `conditionalSimulateBinomialProjected`, and
+  `conditionalSimulateManyBinomialProjected` for projected (planar, optionally
+  anisotropic) prevalence mapping.
+- **Date-aware space-time helpers.** `SpaceTimeBinomialKriging` gains
+  `predictAtDate`, `predictBatchAtDates`, `predictBatchArraysAtDates`, and
+  `predictGridAtDate` (date-axis configured per call via
+  `DateAxisOptions = { timeUnit?, epoch? }`). New free functions
+  `simulateBinomialSpaceTimeGrid{,Ensemble,Summary}` and their `*AtDate`
+  counterparts mirror the spatial grid family for ST binomial conditioning.
 
 #### Spatio-temporal kriging (new `spacetime` module)
 
@@ -75,6 +125,19 @@ Higher-level ergonomics layered on top of the WASM bindings.
 
 - `OrdinaryKrigingModel::set_neighborhood` — in-place counterpart of `with_neighborhood`, for FFI-friendly updates that don't consume `self`.
 
+### Changed
+
+- **No more silent fallbacks for missing WASM symbols.** Every TypeScript wrapper for an unconditional WASM export (`leaveOneOut*`, `kFold*`, `conditionalSimulate*`, `conditionalSimulateMany*`, `computeEmpiricalVariogram`, `computeDirectionalEmpiricalVariogram`, `evaluateNestedVariogram`, `aggregatePolygonsOverEnsemble`) now calls the WASM export directly without a `typeof === "function"` guard or pure-JS fallback. The `RawModule` shape in `internal/wasm-shapes.ts` declares these as required (only the `gpu`-feature-gated `webgpuAvailable` and instance-level `predictBatchGpu` / `predictBatchGpuOrCpu` remain optional, since they really may be absent from a GPU-less build). This eliminates a class of dead code and ensures any genuine packaging mistake fails loudly at first call rather than silently falling back to a slower path.
+- **CV summary statistics now propagate `NaN`.** The internal `requireFiniteOrZero` helper has been replaced with `requireFiniteOrNaN` (in `internal/convert.ts`), and is now used for `meanError`, `rmse`, and `msdr` on `CvSummary` / `BinomialCvSummary`, plus `residuals` on `FittedSpaceTimeVariogram`. Previously these were silently coerced to `0` when the underlying Rust statistic was `NaN` (for example when zero residuals were evaluated), which masked "no data to summarize" as "perfectly calibrated". The honest `NaN` is now returned; non-numeric payloads still throw.
+- **`unpackBinomialManyPayload` no longer carries fallback `nRealizations` / `nTargets`.** The Rust `binomial_many_to_js` serializer always populates those fields, so the JS-side `?? fallback` defaults were defensive against our own code. They have been removed; both fields are now resolved with `requireNumber`, surfacing any inconsistency in the WASM payload immediately.
+
+### Documentation
+
+- **Disease prevalence mapping cookbook** in `npm/kriging-rs-wasm/README.md`
+  walking through fit → validate → simulate → aggregate end-to-end.
+- **`examples/prevalence_mapping.rs`** — Rust runnable example showing the
+  same workflow against the native crate.
+
 ## [0.2.3] - 2026-04-06
 
 ### Fixed
@@ -132,6 +195,7 @@ Higher-level ergonomics layered on top of the WASM bindings.
   - `KrigingError` (JS class with `cause`); `webgpuAvailable` when built with GPU support.
   - Batch and typed-array prediction APIs.
 
+[0.3.0]: https://github.com/m-murphy/kriging-rs/releases/tag/v0.3.0
 [0.2.3]: https://github.com/m-murphy/kriging-rs/releases/tag/v0.2.3
 [0.2.2]: https://github.com/m-murphy/kriging-rs/releases/tag/v0.2.2
 [0.2.1]: https://github.com/m-murphy/kriging-rs/releases/tag/v0.2.1

@@ -739,6 +739,254 @@ const realizations = conditionalSimulateManySpaceTime({
 // (row k holds the k-th realization in input order).
 ```
 
+## Disease prevalence mapping cookbook
+
+End-to-end recipe for the package's primary use case: turning sparse
+`(latitude, longitude, successes, trials)` (or `(x, y, …)` for projected data)
+into a defensible prevalence surface plus calibrated uncertainty. The pieces
+below combine into the typical workflow **fit → validate → simulate → aggregate**.
+
+### 1. One-shot map (great for a first look)
+
+`interpolateBinomialToGrid` fits a variogram on the EB-smoothed logits, builds
+a `BinomialKriging` model, predicts a grid, and (optionally) runs CV — all in
+a single call. The fitted variogram is returned so you can reuse it later
+without re-fitting.
+
+```ts
+import init, { interpolateBinomialToGrid } from "kriging-rs-wasm";
+await init();
+
+const result = interpolateBinomialToGrid({
+  lats, lons, successes, trials,
+  west: -1, south: 36, east: 1, north: 38,
+  xCells: 100, yCells: 100,
+  variogramType: "exponential",
+  prior: { alpha: 1, beta: 1 },           // optional Beta prior
+  estimator: "cressie-hawkins",            // robust empirical variogram
+  withCv: { k: 5 },                        // optional 5-fold CV summary
+});
+result.prevalences;       // [yCells][xCells]
+result.fittedVariogram;   // re-usable for simulation
+result.cv?.prevalence.rmse; // calibration on the prevalence scale
+```
+
+### 2. Fit the variogram once, then build a re-usable model
+
+For repeated work (multiple grids, simulations, polygon roll-ups) it is
+cheaper to fit once and reuse:
+
+```ts
+import {
+  BinomialKriging,
+  fitVariogram,
+  computeEmpiricalVariogram,
+} from "kriging-rs-wasm";
+
+// Empirical variogram on EB-smoothed logits is the recommended starting point;
+// fitVariogram does the smoothing internally for binomial inputs.
+const fitted = fitVariogram({
+  sampleLats: lats, sampleLons: lons,
+  successes, trials,
+  variogramType: "exponential",
+  estimator: "cressie-hawkins",
+  prior: { alpha: 1, beta: 1 },
+});
+const model = BinomialKriging.fromFittedVariogramWithPrior({
+  lats, lons, successes, trials,
+  fittedVariogram: fitted,
+  prior: { alpha: 1, beta: 1 },
+});
+```
+
+### 3. Cross-validate to calibrate the variogram
+
+Binomial CV reports residuals on **both** scales: the logit scale (matches the
+underlying ordinary-kriging variance, calibratable via MSDR ≈ 1) and the
+prevalence scale (intuitive, delta-method variance):
+
+```ts
+import { kFoldBinomial } from "kriging-rs-wasm";
+
+const cv = kFoldBinomial({
+  lats, lons, successes, trials,
+  k: 5,
+  variogram: fitted,
+  prior: { alpha: 1, beta: 1 },
+});
+cv.summary.logit.rmse;       // posterior calibration on the logit scale
+cv.summary.prevalence.rmse;  // and on prevalence
+cv.summary.logit.msdr;       // ≈ 1 means the variogram nugget/sill is well-tuned
+```
+
+### 4. Sample an ensemble of plausible maps (SGS)
+
+Sequential Gaussian Simulation gives you many independent plausible
+prevalence rasters honoring the data and the variogram. Use the
+`*Many*` variant — it amortizes the conditioning factorization across
+realizations:
+
+```ts
+import { simulateBinomialGridEnsemble } from "kriging-rs-wasm";
+
+const ensemble = simulateBinomialGridEnsemble({
+  lats, lons, successes, trials,
+  west: -1, south: 36, east: 1, north: 38,
+  xCells: 100, yCells: 100,
+  variogram: fitted,
+  prior: { alpha: 1, beta: 1 },
+  nRealizations: 200,
+  baseSeed: 42n,           // realization k uses seed = baseSeed + k
+});
+// ensemble.{logit,prevalence}Samples are flat row-major Float64Array
+// of length nRealizations * (xCells * yCells); ensemble.nTargets covers each.
+```
+
+For a one-shot ensemble + per-cell reduction (mean, variance, quantiles,
+exceedance probabilities) use `simulateBinomialGridSummary` and pick the
+scale you want quantiles on:
+
+```ts
+import { simulateBinomialGridSummary } from "kriging-rs-wasm";
+
+const summary = simulateBinomialGridSummary({
+  lats, lons, successes, trials,
+  west: -1, south: 36, east: 1, north: 38,
+  xCells: 100, yCells: 100,
+  variogram: fitted,
+  nRealizations: 200,
+  baseSeed: 42n,
+  quantiles: [0.025, 0.5, 0.975],     // 95% credible interval
+  exceedanceThresholds: [0.10, 0.25],  // P(prevalence > 10%, > 25%)
+  summarizeOn: "prevalence",
+});
+summary.meanPrevalence;       // [yCells][xCells]
+summary.quantiles[1].values;  // median prevalence map
+summary.exceedances[0].values; // P(prevalence > 0.10) per cell
+```
+
+### 5. Roll up to administrative polygons (population-weighted)
+
+A regulator usually wants the posterior distribution of prevalence inside a
+district, not a 10 000-cell raster. `aggregatePrevalenceByPolygon` reduces
+the ensemble to per-polygon mean / variance / quantiles in a single WASM call:
+
+```ts
+import {
+  aggregatePrevalenceByPolygon,
+  polygonCellsFromMask,
+} from "kriging-rs-wasm";
+
+// Population raster (or a binary indicator mask) shaped [yCells][xCells].
+const district = polygonCellsFromMask({
+  xCells: ensemble.xCells, yCells: ensemble.yCells,
+  mask: populationRaster,   // truthy values become weights
+  id: "district-A",
+});
+const [report] = aggregatePrevalenceByPolygon({
+  ensemble,
+  polygons: [district],
+  quantiles: [0.025, 0.5, 0.975],
+});
+report.mean;        // population-weighted posterior mean prevalence
+report.variance;    // posterior variance (n - 1 denominator)
+report.quantiles;   // [{ probability: 0.025, value }, …]
+```
+
+### 6. Projected coordinates and 2-D anisotropy
+
+For data in a local equal-area projection where directional range matters,
+use the projected variants — same workflow, planar distances, 2-D anisotropy:
+
+```ts
+import {
+  BinomialProjectedKriging,
+  kFoldBinomialProjected,
+  conditionalSimulateManyBinomialProjected,
+} from "kriging-rs-wasm";
+
+const model = new BinomialProjectedKriging({
+  xs, ys, successes, trials,
+  variogram: { variogramType: "exponential", nugget: 0.05, sill: 1, range: 1500 },
+  majorAngleDeg: 30,    // azimuth of long axis in degrees CCW from +x
+  rangeRatio: 0.5,       // 1.0 = isotropic
+});
+const cv = kFoldBinomialProjected({ /* same shape; reports both scales */ });
+const ensemble = conditionalSimulateManyBinomialProjected({
+  conditioningXs: xs, conditioningYs: ys, successes, trials,
+  targetXs, targetYs,
+  variogram: { variogramType: "exponential", nugget: 0.05, sill: 1, range: 1500 },
+  majorAngleDeg: 30, rangeRatio: 0.5,
+  nRealizations: 200,
+});
+```
+
+### 7. Date-aware space-time slices
+
+Space-time binomial kriging works on a numeric `times` axis, but most callers
+think in calendar dates. The `*AtDate` helpers convert via `timesFromDates`
+under the hood — pass the `timeUnit` and `epoch` you used when building the
+model:
+
+```ts
+import {
+  SpaceTimeBinomialKriging,
+  fitSpaceTimeVariogram,
+  timesFromDates,
+  simulateBinomialSpaceTimeGridSummaryAtDate,
+} from "kriging-rs-wasm";
+
+const epoch = new Date(Date.UTC(2024, 0, 1));
+const times = timesFromDates(observationDates, "days", epoch);
+const fit = fitSpaceTimeVariogram({
+  lats, lons, times, values: logits, // or use the binomial CV-driven workflow
+  family: "separable",
+  spatialModel: "exponential",
+  temporalModel: "exponential",
+  nSpatialBins: 12, nTemporalBins: 8,
+});
+const model = SpaceTimeBinomialKriging.fromFitted({
+  lats, lons, times, successes, trials,
+  fittedVariogram: fit.fit,
+});
+
+// Predict an entire grid at the most recent reporting date.
+const grid = model.predictGridAtDate({
+  west: -1, south: 36, east: 1, north: 38,
+  xCells: 100, yCells: 100,
+  date: new Date("2024-09-01"),
+  timeUnit: "days", epoch,
+});
+
+// Or simulate an ensemble at that date and pull credible intervals + exceedances:
+const summary = simulateBinomialSpaceTimeGridSummaryAtDate({
+  west: -1, south: 36, east: 1, north: 38,
+  xCells: 100, yCells: 100,
+  lats, lons, dates: observationDates,
+  successes, trials,
+  variogram: fit.fit,
+  date: new Date("2024-09-01"),
+  timeUnit: "days", epoch,
+  nRealizations: 200,
+  baseSeed: 7n,
+  quantiles: [0.025, 0.5, 0.975],
+  exceedanceThresholds: [0.10],
+});
+```
+
+### Tips
+
+- **Reuse the fitted variogram** across CV, simulation, and grids — it's the
+  most expensive step.
+- **Prefer `simulateBinomialGridEnsemble` over per-cell loops** when you need
+  any aggregation (district means, exceedance maps, …); the row-major buffers
+  feed straight into `ensembleMean` / `ensembleVariance` /
+  `ensembleQuantiles` / `ensembleExceedanceProbability`.
+- **`BinomialCvSummary.logit.msdr ≈ 1`** is the cleanest signal that the
+  variogram is well calibrated; values far from 1 suggest tuning the nugget.
+- **Use a Beta(1, 1) prior** for routine work; switch to `Beta(½, ½)` (the
+  default if you omit `prior`) for the Jeffreys-prior smoothing.
+
 ## Error handling
 
 Constructors (`OrdinaryKriging`, `SimpleKriging`, `UniversalKriging`, `ProjectedKriging`, `BinomialKriging`, `BinomialKriging.newWithPrior`, `BinomialKriging.fromPrecomputedLogits`, the `SpaceTime*Kriging` classes), `fitVariogram`, `fitSpaceTimeVariogram`, and the top-level helpers (`computeEmpiricalVariogram`, `computeDirectionalEmpiricalVariogram`, `computeEmpiricalSpaceTimeVariogram`, `leaveOneOut`, `kFold`, `leaveOneOutSimple`, `kFoldSimple`, `leaveOneOutUniversal`, `kFoldUniversal`, `leaveOneOutProjected`, `kFoldProjected`, `leaveOneOutBinomial`, `kFoldBinomial`, `leaveOneOutSpaceTime`, `kFoldSpaceTime`, `leaveOneOutSpaceTimeSimple`, `kFoldSpaceTimeSimple`, `leaveOneOutSpaceTimeUniversal`, `kFoldSpaceTimeUniversal`, `leaveOneOutSpaceTimeBinomial`, `kFoldSpaceTimeBinomial`, `conditionalSimulate`, `conditionalSimulateSimple`, `conditionalSimulateUniversal`, `conditionalSimulateProjected`, `conditionalSimulateBinomial`, `conditionalSimulateSpaceTime`, `conditionalSimulateSpaceTimeSimple`, `conditionalSimulateSpaceTimeUniversal`, `conditionalSimulateSpaceTimeBinomial`, `evaluateNestedVariogram`) throw on invalid inputs or model build failure (e.g. singular covariance). Errors are rethrown as `KrigingError` with the underlying cause attached as `cause`. For UI-friendly messages, use the optional **`code`** property (when present), which is one of: `not_loaded`, `model_freed`, `mismatched_arrays`, `invalid_variogram`, `invalid_bins`, `singular_covariance`, `too_few_points`, `unknown_variogram`, `unknown_family`, `unknown_trend`, `unknown_estimator`, `invalid_input`, `backend_unavailable`, `internal_error`. Not every error has a code. `backend_unavailable` specifically indicates that the WASM package was built without the export in question (e.g. without the `gpu` feature), so the API can't fulfill the call in the current build.
