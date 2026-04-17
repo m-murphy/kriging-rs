@@ -1,3 +1,4 @@
+use kriging_rs::Real;
 use kriging_rs::variogram::empirical::{
     PositiveReal, VariogramConfig, compute_empirical_variogram,
 };
@@ -9,7 +10,7 @@ use kriging_rs::{
 };
 use std::num::NonZeroUsize;
 
-fn coord(lat: f32, lon: f32) -> GeoCoord {
+fn coord(lat: Real, lon: Real) -> GeoCoord {
     GeoCoord::try_new(lat, lon).unwrap()
 }
 

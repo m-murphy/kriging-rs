@@ -3,6 +3,11 @@
 // step and keeps JS callers from having to construct and garbage-collect a JS object per call.
 // This pattern trips clippy's `too_many_arguments` lint.
 #![allow(clippy::too_many_arguments)]
+// JS interop only accepts `f64`, so this module casts every `Real` value to `f64` at the
+// boundary. When the `f64` Cargo feature is on `Real == f64` and clippy flags those casts
+// as redundant, but the casts are meaningful in the default `f32` build and removing them
+// would break compilation there.
+#![allow(clippy::unnecessary_cast)]
 
 use js_sys::{Float64Array, Object, Reflect, Uint32Array};
 use serde::{Deserialize, Serialize};

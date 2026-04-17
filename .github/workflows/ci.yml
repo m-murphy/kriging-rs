@@ -8,6 +8,15 @@ on:
 jobs:
   test-native:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The `f64` and `gpu` features are mutually exclusive (WGSL shaders
+        # are f32-only, see `compile_error!` in src/lib.rs), so we exercise
+        # them in separate jobs instead of via `--all-features`.
+        features:
+          - "gpu,gpu-blocking,wasm"
+          - "f64,wasm"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -16,9 +25,9 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --features "${{ matrix.features }}" -- -D warnings
       - name: Tests
-        run: cargo test --all-features
+        run: cargo test --features "${{ matrix.features }}"
 
   build-wasm:
     runs-on: ubuntu-latest

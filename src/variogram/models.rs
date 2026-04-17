@@ -2,6 +2,12 @@ use crate::Real;
 use crate::error::KrigingError;
 
 /// Matérn semivariance: γ(h) = nugget + partial_sill * (1 - (2^(1-ν)/Γ(ν)) * x^ν * K_ν(x)) with x = h√(2ν)/range.
+//
+// `puruspe` only exposes `f64` Bessel/gamma functions, so we always promote the inputs to
+// `f64` and demote the final result back to `Real`. Under the `f64` Cargo feature the
+// promotion is a no-op cast that clippy flags as unnecessary; the cast is required in the
+// default `f32` build.
+#[allow(clippy::unnecessary_cast)]
 fn matern_semivariance(d: Real, nugget: Real, partial_sill: Real, range: Real, nu: Real) -> Real {
     if d <= 0.0 {
         return nugget;

@@ -5,6 +5,8 @@
 //! plus stand-alone functions for empirical-variogram computation and parametric fitting.
 
 #![allow(clippy::too_many_arguments)]
+// JS interop only accepts `f64`. See note in `super` (src/wasm/mod.rs).
+#![allow(clippy::unnecessary_cast)]
 
 use js_sys::{Float64Array, Object};
 use wasm_bindgen::prelude::*;

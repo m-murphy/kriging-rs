@@ -696,9 +696,14 @@ mod tests {
             GeoCoord::try_new(0.5, 0.8).unwrap(),
         ];
         let cpu = model.predict_batch(&query_coords).expect("cpu batch");
-        let gpu = model
-            .predict_batch_gpu_blocking(&query_coords)
-            .expect("gpu batch");
+        let gpu = match model.predict_batch_gpu_blocking(&query_coords) {
+            Ok(v) => v,
+            Err(crate::error::KrigingError::BackendUnavailable(msg)) => {
+                eprintln!("skipping GPU test: backend unavailable: {msg}");
+                return;
+            }
+            Err(e) => panic!("gpu batch: {e:?}"),
+        };
         assert_eq!(gpu.len(), cpu.len());
         for (g, c) in gpu.iter().zip(cpu.iter()) {
             assert!((g.value - c.value).abs() < 1e-3);
@@ -727,9 +732,14 @@ mod tests {
             GeoCoord::try_new(37.775, -122.425).unwrap(),
         ];
         let cpu = model.predict_batch(&query_coords).expect("cpu batch");
-        let gpu = model
-            .predict_batch_gpu_blocking(&query_coords)
-            .expect("gpu batch");
+        let gpu = match model.predict_batch_gpu_blocking(&query_coords) {
+            Ok(v) => v,
+            Err(crate::error::KrigingError::BackendUnavailable(msg)) => {
+                eprintln!("skipping GPU test: backend unavailable: {msg}");
+                return;
+            }
+            Err(e) => panic!("gpu batch: {e:?}"),
+        };
         assert_eq!(gpu.len(), cpu.len(), "same number of predictions");
         const REL_TOL: f32 = 1e-4;
         const ABS_TOL: f32 = 1e-5;

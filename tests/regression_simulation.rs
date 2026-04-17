@@ -40,15 +40,22 @@ fn ordinary_field(x: Real, y: Real) -> Real {
     (6.0 * x).sin() + 0.7 * (5.0 * y).cos() + 0.2 * x * y
 }
 
+// `Real`-typed TAU so the field expression stays in `Real` arithmetic regardless of
+// whether the `f64` Cargo feature is enabled.
+const TAU: Real = std::f64::consts::TAU as Real;
+
 fn binomial_logit_field(x: Real, y: Real) -> Real {
-    -0.3 + 1.2 * (std::f32::consts::TAU * x).sin() * (std::f32::consts::TAU * y).cos()
+    -0.3 + 1.2 * (TAU * x).sin() * (TAU * y).cos()
 }
 
+// Always sample from the RNG as `f32` (regardless of the `f64` Cargo feature) so that
+// the regression error budgets below stay tied to a single deterministic sequence and do
+// not silently drift when `Real` switches precision.
 fn sample_points(rng: &mut StdRng, count: usize) -> Vec<SamplePoint> {
     (0..count)
         .map(|_| {
-            let x = rng.random::<f32>();
-            let y = rng.random::<f32>();
+            let x = rng.random::<f32>() as Real;
+            let y = rng.random::<f32>() as Real;
             SamplePoint {
                 coord: to_coord(x, y),
                 x,
@@ -59,7 +66,10 @@ fn sample_points(rng: &mut StdRng, count: usize) -> Vec<SamplePoint> {
 }
 
 fn binomial_draws(rng: &mut StdRng, trials: u32, p: Real) -> u32 {
-    (0..trials).map(|_| (rng.random::<f32>() < p) as u32).sum()
+    (0..trials)
+        .map(|_| (rng.random::<f32>() as Real) < p)
+        .map(u32::from)
+        .sum()
 }
 
 fn sample_grid_points(rows: usize, cols: usize) -> Vec<SamplePoint> {
