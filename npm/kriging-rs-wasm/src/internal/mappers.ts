@@ -25,7 +25,7 @@ import type {
 } from "../types.js";
 import {
   asRecord,
-  requireFiniteOrZero,
+  requireFiniteOrNaN,
   requireFloat64Array,
   requireNumber,
   requireUint32Array,
@@ -149,9 +149,9 @@ export function mapCvOutput(value: unknown): CvResult {
   const summaryRec = asRecord(rec.summary);
   const summary: CvSummary = {
     n: requireNumber(summaryRec.n),
-    meanError: requireFiniteOrZero(summaryRec.meanError),
-    rmse: requireFiniteOrZero(summaryRec.rmse),
-    msdr: requireFiniteOrZero(summaryRec.msdr),
+    meanError: requireFiniteOrNaN(summaryRec.meanError),
+    rmse: requireFiniteOrNaN(summaryRec.rmse),
+    msdr: requireFiniteOrNaN(summaryRec.msdr),
   };
   const residuals: CvResidual[] = [];
   for (let i = 0; i < indices.length; i++) {
@@ -174,9 +174,9 @@ function mapCvSummary(value: unknown): CvSummary {
   const rec = asRecord(value);
   return {
     n: requireNumber(rec.n),
-    meanError: requireFiniteOrZero(rec.meanError),
-    rmse: requireFiniteOrZero(rec.rmse),
-    msdr: requireFiniteOrZero(rec.msdr),
+    meanError: requireFiniteOrNaN(rec.meanError),
+    rmse: requireFiniteOrNaN(rec.rmse),
+    msdr: requireFiniteOrNaN(rec.msdr),
   };
 }
 
@@ -258,7 +258,7 @@ export function mapFittedSpaceTimeVariogram(
   }
   const spatial = mapVariogramParams(rec.spatial);
   const temporal = mapVariogramParams(rec.temporal);
-  const residuals = requireFiniteOrZero(rec.residuals);
+  const residuals = requireFiniteOrNaN(rec.residuals);
   if (family === "productSum") {
     return {
       family: "productSum",

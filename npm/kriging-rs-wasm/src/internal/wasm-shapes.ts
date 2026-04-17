@@ -56,6 +56,14 @@ export interface WasmProjectedInstance {
   free?: () => void;
 }
 
+/** WASM projected binomial kriging instance shape. */
+export interface WasmBinomialProjectedInstance {
+  predict(x: number, y: number): unknown;
+  predictBatch(xs: Float64Array, ys: Float64Array): unknown;
+  predictBatchArrays(xs: Float64Array, ys: Float64Array): unknown;
+  free?: () => void;
+}
+
 /** WASM binomial kriging instance shape. */
 export interface WasmBinomialInstance {
   predict(lat: number, lon: number): unknown;
@@ -192,6 +200,48 @@ export type RawModule = {
       rangeRatio: number
     ): WasmProjectedInstance;
   };
+  WasmBinomialProjectedKriging?: {
+    fromArrays(
+      xs: Float64Array,
+      ys: Float64Array,
+      successes: Uint32Array,
+      trials: Uint32Array,
+      variogramType: string,
+      nugget: number,
+      sill: number,
+      range: number,
+      shape: number | undefined,
+      majorAngleDeg: number,
+      rangeRatio: number
+    ): WasmBinomialProjectedInstance;
+    fromArraysWithPrior(
+      xs: Float64Array,
+      ys: Float64Array,
+      successes: Uint32Array,
+      trials: Uint32Array,
+      variogramType: string,
+      nugget: number,
+      sill: number,
+      range: number,
+      shape: number | undefined,
+      majorAngleDeg: number,
+      rangeRatio: number,
+      priorAlpha: number,
+      priorBeta: number
+    ): WasmBinomialProjectedInstance;
+    fromPrecomputedLogits(
+      xs: Float64Array,
+      ys: Float64Array,
+      logits: Float64Array,
+      variogramType: string,
+      nugget: number,
+      sill: number,
+      range: number,
+      shape: number | undefined,
+      majorAngleDeg: number,
+      rangeRatio: number
+    ): WasmBinomialProjectedInstance;
+  };
   WasmVariogramType: {
     readonly Spherical: number;
     readonly Exponential: number;
@@ -211,7 +261,7 @@ export type RawModule = {
     variogramType: number,
     estimator?: string
   ) => unknown;
-  computeEmpiricalVariogram?: (
+  computeEmpiricalVariogram: (
     lats: Float64Array,
     lons: Float64Array,
     values: Float64Array,
@@ -219,7 +269,7 @@ export type RawModule = {
     nBins: number,
     estimator?: string
   ) => unknown;
-  computeDirectionalEmpiricalVariogram?: (
+  computeDirectionalEmpiricalVariogram: (
     xs: Float64Array,
     ys: Float64Array,
     values: Float64Array,
@@ -228,7 +278,7 @@ export type RawModule = {
     azimuthDeg: number,
     toleranceDeg: number
   ) => unknown;
-  leaveOneOut?: (
+  leaveOneOut: (
     lats: Float64Array,
     lons: Float64Array,
     values: Float64Array,
@@ -238,7 +288,7 @@ export type RawModule = {
     range: number,
     shape?: number
   ) => unknown;
-  kFold?: (
+  kFold: (
     lats: Float64Array,
     lons: Float64Array,
     values: Float64Array,
@@ -249,7 +299,7 @@ export type RawModule = {
     range: number,
     shape?: number
   ) => unknown;
-  leaveOneOutSimple?: (
+  leaveOneOutSimple: (
     lats: Float64Array,
     lons: Float64Array,
     values: Float64Array,
@@ -260,7 +310,7 @@ export type RawModule = {
     range: number,
     shape?: number
   ) => unknown;
-  kFoldSimple?: (
+  kFoldSimple: (
     lats: Float64Array,
     lons: Float64Array,
     values: Float64Array,
@@ -272,7 +322,7 @@ export type RawModule = {
     range: number,
     shape?: number
   ) => unknown;
-  leaveOneOutUniversal?: (
+  leaveOneOutUniversal: (
     lats: Float64Array,
     lons: Float64Array,
     values: Float64Array,
@@ -283,7 +333,7 @@ export type RawModule = {
     range: number,
     shape?: number
   ) => unknown;
-  kFoldUniversal?: (
+  kFoldUniversal: (
     lats: Float64Array,
     lons: Float64Array,
     values: Float64Array,
@@ -295,7 +345,7 @@ export type RawModule = {
     range: number,
     shape?: number
   ) => unknown;
-  leaveOneOutProjected?: (
+  leaveOneOutProjected: (
     xs: Float64Array,
     ys: Float64Array,
     values: Float64Array,
@@ -307,7 +357,7 @@ export type RawModule = {
     range: number,
     shape?: number
   ) => unknown;
-  kFoldProjected?: (
+  kFoldProjected: (
     xs: Float64Array,
     ys: Float64Array,
     values: Float64Array,
@@ -320,7 +370,7 @@ export type RawModule = {
     range: number,
     shape?: number
   ) => unknown;
-  leaveOneOutBinomial?: (
+  leaveOneOutBinomial: (
     lats: Float64Array,
     lons: Float64Array,
     successes: Uint32Array,
@@ -333,7 +383,7 @@ export type RawModule = {
     priorAlpha?: number,
     priorBeta?: number
   ) => unknown;
-  kFoldBinomial?: (
+  kFoldBinomial: (
     lats: Float64Array,
     lons: Float64Array,
     successes: Uint32Array,
@@ -347,7 +397,38 @@ export type RawModule = {
     priorAlpha?: number,
     priorBeta?: number
   ) => unknown;
-  conditionalSimulate?: (
+  leaveOneOutBinomialProjected: (
+    xs: Float64Array,
+    ys: Float64Array,
+    successes: Uint32Array,
+    trials: Uint32Array,
+    majorAngleDeg: number,
+    rangeRatio: number,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape?: number,
+    priorAlpha?: number,
+    priorBeta?: number
+  ) => unknown;
+  kFoldBinomialProjected: (
+    xs: Float64Array,
+    ys: Float64Array,
+    successes: Uint32Array,
+    trials: Uint32Array,
+    majorAngleDeg: number,
+    rangeRatio: number,
+    k: number,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape?: number,
+    priorAlpha?: number,
+    priorBeta?: number
+  ) => unknown;
+  conditionalSimulate: (
     conditioningLats: Float64Array,
     conditioningLons: Float64Array,
     conditioningValues: Float64Array,
@@ -361,7 +442,7 @@ export type RawModule = {
     seed: bigint,
     targetOrder?: Uint32Array
   ) => unknown;
-  conditionalSimulateSimple?: (
+  conditionalSimulateSimple: (
     conditioningLats: Float64Array,
     conditioningLons: Float64Array,
     conditioningValues: Float64Array,
@@ -376,7 +457,7 @@ export type RawModule = {
     seed: bigint,
     targetOrder?: Uint32Array
   ) => unknown;
-  conditionalSimulateUniversal?: (
+  conditionalSimulateUniversal: (
     conditioningLats: Float64Array,
     conditioningLons: Float64Array,
     conditioningValues: Float64Array,
@@ -391,7 +472,7 @@ export type RawModule = {
     seed: bigint,
     targetOrder?: Uint32Array
   ) => unknown;
-  conditionalSimulateProjected?: (
+  conditionalSimulateProjected: (
     conditioningXs: Float64Array,
     conditioningYs: Float64Array,
     conditioningValues: Float64Array,
@@ -407,7 +488,7 @@ export type RawModule = {
     seed: bigint,
     targetOrder?: Uint32Array
   ) => unknown;
-  conditionalSimulateBinomial?: (
+  conditionalSimulateBinomial: (
     conditioningLats: Float64Array,
     conditioningLons: Float64Array,
     successes: Uint32Array,
@@ -424,12 +505,93 @@ export type RawModule = {
     seed: bigint,
     targetOrder?: Uint32Array
   ) => unknown;
-  evaluateNestedVariogram?: (
+  conditionalSimulateMany: (
+    conditioningLats: Float64Array,
+    conditioningLons: Float64Array,
+    conditioningValues: Float64Array,
+    targetLats: Float64Array,
+    targetLons: Float64Array,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape: number | undefined,
+    nRealizations: number,
+    baseSeed: bigint,
+    targetOrder?: Uint32Array
+  ) => unknown;
+  conditionalSimulateManyBinomial: (
+    conditioningLats: Float64Array,
+    conditioningLons: Float64Array,
+    successes: Uint32Array,
+    trials: Uint32Array,
+    targetLats: Float64Array,
+    targetLons: Float64Array,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape: number | undefined,
+    priorAlpha: number | undefined,
+    priorBeta: number | undefined,
+    nRealizations: number,
+    baseSeed: bigint,
+    targetOrder?: Uint32Array
+  ) => unknown;
+  conditionalSimulateBinomialProjected: (
+    conditioningXs: Float64Array,
+    conditioningYs: Float64Array,
+    successes: Uint32Array,
+    trials: Uint32Array,
+    targetXs: Float64Array,
+    targetYs: Float64Array,
+    majorAngleDeg: number,
+    rangeRatio: number,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape: number | undefined,
+    priorAlpha: number | undefined,
+    priorBeta: number | undefined,
+    seed: bigint,
+    targetOrder?: Uint32Array
+  ) => unknown;
+  conditionalSimulateManyBinomialProjected: (
+    conditioningXs: Float64Array,
+    conditioningYs: Float64Array,
+    successes: Uint32Array,
+    trials: Uint32Array,
+    targetXs: Float64Array,
+    targetYs: Float64Array,
+    majorAngleDeg: number,
+    rangeRatio: number,
+    variogramType: string,
+    nugget: number,
+    sill: number,
+    range: number,
+    shape: number | undefined,
+    priorAlpha: number | undefined,
+    priorBeta: number | undefined,
+    nRealizations: number,
+    baseSeed: bigint,
+    targetOrder?: Uint32Array
+  ) => unknown;
+  evaluateNestedVariogram: (
     components: unknown,
     distances: Float64Array
   ) => unknown;
+  aggregatePolygonsOverEnsemble: (
+    samples: Float64Array,
+    nRealizations: number,
+    nTargets: number,
+    polygonIndices: Uint32Array,
+    polygonWeights: Float64Array,
+    polygonOffsets: Uint32Array,
+    quantiles: Float64Array
+  ) => unknown;
   webgpuAvailable?: () => Promise<unknown>;
-  leaveOneOutSpaceTime?: (
+  leaveOneOutSpaceTime: (
     lats: Float64Array,
     lons: Float64Array,
     times: Float64Array,
@@ -449,7 +611,7 @@ export type RawModule = {
     k2: number | undefined,
     k3: number | undefined
   ) => unknown;
-  kFoldSpaceTime?: (
+  kFoldSpaceTime: (
     lats: Float64Array,
     lons: Float64Array,
     times: Float64Array,
@@ -470,7 +632,7 @@ export type RawModule = {
     k2: number | undefined,
     k3: number | undefined
   ) => unknown;
-  leaveOneOutSpaceTimeSimple?: (
+  leaveOneOutSpaceTimeSimple: (
     lats: Float64Array,
     lons: Float64Array,
     times: Float64Array,
@@ -491,7 +653,7 @@ export type RawModule = {
     k2: number | undefined,
     k3: number | undefined
   ) => unknown;
-  kFoldSpaceTimeSimple?: (
+  kFoldSpaceTimeSimple: (
     lats: Float64Array,
     lons: Float64Array,
     times: Float64Array,
@@ -513,7 +675,7 @@ export type RawModule = {
     k2: number | undefined,
     k3: number | undefined
   ) => unknown;
-  leaveOneOutSpaceTimeUniversal?: (
+  leaveOneOutSpaceTimeUniversal: (
     lats: Float64Array,
     lons: Float64Array,
     times: Float64Array,
@@ -534,7 +696,7 @@ export type RawModule = {
     k2: number | undefined,
     k3: number | undefined
   ) => unknown;
-  kFoldSpaceTimeUniversal?: (
+  kFoldSpaceTimeUniversal: (
     lats: Float64Array,
     lons: Float64Array,
     times: Float64Array,
@@ -556,7 +718,7 @@ export type RawModule = {
     k2: number | undefined,
     k3: number | undefined
   ) => unknown;
-  leaveOneOutSpaceTimeBinomial?: (
+  leaveOneOutSpaceTimeBinomial: (
     lats: Float64Array,
     lons: Float64Array,
     times: Float64Array,
@@ -579,7 +741,7 @@ export type RawModule = {
     priorAlpha: number | undefined,
     priorBeta: number | undefined
   ) => unknown;
-  kFoldSpaceTimeBinomial?: (
+  kFoldSpaceTimeBinomial: (
     lats: Float64Array,
     lons: Float64Array,
     times: Float64Array,
@@ -603,7 +765,7 @@ export type RawModule = {
     priorAlpha: number | undefined,
     priorBeta: number | undefined
   ) => unknown;
-  conditionalSimulateSpaceTime?: (
+  conditionalSimulateSpaceTime: (
     conditioningLats: Float64Array,
     conditioningLons: Float64Array,
     conditioningTimes: Float64Array,
@@ -628,7 +790,7 @@ export type RawModule = {
     seed: bigint,
     targetOrder?: Uint32Array
   ) => unknown;
-  conditionalSimulateSpaceTimeSimple?: (
+  conditionalSimulateSpaceTimeSimple: (
     conditioningLats: Float64Array,
     conditioningLons: Float64Array,
     conditioningTimes: Float64Array,
@@ -654,7 +816,7 @@ export type RawModule = {
     seed: bigint,
     targetOrder?: Uint32Array
   ) => unknown;
-  conditionalSimulateSpaceTimeUniversal?: (
+  conditionalSimulateSpaceTimeUniversal: (
     conditioningLats: Float64Array,
     conditioningLons: Float64Array,
     conditioningTimes: Float64Array,
@@ -680,7 +842,7 @@ export type RawModule = {
     seed: bigint,
     targetOrder?: Uint32Array
   ) => unknown;
-  conditionalSimulateSpaceTimeBinomial?: (
+  conditionalSimulateSpaceTimeBinomial: (
     conditioningLats: Float64Array,
     conditioningLons: Float64Array,
     conditioningTimes: Float64Array,
@@ -706,6 +868,61 @@ export type RawModule = {
     priorAlpha: number | undefined,
     priorBeta: number | undefined,
     seed: bigint,
+    targetOrder?: Uint32Array
+  ) => unknown;
+  conditionalSimulateSpaceTimeMany: (
+    conditioningLats: Float64Array,
+    conditioningLons: Float64Array,
+    conditioningTimes: Float64Array,
+    conditioningValues: Float64Array,
+    targetLats: Float64Array,
+    targetLons: Float64Array,
+    targetTimes: Float64Array,
+    family: string,
+    spatialType: string,
+    spatialNugget: number,
+    spatialSill: number,
+    spatialRange: number,
+    spatialShape: number | undefined,
+    temporalType: string,
+    temporalNugget: number,
+    temporalSill: number,
+    temporalRange: number,
+    temporalShape: number | undefined,
+    k1: number | undefined,
+    k2: number | undefined,
+    k3: number | undefined,
+    nRealizations: number,
+    baseSeed: bigint,
+    targetOrder?: Uint32Array
+  ) => unknown;
+  conditionalSimulateSpaceTimeManyBinomial: (
+    conditioningLats: Float64Array,
+    conditioningLons: Float64Array,
+    conditioningTimes: Float64Array,
+    successes: Uint32Array,
+    trials: Uint32Array,
+    targetLats: Float64Array,
+    targetLons: Float64Array,
+    targetTimes: Float64Array,
+    family: string,
+    spatialType: string,
+    spatialNugget: number,
+    spatialSill: number,
+    spatialRange: number,
+    spatialShape: number | undefined,
+    temporalType: string,
+    temporalNugget: number,
+    temporalSill: number,
+    temporalRange: number,
+    temporalShape: number | undefined,
+    k1: number | undefined,
+    k2: number | undefined,
+    k3: number | undefined,
+    priorAlpha: number | undefined,
+    priorBeta: number | undefined,
+    nRealizations: number,
+    baseSeed: bigint,
     targetOrder?: Uint32Array
   ) => unknown;
   WasmSpaceTimeOrdinaryKriging?: {
@@ -823,7 +1040,7 @@ export type RawModule = {
       k3: number | undefined
     ): WasmSpaceTimeInstance;
   };
-  wasmComputeEmpiricalSpaceTimeVariogram?: (
+  wasmComputeEmpiricalSpaceTimeVariogram: (
     lats: Float64Array,
     lons: Float64Array,
     times: Float64Array,
@@ -834,7 +1051,7 @@ export type RawModule = {
     nTemporalBins: number,
     estimator: string
   ) => unknown;
-  wasmFitSpaceTimeVariogram?: (
+  wasmFitSpaceTimeVariogram: (
     lats: Float64Array,
     lons: Float64Array,
     times: Float64Array,

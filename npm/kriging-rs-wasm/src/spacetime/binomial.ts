@@ -18,12 +18,15 @@ import {
   fittedToSpaceTimeVariogramParams,
   packSpaceTimeVariogram,
 } from "../internal/spacetime.js";
+import { timesFromDates } from "../time.js";
 import type { WasmSpaceTimeBinomialInstance } from "../internal/wasm-shapes.js";
 import type {
   BinomialBatchArrayOutput,
   BinomialGridOutput,
   BinomialPrediction,
+  DateAxisOptions,
   NumericArrayInput,
+  PredictGridAtDateOptions,
   PredictGridAtTimeOptions,
   SpaceTimeBinomialKrigingFromFittedOptions,
   SpaceTimeBinomialKrigingOptions,
@@ -165,4 +168,69 @@ export class SpaceTimeBinomialKriging {
       prevalenceVariances: reshapeFlatToGrid(prevVarFlat, nRows, nCols),
     };
   }
+
+  // -------------------------------------------------------------------------
+  // Date-aware convenience helpers
+  //
+  // Wrap the numeric `times` API with JS `Date` inputs. Conversion uses the
+  // same `timesFromDates` helper exported from this package, so callers can
+  // round-trip with `datesFromTimes`. `timeUnit` and `epoch` default to
+  // `"days"` and the Unix epoch — match whatever convention you used to build
+  // the model.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Like {@link predict} but takes a JS `Date` and projects it onto the
+   * model's numeric time axis using `timeUnit` / `epoch` (defaults `"days"` /
+   * Unix epoch). See {@link DateAxisOptions}.
+   */
+  predictAtDate(
+    lat: number,
+    lon: number,
+    date: Date,
+    options: DateAxisOptions = {}
+  ): BinomialPrediction {
+    const time = dateToTime(date, options);
+    return this.predict(lat, lon, time);
+  }
+
+  /**
+   * Like {@link predictBatch} but takes JS `Date` objects. All `dates` are
+   * converted with the same `timeUnit` / `epoch`.
+   */
+  predictBatchAtDates(
+    lats: NumericArrayInput,
+    lons: NumericArrayInput,
+    dates: readonly Date[],
+    options: DateAxisOptions = {}
+  ): BinomialPrediction[] {
+    const times = timesFromDates(dates, options.timeUnit, options.epoch);
+    return this.predictBatch(lats, lons, times);
+  }
+
+  /**
+   * Like {@link predictBatchArrays} but takes JS `Date` objects.
+   */
+  predictBatchArraysAtDates(
+    lats: NumericArrayInput,
+    lons: NumericArrayInput,
+    dates: readonly Date[],
+    options: DateAxisOptions = {}
+  ): BinomialBatchArrayOutput {
+    const times = timesFromDates(dates, options.timeUnit, options.epoch);
+    return this.predictBatchArrays(lats, lons, times);
+  }
+
+  /**
+   * Like {@link predictGridAtTime} but takes a JS `Date`. Useful for slicing
+   * a time-series of grids at calendar-aligned dates.
+   */
+  predictGridAtDate(options: PredictGridAtDateOptions): BinomialGridOutput {
+    const time = dateToTime(options.date, options);
+    return this.predictGridAtTime({ ...options, time });
+  }
+}
+
+function dateToTime(date: Date, options: DateAxisOptions): number {
+  return timesFromDates([date], options.timeUnit, options.epoch)[0];
 }

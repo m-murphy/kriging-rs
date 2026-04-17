@@ -6,12 +6,18 @@
  * @module
  */
 
-import { toUint32Array } from "./internal/convert.js";
+import { kFoldBinomial, leaveOneOutBinomial } from "./cv.js";
+import {
+  resolveBinomialPriorOrDefault,
+  smoothedLogits,
+} from "./internal/prior.js";
 import { BinomialKriging } from "./kriging/binomial.js";
 import { OrdinaryKriging } from "./kriging/ordinary.js";
 import type {
+  BinomialCvSummary,
   BinomialGridOutput,
   InterpolateBinomialToGridOptions,
+  InterpolateBinomialToGridResult,
   InterpolateOrdinaryToGridOptions,
   OrdinaryGridOutput,
 } from "./types.js";
@@ -57,30 +63,43 @@ export function interpolateOrdinaryToGrid(
 }
 
 /**
- * One-shot binomial kriging: fit variogram on logit(prevalence), build model, predict on a
- * rectangular grid, then free the model. Returns 2D prevalence and variance grids.
+ * One-shot binomial kriging: fit a variogram on the same EB-smoothed logits the
+ * binomial kriger interpolates internally, build a model, predict prevalence on
+ * a rectangular grid, then free the model. Returns 2D prevalence, logit, and
+ * variance grids.
  *
- * @param options - Sample lats, lons, successes, trials; grid bounds and xCells/yCells; variogramType; optional nBins, nuggetOverride, prior
- * @returns { prevalences, logitValues, variances } as number[][], shape [yCells][xCells]
+ * The variogram fit and the kriging system both see
+ * `logit((sᵢ + α)/(nᵢ + α + β))` per station, with `α/β` from the supplied
+ * `prior` (default Beta(½, ½)) — so the fitted nugget/sill/range are calibrated
+ * for the field the model actually solves on. Pass `estimator: "cressie-hawkins"`
+ * for a robust fit when counts are small / heavy-tailed.
+ *
+ * Pass `withCv` (boolean, `"loo"`, or `{ k }`) to additionally run binomial
+ * cross-validation against the fitted variogram and include a
+ * {@link BinomialCvSummary} on the returned object.
+ *
+ * @returns A {@link InterpolateBinomialToGridResult} carrying the prevalence /
+ * logit / variance grids, the fitted variogram, and (when requested) a CV
+ * summary.
  */
 export function interpolateBinomialToGrid(
   options: InterpolateBinomialToGridOptions
-): BinomialGridOutput {
-  const s = toUint32Array(options.successes);
-  const t = toUint32Array(options.trials);
-  const logits: number[] = [];
-  for (let i = 0; i < s.length; i++) {
-    const p = t[i] > 0 ? s[i] / t[i] : 0.5;
-    const clamped = Math.max(1e-6, Math.min(1 - 1e-6, p));
-    logits.push(Math.log(clamped / (1 - clamped)));
-  }
+): InterpolateBinomialToGridResult {
+  const successesArr = Array.from(options.successes as ArrayLike<number>);
+  const trialsArr = Array.from(options.trials as ArrayLike<number>);
+  const prior = resolveBinomialPriorOrDefault(options.prior);
+  const logits = smoothedLogits(successesArr, trialsArr, prior);
+
   const fitted = fitVariogram({
     sampleLats: options.lats,
     sampleLons: options.lons,
     values: logits,
     variogramType: options.variogramType,
     nBins: options.nBins,
+    maxDistance: options.maxDistance,
+    estimator: options.estimator,
   });
+
   const model = options.prior
     ? BinomialKriging.fromFittedVariogramWithPrior({
         lats: options.lats,
@@ -99,8 +118,10 @@ export function interpolateBinomialToGrid(
         fittedVariogram: fitted,
         nuggetOverride: options.nuggetOverride,
       });
+
+  let grids: BinomialGridOutput;
   try {
-    return model.predictGrid({
+    grids = model.predictGrid({
       west: options.west,
       south: options.south,
       east: options.east,
@@ -111,4 +132,51 @@ export function interpolateBinomialToGrid(
   } finally {
     model.free();
   }
+
+  const result: InterpolateBinomialToGridResult = {
+    ...grids,
+    fittedVariogram: fitted,
+  };
+
+  const cvSummary = runBinomialCvIfRequested(options, fitted);
+  if (cvSummary !== undefined) {
+    result.cv = cvSummary;
+  }
+  return result;
+}
+
+function runBinomialCvIfRequested(
+  options: InterpolateBinomialToGridOptions,
+  fittedVariogram: InterpolateBinomialToGridResult["fittedVariogram"]
+): BinomialCvSummary | undefined {
+  const withCv = options.withCv;
+  if (!withCv) return undefined;
+
+  const variogram = {
+    variogramType: fittedVariogram.variogramType,
+    nugget: options.nuggetOverride ?? fittedVariogram.nugget,
+    sill: fittedVariogram.sill,
+    range: fittedVariogram.range,
+    shape: fittedVariogram.shape,
+  };
+
+  if (withCv === true || withCv === "loo") {
+    return leaveOneOutBinomial({
+      lats: options.lats,
+      lons: options.lons,
+      successes: options.successes,
+      trials: options.trials,
+      variogram,
+      prior: options.prior,
+    }).summary;
+  }
+  return kFoldBinomial({
+    lats: options.lats,
+    lons: options.lons,
+    successes: options.successes,
+    trials: options.trials,
+    variogram,
+    k: withCv.k,
+    prior: options.prior,
+  }).summary;
 }

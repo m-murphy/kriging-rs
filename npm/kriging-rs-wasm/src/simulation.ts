@@ -22,6 +22,7 @@
 import { KrigingError, wrapThrown } from "./errors.js";
 import {
   requireFloat64Array,
+  requireNumber,
   toFloat64Array,
   toUint32Array,
 } from "./internal/convert.js";
@@ -32,9 +33,14 @@ import {
   requireSpaceTimeUniversalTrend,
 } from "./internal/spacetime.js";
 import type {
+  BinomialSimulationManyResult,
   BinomialSimulationResult,
   ConditionalSimulateBinomialOptions,
+  ConditionalSimulateBinomialProjectedOptions,
+  ConditionalSimulateManyBinomialOptions,
+  ConditionalSimulateManyBinomialProjectedOptions,
   ConditionalSimulateManyOptions,
+  ConditionalSimulateManySpaceTimeBinomialOptions,
   ConditionalSimulateManySpaceTimeOptions,
   ConditionalSimulateOptions,
   ConditionalSimulateProjectedOptions,
@@ -45,12 +51,6 @@ import type {
   ConditionalSimulateSpaceTimeUniversalOptions,
   ConditionalSimulateUniversalOptions,
 } from "./types.js";
-
-function unavailable(name: string): never {
-  throw new KrigingError(`${name} is not available; rebuild the WASM package`, {
-    code: "backend_unavailable",
-  });
-}
 
 function normalizeSeed(seed: number | bigint | undefined): bigint {
   return typeof seed === "bigint" ? seed : BigInt(seed ?? 0);
@@ -84,9 +84,6 @@ export function conditionalSimulate(
   options: ConditionalSimulateOptions
 ): Float64Array {
   const mod = requireLoadedModule();
-  if (typeof mod.conditionalSimulate !== "function") {
-    unavailable("conditionalSimulate");
-  }
   const seed = normalizeSeed(options.seed);
   const targetOrder = normalizeTargetOrder(options.targetOrder);
   try {
@@ -121,9 +118,6 @@ export function conditionalSimulateSimple(
   options: ConditionalSimulateSimpleOptions
 ): Float64Array {
   const mod = requireLoadedModule();
-  if (typeof mod.conditionalSimulateSimple !== "function") {
-    unavailable("conditionalSimulateSimple");
-  }
   const seed = normalizeSeed(options.seed);
   const targetOrder = normalizeTargetOrder(options.targetOrder);
   try {
@@ -159,9 +153,6 @@ export function conditionalSimulateUniversal(
   options: ConditionalSimulateUniversalOptions
 ): Float64Array {
   const mod = requireLoadedModule();
-  if (typeof mod.conditionalSimulateUniversal !== "function") {
-    unavailable("conditionalSimulateUniversal");
-  }
   const seed = normalizeSeed(options.seed);
   const targetOrder = normalizeTargetOrder(options.targetOrder);
   try {
@@ -197,9 +188,6 @@ export function conditionalSimulateProjected(
   options: ConditionalSimulateProjectedOptions
 ): Float64Array {
   const mod = requireLoadedModule();
-  if (typeof mod.conditionalSimulateProjected !== "function") {
-    unavailable("conditionalSimulateProjected");
-  }
   const seed = normalizeSeed(options.seed);
   const targetOrder = normalizeTargetOrder(options.targetOrder);
   try {
@@ -244,9 +232,6 @@ export function conditionalSimulateBinomial(
   options: ConditionalSimulateBinomialOptions
 ): BinomialSimulationResult {
   const mod = requireLoadedModule();
-  if (typeof mod.conditionalSimulateBinomial !== "function") {
-    unavailable("conditionalSimulateBinomial");
-  }
   const { alpha, beta } = resolveBinomialPrior(options.prior);
   const seed = normalizeSeed(options.seed);
   const targetOrder = normalizeTargetOrder(options.targetOrder);
@@ -290,9 +275,6 @@ export function conditionalSimulateSpaceTime(
   options: ConditionalSimulateSpaceTimeOptions
 ): Float64Array {
   const mod = requireLoadedModule();
-  if (typeof mod.conditionalSimulateSpaceTime !== "function") {
-    unavailable("conditionalSimulateSpaceTime");
-  }
   const seed = normalizeSeed(options.seed);
   const targetOrder = normalizeTargetOrder(options.targetOrder);
   const packed = packSpaceTimeVariogram(options.variogram);
@@ -333,9 +315,6 @@ export function conditionalSimulateSpaceTimeSimple(
   options: ConditionalSimulateSpaceTimeSimpleOptions
 ): Float64Array {
   const mod = requireLoadedModule();
-  if (typeof mod.conditionalSimulateSpaceTimeSimple !== "function") {
-    unavailable("conditionalSimulateSpaceTimeSimple");
-  }
   const seed = normalizeSeed(options.seed);
   const targetOrder = normalizeTargetOrder(options.targetOrder);
   const packed = packSpaceTimeVariogram(options.variogram);
@@ -381,9 +360,6 @@ export function conditionalSimulateSpaceTimeUniversal(
   options: ConditionalSimulateSpaceTimeUniversalOptions
 ): Float64Array {
   const mod = requireLoadedModule();
-  if (typeof mod.conditionalSimulateSpaceTimeUniversal !== "function") {
-    unavailable("conditionalSimulateSpaceTimeUniversal");
-  }
   const seed = normalizeSeed(options.seed);
   const targetOrder = normalizeTargetOrder(options.targetOrder);
   const packed = packSpaceTimeVariogram(options.variogram);
@@ -430,9 +406,6 @@ export function conditionalSimulateSpaceTimeBinomial(
   options: ConditionalSimulateSpaceTimeBinomialOptions
 ): BinomialSimulationResult {
   const mod = requireLoadedModule();
-  if (typeof mod.conditionalSimulateSpaceTimeBinomial !== "function") {
-    unavailable("conditionalSimulateSpaceTimeBinomial");
-  }
   const { alpha, beta } = resolveBinomialPrior(options.prior);
   const seed = normalizeSeed(options.seed);
   const targetOrder = normalizeTargetOrder(options.targetOrder);
@@ -485,9 +458,10 @@ export function conditionalSimulateSpaceTimeBinomial(
  * `Float64Array(nRealizations * nTargets)` where row `k` holds the k-th
  * realization in input order.
  *
- * Each realization is produced by a single call to {@link conditionalSimulate},
- * so the output is identical to calling it in a loop — but collected into one
- * buffer for easy aggregation (mean, quantiles, variance).
+ * The entire ensemble is drawn in a single JS<->WASM call via the native
+ * `conditionalSimulateMany` entry point, which amortizes the conditioning
+ * factorization across realizations. Output is bit-identical to calling
+ * {@link conditionalSimulate} with `seed = baseSeed + k` for each `k`.
  */
 export function conditionalSimulateMany(
   options: ConditionalSimulateManyOptions
@@ -495,31 +469,37 @@ export function conditionalSimulateMany(
   const n = requirePositiveInt(options.nRealizations, "nRealizations");
   const baseSeed = normalizeSeed(options.baseSeed);
   const targetLats = toFloat64Array(options.targetLats);
-  const nTargets = targetLats.length;
-  const out = new Float64Array(n * nTargets);
-  const {
-    nRealizations: _nRealizations,
-    baseSeed: _baseSeed,
-    ...rest
-  } = options;
-  void _nRealizations;
-  void _baseSeed;
-  for (let k = 0; k < n; k++) {
-    const row = conditionalSimulate({
-      ...rest,
+
+  const mod = requireLoadedModule();
+  const targetOrder = normalizeTargetOrder(options.targetOrder);
+  try {
+    const out = mod.conditionalSimulateMany(
+      toFloat64Array(options.conditioningLats),
+      toFloat64Array(options.conditioningLons),
+      toFloat64Array(options.conditioningValues),
       targetLats,
-      seed: baseSeed + BigInt(k),
-    });
-    out.set(row, k * nTargets);
+      toFloat64Array(options.targetLons),
+      options.variogram.variogramType,
+      options.variogram.nugget,
+      options.variogram.sill,
+      options.variogram.range,
+      options.variogram.shape,
+      n,
+      baseSeed,
+      targetOrder
+    );
+    return requireFloat64Array(out);
+  } catch (e) {
+    throw wrapThrown(e);
   }
-  return out;
 }
 
 /**
  * Draw `nRealizations` independent space-time ordinary-kriging SGS realizations
  * with deterministic seeds `baseSeed + k`. Returns a flat row-major
  * `Float64Array(nRealizations * nTargets)` where row `k` holds the k-th
- * realization in input order.
+ * realization in input order. Output is bit-identical to calling
+ * {@link conditionalSimulateSpaceTime} with `seed = baseSeed + k` for each `k`.
  */
 export function conditionalSimulateManySpaceTime(
   options: ConditionalSimulateManySpaceTimeOptions
@@ -527,22 +507,236 @@ export function conditionalSimulateManySpaceTime(
   const n = requirePositiveInt(options.nRealizations, "nRealizations");
   const baseSeed = normalizeSeed(options.baseSeed);
   const targetLats = toFloat64Array(options.targetLats);
-  const nTargets = targetLats.length;
-  const out = new Float64Array(n * nTargets);
-  const {
-    nRealizations: _nRealizations,
-    baseSeed: _baseSeed,
-    ...rest
-  } = options;
-  void _nRealizations;
-  void _baseSeed;
-  for (let k = 0; k < n; k++) {
-    const row = conditionalSimulateSpaceTime({
-      ...rest,
+
+  const mod = requireLoadedModule();
+  const targetOrder = normalizeTargetOrder(options.targetOrder);
+  const packed = packSpaceTimeVariogram(options.variogram);
+  try {
+    const out = mod.conditionalSimulateSpaceTimeMany(
+      toFloat64Array(options.conditioningLats),
+      toFloat64Array(options.conditioningLons),
+      toFloat64Array(options.conditioningTimes),
+      toFloat64Array(options.conditioningValues),
       targetLats,
-      seed: baseSeed + BigInt(k),
-    });
-    out.set(row, k * nTargets);
+      toFloat64Array(options.targetLons),
+      toFloat64Array(options.targetTimes),
+      packed.family,
+      packed.spatialType,
+      packed.spatialNugget,
+      packed.spatialSill,
+      packed.spatialRange,
+      packed.spatialShape,
+      packed.temporalType,
+      packed.temporalNugget,
+      packed.temporalSill,
+      packed.temporalRange,
+      packed.temporalShape,
+      packed.k1,
+      packed.k2,
+      packed.k3,
+      n,
+      baseSeed,
+      targetOrder
+    );
+    return requireFloat64Array(out);
+  } catch (e) {
+    throw wrapThrown(e);
   }
-  return out;
+}
+
+interface RawBinomialManyPayload {
+  nRealizations: unknown;
+  nTargets: unknown;
+  logitSamples: unknown;
+  prevalenceSamples: unknown;
+}
+
+function unpackBinomialManyPayload(
+  raw: RawBinomialManyPayload
+): BinomialSimulationManyResult {
+  return {
+    nRealizations: requireNumber(raw.nRealizations),
+    nTargets: requireNumber(raw.nTargets),
+    logitSamples: requireFloat64Array(raw.logitSamples),
+    prevalenceSamples: requireFloat64Array(raw.prevalenceSamples),
+  };
+}
+
+/**
+ * Draw `nRealizations` independent binomial SGS realizations with deterministic seeds
+ * `baseSeed + k`. The k-th row of either `logitSamples` or `prevalenceSamples`
+ * (a `nTargets`-length slice starting at `k * nTargets`) is bit-identical to
+ * {@link conditionalSimulateBinomial} with `seed = baseSeed + k`.
+ *
+ * The entire ensemble is drawn in a single JS<->WASM call, and the EB-smoothed
+ * initial logit pool is computed exactly once.
+ */
+export function conditionalSimulateManyBinomial(
+  options: ConditionalSimulateManyBinomialOptions
+): BinomialSimulationManyResult {
+  const n = requirePositiveInt(options.nRealizations, "nRealizations");
+  const baseSeed = normalizeSeed(options.baseSeed);
+  const targetLats = toFloat64Array(options.targetLats);
+
+  const mod = requireLoadedModule();
+  const { alpha, beta } = resolveBinomialPrior(options.prior);
+  const targetOrder = normalizeTargetOrder(options.targetOrder);
+  try {
+    const raw = mod.conditionalSimulateManyBinomial(
+      toFloat64Array(options.conditioningLats),
+      toFloat64Array(options.conditioningLons),
+      toUint32Array(options.successes),
+      toUint32Array(options.trials),
+      targetLats,
+      toFloat64Array(options.targetLons),
+      options.variogram.variogramType,
+      options.variogram.nugget,
+      options.variogram.sill,
+      options.variogram.range,
+      options.variogram.shape,
+      alpha,
+      beta,
+      n,
+      baseSeed,
+      targetOrder
+    ) as RawBinomialManyPayload;
+    return unpackBinomialManyPayload(raw);
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+}
+
+/**
+ * Draw `nRealizations` independent space-time binomial SGS realizations with seeds
+ * `baseSeed + k`. Same row-major contract as {@link conditionalSimulateManyBinomial}.
+ */
+export function conditionalSimulateManySpaceTimeBinomial(
+  options: ConditionalSimulateManySpaceTimeBinomialOptions
+): BinomialSimulationManyResult {
+  const n = requirePositiveInt(options.nRealizations, "nRealizations");
+  const baseSeed = normalizeSeed(options.baseSeed);
+  const targetLats = toFloat64Array(options.targetLats);
+
+  const mod = requireLoadedModule();
+  const { alpha, beta } = resolveBinomialPrior(options.prior);
+  const targetOrder = normalizeTargetOrder(options.targetOrder);
+  const packed = packSpaceTimeVariogram(options.variogram);
+  try {
+    const raw = mod.conditionalSimulateSpaceTimeManyBinomial(
+      toFloat64Array(options.conditioningLats),
+      toFloat64Array(options.conditioningLons),
+      toFloat64Array(options.conditioningTimes),
+      toUint32Array(options.successes),
+      toUint32Array(options.trials),
+      targetLats,
+      toFloat64Array(options.targetLons),
+      toFloat64Array(options.targetTimes),
+      packed.family,
+      packed.spatialType,
+      packed.spatialNugget,
+      packed.spatialSill,
+      packed.spatialRange,
+      packed.spatialShape,
+      packed.temporalType,
+      packed.temporalNugget,
+      packed.temporalSill,
+      packed.temporalRange,
+      packed.temporalShape,
+      packed.k1,
+      packed.k2,
+      packed.k3,
+      alpha,
+      beta,
+      n,
+      baseSeed,
+      targetOrder
+    ) as RawBinomialManyPayload;
+    return unpackBinomialManyPayload(raw);
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+}
+
+/**
+ * Sequential Gaussian simulation for binomial (count) data on **projected**
+ * (planar) coordinates with optional 2-D geometric anisotropy. Same logit-scale
+ * semantics as {@link conditionalSimulateBinomial}; pass `rangeRatio === 1` for
+ * isotropic.
+ */
+export function conditionalSimulateBinomialProjected(
+  options: ConditionalSimulateBinomialProjectedOptions
+): BinomialSimulationResult {
+  const mod = requireLoadedModule();
+  const { alpha, beta } = resolveBinomialPrior(options.prior);
+  const seed = normalizeSeed(options.seed);
+  const targetOrder = normalizeTargetOrder(options.targetOrder);
+  try {
+    const raw = mod.conditionalSimulateBinomialProjected(
+      toFloat64Array(options.conditioningXs),
+      toFloat64Array(options.conditioningYs),
+      toUint32Array(options.successes),
+      toUint32Array(options.trials),
+      toFloat64Array(options.targetXs),
+      toFloat64Array(options.targetYs),
+      options.majorAngleDeg,
+      options.rangeRatio,
+      options.variogram.variogramType,
+      options.variogram.nugget,
+      options.variogram.sill,
+      options.variogram.range,
+      options.variogram.shape,
+      alpha,
+      beta,
+      seed,
+      targetOrder
+    ) as { logitSamples: unknown; prevalenceSamples: unknown };
+    return {
+      logitSamples: requireFloat64Array(raw.logitSamples),
+      prevalenceSamples: requireFloat64Array(raw.prevalenceSamples),
+    };
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+}
+
+/**
+ * Draw `nRealizations` independent projected binomial SGS realizations with
+ * deterministic seeds `baseSeed + k`. See {@link conditionalSimulateManyBinomial}
+ * for buffer layout.
+ */
+export function conditionalSimulateManyBinomialProjected(
+  options: ConditionalSimulateManyBinomialProjectedOptions
+): BinomialSimulationManyResult {
+  const n = requirePositiveInt(options.nRealizations, "nRealizations");
+  const baseSeed = normalizeSeed(options.baseSeed);
+  const targetXs = toFloat64Array(options.targetXs);
+
+  const mod = requireLoadedModule();
+  const { alpha, beta } = resolveBinomialPrior(options.prior);
+  const targetOrder = normalizeTargetOrder(options.targetOrder);
+  try {
+    const raw = mod.conditionalSimulateManyBinomialProjected(
+      toFloat64Array(options.conditioningXs),
+      toFloat64Array(options.conditioningYs),
+      toUint32Array(options.successes),
+      toUint32Array(options.trials),
+      targetXs,
+      toFloat64Array(options.targetYs),
+      options.majorAngleDeg,
+      options.rangeRatio,
+      options.variogram.variogramType,
+      options.variogram.nugget,
+      options.variogram.sill,
+      options.variogram.range,
+      options.variogram.shape,
+      alpha,
+      beta,
+      n,
+      baseSeed,
+      targetOrder
+    ) as RawBinomialManyPayload;
+    return unpackBinomialManyPayload(raw);
+  } catch (e) {
+    throw wrapThrown(e);
+  }
 }

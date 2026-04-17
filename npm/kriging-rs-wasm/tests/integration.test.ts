@@ -11,6 +11,7 @@ import {
   SimpleKriging,
   UniversalKriging,
   ProjectedKriging,
+  BinomialProjectedKriging,
   SpaceTimeOrdinaryKriging,
   SpaceTimeSimpleKriging,
   SpaceTimeUniversalKriging,
@@ -33,13 +34,19 @@ import {
   kFoldProjected,
   leaveOneOutBinomial,
   kFoldBinomial,
+  leaveOneOutBinomialProjected,
+  kFoldBinomialProjected,
   conditionalSimulate,
   conditionalSimulateMany,
+  conditionalSimulateManyBinomial,
   conditionalSimulateManySpaceTime,
+  conditionalSimulateManySpaceTimeBinomial,
   conditionalSimulateSimple,
   conditionalSimulateUniversal,
   conditionalSimulateProjected,
   conditionalSimulateBinomial,
+  conditionalSimulateBinomialProjected,
+  conditionalSimulateManyBinomialProjected,
   leaveOneOutSpaceTime,
   kFoldSpaceTime,
   leaveOneOutSpaceTimeSimple,
@@ -52,6 +59,23 @@ import {
   conditionalSimulateSpaceTimeSimple,
   conditionalSimulateSpaceTimeUniversal,
   conditionalSimulateSpaceTimeBinomial,
+  ensembleExceedanceProbability,
+  ensembleMean,
+  ensembleQuantiles,
+  ensembleVariance,
+  gridCellCenters,
+  reshapeGridRow,
+  simulateBinomialGrid,
+  simulateBinomialGridEnsemble,
+  simulateBinomialGridSummary,
+  simulateBinomialSpaceTimeGrid,
+  simulateBinomialSpaceTimeGridAtDate,
+  simulateBinomialSpaceTimeGridEnsemble,
+  simulateBinomialSpaceTimeGridEnsembleAtDate,
+  simulateBinomialSpaceTimeGridSummary,
+  simulateBinomialSpaceTimeGridSummaryAtDate,
+  aggregatePrevalenceByPolygon,
+  polygonCellsFromMask,
   evaluateNestedVariogram,
   VariogramType,
   type OrdinaryPrediction,
@@ -503,6 +527,151 @@ describe("Binomial kriging", () => {
     expect(out.prevalences[0].length).toBe(2);
     expect(out.variances.length).toBe(2);
     expect(Number.isFinite(out.prevalences[0][0])).toBe(true);
+    expect(out.fittedVariogram.variogramType).toBe("exponential");
+    expect(Number.isFinite(out.fittedVariogram.range)).toBe(true);
+    expect(out.cv).toBeUndefined();
+  });
+
+  test("interpolateBinomialToGrid fits on smoothed logits (matches manual pipeline)", () => {
+    const out = interpolateBinomialToGrid({
+      lats,
+      lons,
+      successes,
+      trials,
+      west: 0,
+      south: 0,
+      east: 1,
+      north: 1,
+      xCells: 2,
+      yCells: 2,
+      variogramType: "exponential",
+      nBins: 12,
+    });
+
+    const ALPHA = 0.5;
+    const BETA = 0.5;
+    const manualLogits = successes.map((s, i) => {
+      const p = (s + ALPHA) / (trials[i] + ALPHA + BETA);
+      return Math.log(p / (1 - p));
+    });
+    const manualFit = fitVariogram({
+      sampleLats: lats,
+      sampleLons: lons,
+      values: manualLogits,
+      variogramType: "exponential",
+      nBins: 12,
+    });
+    const manualModel = BinomialKriging.fromFittedVariogram({
+      lats,
+      lons,
+      successes,
+      trials,
+      fittedVariogram: manualFit,
+    });
+    try {
+      const manualGrid = manualModel.predictGrid({
+        west: 0,
+        south: 0,
+        east: 1,
+        north: 1,
+        xCells: 2,
+        yCells: 2,
+      });
+      for (let j = 0; j < 2; j++) {
+        for (let i = 0; i < 2; i++) {
+          expect(out.prevalences[j][i]).toBeCloseTo(
+            manualGrid.prevalences[j][i],
+            12
+          );
+          expect(out.logitValues[j][i]).toBeCloseTo(
+            manualGrid.logitValues[j][i],
+            12
+          );
+        }
+      }
+      expect(out.fittedVariogram.nugget).toBeCloseTo(manualFit.nugget, 12);
+      expect(out.fittedVariogram.sill).toBeCloseTo(manualFit.sill, 12);
+      expect(out.fittedVariogram.range).toBeCloseTo(manualFit.range, 12);
+    } finally {
+      manualModel.free();
+    }
+  });
+
+  test("interpolateBinomialToGrid honors estimator option", () => {
+    const classical = interpolateBinomialToGrid({
+      lats,
+      lons,
+      successes,
+      trials,
+      west: 0,
+      south: 0,
+      east: 1,
+      north: 1,
+      xCells: 2,
+      yCells: 2,
+      variogramType: "exponential",
+      nBins: 12,
+    });
+    const robust = interpolateBinomialToGrid({
+      lats,
+      lons,
+      successes,
+      trials,
+      west: 0,
+      south: 0,
+      east: 1,
+      north: 1,
+      xCells: 2,
+      yCells: 2,
+      variogramType: "exponential",
+      nBins: 12,
+      estimator: "cressie-hawkins",
+    });
+    expect(Number.isFinite(robust.fittedVariogram.range)).toBe(true);
+    expect(Number.isFinite(classical.fittedVariogram.range)).toBe(true);
+  });
+
+  test("interpolateBinomialToGrid with withCv returns CV summary on both scales", () => {
+    const out = interpolateBinomialToGrid({
+      lats,
+      lons,
+      successes,
+      trials,
+      west: 0,
+      south: 0,
+      east: 1,
+      north: 1,
+      xCells: 2,
+      yCells: 2,
+      variogramType: "exponential",
+      nBins: 12,
+      withCv: true,
+    });
+    expect(out.cv).toBeDefined();
+    expect(out.cv?.n).toBe(lats.length);
+    expect(out.cv?.nEvaluated).toBeLessThanOrEqual(lats.length);
+    expect(Number.isFinite(out.cv?.logit.rmse)).toBe(true);
+    expect(Number.isFinite(out.cv?.prevalence.rmse)).toBe(true);
+  });
+
+  test("interpolateBinomialToGrid with withCv {k} runs k-fold CV", () => {
+    const out = interpolateBinomialToGrid({
+      lats,
+      lons,
+      successes,
+      trials,
+      west: 0,
+      south: 0,
+      east: 1,
+      north: 1,
+      xCells: 2,
+      yCells: 2,
+      variogramType: "exponential",
+      nBins: 12,
+      withCv: { k: 2 },
+    });
+    expect(out.cv).toBeDefined();
+    expect(out.cv?.n).toBe(lats.length);
   });
 
   test("BinomialKriging.fromFittedVariogram produces valid predictions", () => {
@@ -764,6 +933,245 @@ describe("Projected kriging", () => {
           rangeRatio: 2.0,
         })
     ).toThrow(KrigingError);
+  });
+});
+
+describe("Projected binomial kriging", () => {
+  // 4 corner stations of a 1km square in projected (meter) coordinates with a
+  // mild positive logit gradient toward (1, 1).
+  const xs = [0, 1000, 0, 1000];
+  const ys = [0, 0, 1000, 1000];
+  const successes = [3, 7, 4, 9];
+  const trials = [10, 12, 9, 15];
+  const variogram = {
+    variogramType: "exponential" as VariogramTypeName,
+    nugget: 0.1,
+    sill: 1.0,
+    range: 1500,
+  };
+
+  test("BinomialProjectedKriging.predict returns prevalence in [0, 1] with non-negative variance", () => {
+    const model = new BinomialProjectedKriging({
+      xs,
+      ys,
+      successes,
+      trials,
+      variogram,
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+    });
+    try {
+      const pred = model.predict(500, 500);
+      expect(Number.isFinite(pred.prevalence)).toBe(true);
+      expect(Number.isFinite(pred.logitValue)).toBe(true);
+      expect(pred.prevalence).toBeGreaterThanOrEqual(0);
+      expect(pred.prevalence).toBeLessThanOrEqual(1);
+      expect(pred.variance).toBeGreaterThanOrEqual(0);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("BinomialProjectedKriging.predictBatch and predictBatchArrays agree", () => {
+    const model = new BinomialProjectedKriging({
+      xs,
+      ys,
+      successes,
+      trials,
+      variogram,
+      majorAngleDeg: 30,
+      rangeRatio: 0.5,
+    });
+    try {
+      const targets = { xs: [250, 750], ys: [250, 750] };
+      const batch = model.predictBatch(targets.xs, targets.ys);
+      const arrays = model.predictBatchArrays(targets.xs, targets.ys);
+      expect(batch).toHaveLength(2);
+      expect(arrays.prevalences).toBeInstanceOf(Float64Array);
+      expect(arrays.logitValues).toBeInstanceOf(Float64Array);
+      expect(arrays.variances).toBeInstanceOf(Float64Array);
+      for (let i = 0; i < 2; i++) {
+        expect(arrays.prevalences[i]).toBeCloseTo(batch[i].prevalence, 6);
+        expect(arrays.logitValues[i]).toBeCloseTo(batch[i].logitValue, 6);
+        expect(arrays.variances[i]).toBeCloseTo(batch[i].variance, 6);
+      }
+    } finally {
+      model.free();
+    }
+  });
+
+  test("BinomialProjectedKriging.newWithPrior and fromPrecomputedLogits both predict", () => {
+    const withPrior = BinomialProjectedKriging.newWithPrior({
+      xs,
+      ys,
+      successes,
+      trials,
+      variogram,
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+      prior: { alpha: 1, beta: 1 },
+    });
+    const fromLogits = BinomialProjectedKriging.fromPrecomputedLogits({
+      xs,
+      ys,
+      logits: [-1.2, 0.3, -0.9, 0.6],
+      variogram,
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+    });
+    try {
+      for (const m of [withPrior, fromLogits]) {
+        const pred = m.predict(500, 500);
+        expect(pred.prevalence).toBeGreaterThanOrEqual(0);
+        expect(pred.prevalence).toBeLessThanOrEqual(1);
+      }
+    } finally {
+      withPrior.free();
+      fromLogits.free();
+    }
+  });
+
+  test("BinomialProjectedKriging rejects rangeRatio outside (0, 1]", () => {
+    expect(
+      () =>
+        new BinomialProjectedKriging({
+          xs,
+          ys,
+          successes,
+          trials,
+          variogram,
+          majorAngleDeg: 0,
+          rangeRatio: 1.5,
+        })
+    ).toThrow(KrigingError);
+  });
+
+  test("BinomialProjectedKriging.free is idempotent and predict throws after free", () => {
+    const model = new BinomialProjectedKriging({
+      xs,
+      ys,
+      successes,
+      trials,
+      variogram,
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+    });
+    model.free();
+    expect(() => model.free()).not.toThrow();
+    expect(() => model.predict(0, 0)).toThrow(KrigingError);
+  });
+
+  test("leaveOneOutBinomialProjected returns one residual per station with both scales", () => {
+    const out = leaveOneOutBinomialProjected({
+      xs,
+      ys,
+      successes,
+      trials,
+      variogram,
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+    });
+    expect(out.residuals).toHaveLength(xs.length);
+    for (const r of out.residuals) {
+      expect(Number.isFinite(r.observedLogit)).toBe(true);
+      expect(Number.isFinite(r.predictedLogit)).toBe(true);
+      expect(Number.isFinite(r.observedPrevalence)).toBe(true);
+      expect(Number.isFinite(r.predictedPrevalence)).toBe(true);
+      expect(r.predictedPrevalence).toBeGreaterThanOrEqual(0);
+      expect(r.predictedPrevalence).toBeLessThanOrEqual(1);
+    }
+    expect(out.summary.n).toBe(xs.length);
+    expect(out.summary.nEvaluated).toBe(xs.length);
+    expect(Number.isFinite(out.summary.logit.rmse)).toBe(true);
+    expect(Number.isFinite(out.summary.prevalence.rmse)).toBe(true);
+  });
+
+  test("kFoldBinomialProjected covers every station exactly once", () => {
+    const out = kFoldBinomialProjected({
+      xs,
+      ys,
+      successes,
+      trials,
+      variogram,
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+      k: 2,
+    });
+    const seen = new Set(out.residuals.map((r) => r.index));
+    expect(seen.size).toBe(xs.length);
+    for (let i = 0; i < xs.length; i++) expect(seen.has(i)).toBe(true);
+  });
+
+  test("conditionalSimulateBinomialProjected is reproducible for a fixed seed", () => {
+    const opts = {
+      conditioningXs: xs,
+      conditioningYs: ys,
+      successes,
+      trials,
+      targetXs: [250, 500, 750],
+      targetYs: [250, 500, 750],
+      variogram,
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+      seed: 42n,
+    } as const;
+    const a = conditionalSimulateBinomialProjected(opts);
+    const b = conditionalSimulateBinomialProjected(opts);
+    expect(a.prevalenceSamples).toEqual(b.prevalenceSamples);
+    expect(a.logitSamples).toEqual(b.logitSamples);
+    expect(a.prevalenceSamples.length).toBe(3);
+    for (const v of a.prevalenceSamples) {
+      expect(v).toBeGreaterThanOrEqual(0);
+      expect(v).toBeLessThanOrEqual(1);
+    }
+  });
+
+  test("conditionalSimulateManyBinomialProjected matches per-realization seeds", () => {
+    const targetXs = [250, 750];
+    const targetYs = [250, 750];
+    const baseSeed = 7n;
+    const nRealizations = 3;
+    const many = conditionalSimulateManyBinomialProjected({
+      conditioningXs: xs,
+      conditioningYs: ys,
+      successes,
+      trials,
+      targetXs,
+      targetYs,
+      variogram,
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+      nRealizations,
+      baseSeed,
+    });
+    expect(many.nRealizations).toBe(nRealizations);
+    expect(many.nTargets).toBe(targetXs.length);
+    expect(many.prevalenceSamples.length).toBe(nRealizations * targetXs.length);
+    for (let k = 0; k < nRealizations; k++) {
+      const single = conditionalSimulateBinomialProjected({
+        conditioningXs: xs,
+        conditioningYs: ys,
+        successes,
+        trials,
+        targetXs,
+        targetYs,
+        variogram,
+        majorAngleDeg: 0,
+        rangeRatio: 1,
+        seed: baseSeed + BigInt(k),
+      });
+      const off = k * targetXs.length;
+      for (let j = 0; j < targetXs.length; j++) {
+        expect(many.prevalenceSamples[off + j]).toBeCloseTo(
+          single.prevalenceSamples[j],
+          6
+        );
+        expect(many.logitSamples[off + j]).toBeCloseTo(
+          single.logitSamples[j],
+          6
+        );
+      }
+    }
   });
 });
 
@@ -1438,6 +1846,89 @@ describe("Conditional simulation (binomial, both scales)", () => {
       Math.abs(defaultPrior.logitSamples[0] - customPrior.logitSamples[0])
     ).toBeGreaterThan(1e-9);
   });
+
+  test("conditionalSimulateManyBinomial row k matches single call with seed = baseSeed + k", () => {
+    const N = 4;
+    const baseSeed = 21n;
+    const many = conditionalSimulateManyBinomial({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      successes,
+      trials,
+      targetLats,
+      targetLons,
+      variogram,
+      nRealizations: N,
+      baseSeed,
+    });
+    expect(many.nRealizations).toBe(N);
+    expect(many.nTargets).toBe(targetLats.length);
+    expect(many.logitSamples.length).toBe(N * targetLats.length);
+    expect(many.prevalenceSamples.length).toBe(N * targetLats.length);
+    for (let k = 0; k < N; k++) {
+      const single = conditionalSimulateBinomial({
+        conditioningLats: condLats,
+        conditioningLons: condLons,
+        successes,
+        trials,
+        targetLats,
+        targetLons,
+        variogram,
+        seed: baseSeed + BigInt(k),
+      });
+      const off = k * targetLats.length;
+      for (let j = 0; j < targetLats.length; j++) {
+        expect(many.logitSamples[off + j]).toBe(single.logitSamples[j]);
+        expect(many.prevalenceSamples[off + j]).toBe(
+          single.prevalenceSamples[j]
+        );
+      }
+    }
+  });
+
+  test("conditionalSimulateManyBinomial honors custom prior", () => {
+    const defaultPrior = conditionalSimulateManyBinomial({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      successes,
+      trials,
+      targetLats,
+      targetLons,
+      variogram,
+      nRealizations: 2,
+      baseSeed: 13,
+    });
+    const customPrior = conditionalSimulateManyBinomial({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      successes,
+      trials,
+      targetLats,
+      targetLons,
+      variogram,
+      prior: { alpha: 2, beta: 5 },
+      nRealizations: 2,
+      baseSeed: 13,
+    });
+    expect(
+      Math.abs(defaultPrior.logitSamples[0] - customPrior.logitSamples[0])
+    ).toBeGreaterThan(1e-9);
+  });
+
+  test("conditionalSimulateManyBinomial rejects non-positive nRealizations", () => {
+    expect(() =>
+      conditionalSimulateManyBinomial({
+        conditioningLats: condLats,
+        conditioningLons: condLons,
+        successes,
+        trials,
+        targetLats,
+        targetLons,
+        variogram,
+        nRealizations: 0,
+      })
+    ).toThrow(KrigingError);
+  });
 });
 
 describe("Binomial kriging: fromPrecomputedLogits", () => {
@@ -1885,6 +2376,212 @@ describe("Space-time kriging", () => {
     }
   });
 
+  test("SpaceTimeBinomialKriging.predictAtDate matches predict with timesFromDates", () => {
+    // Model was built with `times = [0, 1, 0, 1, ...]` interpreted as days;
+    // pick a calendar date 12 hours past the Unix epoch -> time = 0.5 days.
+    const model = new SpaceTimeBinomialKriging({
+      lats,
+      lons,
+      times,
+      successes,
+      trials,
+      variogram,
+    });
+    try {
+      const date = new Date(12 * 3_600_000); // 0.5 days after epoch
+      const fromDate = model.predictAtDate(0.5, 0.5, date);
+      const fromTime = model.predict(0.5, 0.5, 0.5);
+      expect(fromDate.prevalence).toBeCloseTo(fromTime.prevalence, 12);
+      expect(fromDate.logitValue).toBeCloseTo(fromTime.logitValue, 12);
+      expect(fromDate.variance).toBeCloseTo(fromTime.variance, 12);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("SpaceTimeBinomialKriging date-aware predict batch helpers honor timeUnit", () => {
+    const model = new SpaceTimeBinomialKriging({
+      lats,
+      lons,
+      times,
+      successes,
+      trials,
+      variogram,
+    });
+    try {
+      // The date helpers project Date -> numeric time using `timeUnit`/`epoch`;
+      // they DO NOT know what unit the model was trained in. Here we deliberately
+      // request "hours" so the conversion emits 12 (hours past epoch), and verify
+      // the same numeric value reaches `predictBatchArrays` directly. Callers in
+      // production would pass the same unit they built the model with.
+      const date = new Date(12 * 3_600_000);
+      const dates = [date, date];
+      const opts = { timeUnit: "hours" as const };
+      const fromDates = model.predictBatchAtDates([0.5, 0.5], [0.5, 0.5], dates, opts);
+      const fromArrays = model.predictBatchArraysAtDates(
+        [0.5, 0.5],
+        [0.5, 0.5],
+        dates,
+        opts
+      );
+      const direct = model.predictBatchArrays([0.5, 0.5], [0.5, 0.5], [12, 12]);
+      for (let i = 0; i < 2; i++) {
+        expect(fromDates[i].prevalence).toBeCloseTo(direct.prevalences[i], 12);
+        expect(fromArrays.prevalences[i]).toBeCloseTo(
+          direct.prevalences[i],
+          12
+        );
+        expect(fromArrays.logitValues[i]).toBeCloseTo(
+          direct.logitValues[i],
+          12
+        );
+      }
+    } finally {
+      model.free();
+    }
+  });
+
+  test("SpaceTimeBinomialKriging.predictGridAtDate equals predictGridAtTime", () => {
+    const model = new SpaceTimeBinomialKriging({
+      lats,
+      lons,
+      times,
+      successes,
+      trials,
+      variogram,
+    });
+    try {
+      const date = new Date(12 * 3_600_000); // 0.5 days
+      const fromDate = model.predictGridAtDate({
+        west: 0,
+        south: 0,
+        east: 1,
+        north: 1,
+        xCells: 2,
+        yCells: 2,
+        date,
+      });
+      const fromTime = model.predictGridAtTime({
+        west: 0,
+        south: 0,
+        east: 1,
+        north: 1,
+        xCells: 2,
+        yCells: 2,
+        time: 0.5,
+      });
+      for (let j = 0; j < 2; j++) {
+        for (let i = 0; i < 2; i++) {
+          expect(fromDate.prevalences[j][i]).toBeCloseTo(
+            fromTime.prevalences[j][i],
+            12
+          );
+          expect(fromDate.logitValues[j][i]).toBeCloseTo(
+            fromTime.logitValues[j][i],
+            12
+          );
+        }
+      }
+    } finally {
+      model.free();
+    }
+  });
+
+  test("simulateBinomialSpaceTimeGrid* date-aware helpers match numeric versions", () => {
+    const epoch = new Date(Date.UTC(2024, 0, 1));
+    // condDates for `times = [0, 1, 0, 1, ...]` (days from epoch)
+    const condDates = times.map(
+      (t) => new Date(epoch.getTime() + t * 86_400_000)
+    );
+    const targetDate = new Date(epoch.getTime() + 0.5 * 86_400_000); // 0.5 days
+    const numericOpts = {
+      west: 0,
+      south: 0,
+      east: 1,
+      north: 1,
+      xCells: 2,
+      yCells: 2,
+      lats,
+      lons,
+      times,
+      successes,
+      trials,
+      variogram,
+      time: 0.5,
+      seed: 7n,
+    } as const;
+    const dateOpts = {
+      west: 0,
+      south: 0,
+      east: 1,
+      north: 1,
+      xCells: 2,
+      yCells: 2,
+      lats,
+      lons,
+      dates: condDates,
+      successes,
+      trials,
+      variogram,
+      date: targetDate,
+      timeUnit: "days" as const,
+      epoch,
+      seed: 7n,
+    } as const;
+    const a = simulateBinomialSpaceTimeGrid(numericOpts);
+    const b = simulateBinomialSpaceTimeGridAtDate(dateOpts);
+    for (let j = 0; j < 2; j++) {
+      for (let i = 0; i < 2; i++) {
+        expect(b.prevalences[j][i]).toBeCloseTo(a.prevalences[j][i], 12);
+        expect(b.logitSamples[j][i]).toBeCloseTo(a.logitSamples[j][i], 12);
+      }
+    }
+
+    const ensembleA = simulateBinomialSpaceTimeGridEnsemble({
+      ...numericOpts,
+      seed: undefined,
+      nRealizations: 3,
+      baseSeed: 11n,
+    });
+    const ensembleB = simulateBinomialSpaceTimeGridEnsembleAtDate({
+      ...dateOpts,
+      seed: undefined,
+      nRealizations: 3,
+      baseSeed: 11n,
+    });
+    expect(ensembleB.prevalenceSamples).toEqual(ensembleA.prevalenceSamples);
+    expect(ensembleB.logitSamples).toEqual(ensembleA.logitSamples);
+    expect(ensembleB.nRealizations).toBe(3);
+    expect(ensembleB.nTargets).toBe(4);
+
+    const summaryA = simulateBinomialSpaceTimeGridSummary({
+      ...numericOpts,
+      seed: undefined,
+      nRealizations: 3,
+      baseSeed: 11n,
+      quantiles: [0.5],
+    });
+    const summaryB = simulateBinomialSpaceTimeGridSummaryAtDate({
+      ...dateOpts,
+      seed: undefined,
+      nRealizations: 3,
+      baseSeed: 11n,
+      quantiles: [0.5],
+    });
+    for (let j = 0; j < 2; j++) {
+      for (let i = 0; i < 2; i++) {
+        expect(summaryB.meanPrevalence[j][i]).toBeCloseTo(
+          summaryA.meanPrevalence[j][i],
+          12
+        );
+        expect(summaryB.quantiles[0].values[j][i]).toBeCloseTo(
+          summaryA.quantiles[0].values[j][i],
+          12
+        );
+      }
+    }
+  });
+
   test("fitSpaceTimeVariogram returns a separable fit with finite residuals", () => {
     const denseLats: number[] = [];
     const denseLons: number[] = [];
@@ -2321,5 +3018,666 @@ describe("Space-time conditional simulation", () => {
     expect(Array.from(a.prevalenceSamples)).toEqual(
       Array.from(b.prevalenceSamples)
     );
+  });
+
+  test("conditionalSimulateManySpaceTimeBinomial row k matches single call", () => {
+    const N = 3;
+    const baseSeed = 41n;
+    const many = conditionalSimulateManySpaceTimeBinomial({
+      conditioningLats,
+      conditioningLons,
+      conditioningTimes,
+      successes,
+      trials,
+      targetLats,
+      targetLons,
+      targetTimes,
+      variogram,
+      nRealizations: N,
+      baseSeed,
+    });
+    expect(many.nRealizations).toBe(N);
+    expect(many.nTargets).toBe(targetLats.length);
+    for (let k = 0; k < N; k++) {
+      const single = conditionalSimulateSpaceTimeBinomial({
+        conditioningLats,
+        conditioningLons,
+        conditioningTimes,
+        successes,
+        trials,
+        targetLats,
+        targetLons,
+        targetTimes,
+        variogram,
+        seed: baseSeed + BigInt(k),
+      });
+      const off = k * targetLats.length;
+      for (let j = 0; j < targetLats.length; j++) {
+        expect(many.logitSamples[off + j]).toBe(single.logitSamples[j]);
+        expect(many.prevalenceSamples[off + j]).toBe(
+          single.prevalenceSamples[j]
+        );
+      }
+    }
+  });
+});
+
+describe("Ensemble aggregators", () => {
+  // Hand-built 3 realizations × 4 targets matrix:
+  //   row 0: [1, 2, 3, 4]
+  //   row 1: [2, 4, 6, 8]
+  //   row 2: [3, 6, 9, 12]
+  const samples = new Float64Array([1, 2, 3, 4, 2, 4, 6, 8, 3, 6, 9, 12]);
+  const N = 3;
+  const T = 4;
+
+  test("ensembleMean computes per-target column mean", () => {
+    const m = ensembleMean(samples, N, T);
+    expect(Array.from(m)).toEqual([2, 4, 6, 8]);
+  });
+
+  test("ensembleVariance computes unbiased per-target variance (n-1 denom)", () => {
+    const v = ensembleVariance(samples, N, T);
+    expect(Array.from(v)).toEqual([1, 4, 9, 16]);
+  });
+
+  test("ensembleVariance rejects nRealizations < 2", () => {
+    expect(() =>
+      ensembleVariance(new Float64Array([1, 2, 3, 4]), 1, T)
+    ).toThrow(KrigingError);
+  });
+
+  test("ensembleQuantiles returns linearly interpolated quantiles per target", () => {
+    const q = ensembleQuantiles(samples, N, T, [0, 0.5, 1]);
+    expect(q.length).toBe(3 * T);
+    expect(Array.from(q.subarray(0, T))).toEqual([1, 2, 3, 4]);
+    expect(Array.from(q.subarray(T, 2 * T))).toEqual([2, 4, 6, 8]);
+    expect(Array.from(q.subarray(2 * T, 3 * T))).toEqual([3, 6, 9, 12]);
+  });
+
+  test("ensembleQuantiles rejects probabilities outside [0,1]", () => {
+    expect(() => ensembleQuantiles(samples, N, T, [-0.1])).toThrow(
+      KrigingError
+    );
+    expect(() => ensembleQuantiles(samples, N, T, [1.1])).toThrow(KrigingError);
+  });
+
+  test("ensembleQuantiles rejects empty quantile list", () => {
+    expect(() => ensembleQuantiles(samples, N, T, [])).toThrow(KrigingError);
+  });
+
+  test("ensembleExceedanceProbability counts strict exceedances per target", () => {
+    // threshold 2 → cells > 2 by column:
+    //   col 0: {1,2,3} → 1/3
+    //   col 1: {2,4,6} → 2/3
+    //   col 2: {3,6,9} → 3/3
+    //   col 3: {4,8,12} → 3/3
+    const p = ensembleExceedanceProbability(samples, N, T, 2);
+    expect(p[0]).toBeCloseTo(1 / 3, 12);
+    expect(p[1]).toBeCloseTo(2 / 3, 12);
+    expect(p[2]).toBe(1);
+    expect(p[3]).toBe(1);
+  });
+
+  test("aggregator dimension mismatch throws KrigingError", () => {
+    expect(() => ensembleMean(new Float64Array(11), N, T)).toThrow(
+      KrigingError
+    );
+  });
+
+  test("aggregators integrate with conditionalSimulateMany output", () => {
+    const condLats = [0, 0, 1, 1];
+    const condLons = [0, 1, 0, 1];
+    const condValues = [10, 12, 11, 13];
+    const targetLats = [0.5, 0.25, 0.75];
+    const targetLons = [0.5, 0.25, 0.75];
+    const variogram = {
+      variogramType: "exponential" as VariogramTypeName,
+      nugget: 0.05,
+      sill: 1.0,
+      range: 500,
+    };
+    const Nr = 8;
+    const buf = conditionalSimulateMany({
+      conditioningLats: condLats,
+      conditioningLons: condLons,
+      conditioningValues: condValues,
+      targetLats,
+      targetLons,
+      variogram,
+      nRealizations: Nr,
+      baseSeed: 314159,
+    });
+    const m = ensembleMean(buf, Nr, targetLats.length);
+    const v = ensembleVariance(buf, Nr, targetLats.length);
+    expect(m.length).toBe(targetLats.length);
+    expect(v.length).toBe(targetLats.length);
+    for (let j = 0; j < targetLats.length; j++) {
+      expect(Number.isFinite(m[j])).toBe(true);
+      expect(v[j]).toBeGreaterThanOrEqual(0);
+    }
+  });
+});
+
+describe("Binomial grid simulation", () => {
+  const lats = [0, 0, 1, 1];
+  const lons = [0, 1, 0, 1];
+  const successes = [3, 7, 4, 9];
+  const trials = [10, 12, 9, 15];
+  const variogram = {
+    variogramType: "exponential" as VariogramTypeName,
+    nugget: 0.05,
+    sill: 1.0,
+    range: 500,
+  };
+  const bounds = {
+    west: 0,
+    south: 0,
+    east: 1,
+    north: 1,
+    xCells: 3,
+    yCells: 2,
+  };
+
+  test("gridCellCenters lays out (j, i) with i fastest, j running south->north", () => {
+    const { lats: gLats, lons: gLons } = gridCellCenters(bounds);
+    expect(gLats.length).toBe(bounds.xCells * bounds.yCells);
+    expect(gLons.length).toBe(bounds.xCells * bounds.yCells);
+    const dx = (bounds.east - bounds.west) / bounds.xCells;
+    const dy = (bounds.north - bounds.south) / bounds.yCells;
+    for (let j = 0; j < bounds.yCells; j++) {
+      for (let i = 0; i < bounds.xCells; i++) {
+        const idx = j * bounds.xCells + i;
+        expect(gLats[idx]).toBeCloseTo(bounds.south + (j + 0.5) * dy, 12);
+        expect(gLons[idx]).toBeCloseTo(bounds.west + (i + 0.5) * dx, 12);
+      }
+    }
+  });
+
+  test("reshapeGridRow inverts gridCellCenters layout", () => {
+    const flat = new Float64Array(bounds.xCells * bounds.yCells);
+    for (let i = 0; i < flat.length; i++) flat[i] = i;
+    const grid = reshapeGridRow(flat, bounds.xCells, bounds.yCells);
+    expect(grid.length).toBe(bounds.yCells);
+    expect(grid[0].length).toBe(bounds.xCells);
+    for (let j = 0; j < bounds.yCells; j++) {
+      for (let i = 0; i < bounds.xCells; i++) {
+        expect(grid[j][i]).toBe(j * bounds.xCells + i);
+      }
+    }
+  });
+
+  test("simulateBinomialGrid returns dual-scale 2D arrays consistent with logistic()", () => {
+    const grid = simulateBinomialGrid({
+      ...bounds,
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram,
+      seed: 17,
+    });
+    expect(grid.logitSamples.length).toBe(bounds.yCells);
+    expect(grid.prevalences.length).toBe(bounds.yCells);
+    for (let j = 0; j < bounds.yCells; j++) {
+      expect(grid.logitSamples[j].length).toBe(bounds.xCells);
+      expect(grid.prevalences[j].length).toBe(bounds.xCells);
+      for (let i = 0; i < bounds.xCells; i++) {
+        const l = grid.logitSamples[j][i];
+        const p = grid.prevalences[j][i];
+        expect(Number.isFinite(l)).toBe(true);
+        expect(p).toBeGreaterThan(0);
+        expect(p).toBeLessThan(1);
+        const expected = 1 / (1 + Math.exp(-l));
+        expect(Math.abs(p - expected)).toBeLessThan(1e-6);
+      }
+    }
+  });
+
+  test("simulateBinomialGrid is deterministic for same seed", () => {
+    const a = simulateBinomialGrid({
+      ...bounds,
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram,
+      seed: 123,
+    });
+    const b = simulateBinomialGrid({
+      ...bounds,
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram,
+      seed: 123,
+    });
+    for (let j = 0; j < bounds.yCells; j++) {
+      for (let i = 0; i < bounds.xCells; i++) {
+        expect(a.prevalences[j][i]).toBe(b.prevalences[j][i]);
+      }
+    }
+  });
+
+  test("simulateBinomialGridEnsemble row k matches simulateBinomialGrid(seed = baseSeed + k)", () => {
+    const N = 3;
+    const baseSeed = 42n;
+    const ens = simulateBinomialGridEnsemble({
+      ...bounds,
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram,
+      nRealizations: N,
+      baseSeed,
+    });
+    const nTargets = bounds.xCells * bounds.yCells;
+    expect(ens.nRealizations).toBe(N);
+    expect(ens.nTargets).toBe(nTargets);
+    expect(ens.logitSamples.length).toBe(N * nTargets);
+    expect(ens.prevalenceSamples.length).toBe(N * nTargets);
+    for (let k = 0; k < N; k++) {
+      const single = simulateBinomialGrid({
+        ...bounds,
+        lats,
+        lons,
+        successes,
+        trials,
+        variogram,
+        seed: baseSeed + BigInt(k),
+      });
+      for (let j = 0; j < bounds.yCells; j++) {
+        for (let i = 0; i < bounds.xCells; i++) {
+          const off = k * nTargets + j * bounds.xCells + i;
+          expect(ens.prevalenceSamples[off]).toBe(single.prevalences[j][i]);
+          expect(ens.logitSamples[off]).toBe(single.logitSamples[j][i]);
+        }
+      }
+    }
+  });
+
+  test("simulateBinomialGridSummary returns mean/variance maps with correct shape", () => {
+    const N = 8;
+    const summary = simulateBinomialGridSummary({
+      ...bounds,
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram,
+      nRealizations: N,
+      baseSeed: 7,
+      quantiles: [0.025, 0.5, 0.975],
+      exceedanceThresholds: [0.5],
+    });
+    expect(summary.nRealizations).toBe(N);
+    expect(summary.summarizeOn).toBe("prevalence");
+    expect(summary.meanLogit.length).toBe(bounds.yCells);
+    expect(summary.meanLogit[0].length).toBe(bounds.xCells);
+    expect(summary.meanPrevalence.length).toBe(bounds.yCells);
+    expect(summary.varianceLogit.length).toBe(bounds.yCells);
+    expect(summary.quantiles).toHaveLength(3);
+    for (const q of summary.quantiles) {
+      expect(q.values.length).toBe(bounds.yCells);
+      expect(q.values[0].length).toBe(bounds.xCells);
+    }
+    expect(summary.exceedances).toHaveLength(1);
+    expect(summary.exceedances[0].threshold).toBe(0.5);
+    for (let j = 0; j < bounds.yCells; j++) {
+      for (let i = 0; i < bounds.xCells; i++) {
+        const m = summary.meanPrevalence[j][i];
+        expect(m).toBeGreaterThanOrEqual(0);
+        expect(m).toBeLessThanOrEqual(1);
+        expect(summary.varianceLogit[j][i]).toBeGreaterThanOrEqual(0);
+        const ex = summary.exceedances[0].values[j][i];
+        expect(ex).toBeGreaterThanOrEqual(0);
+        expect(ex).toBeLessThanOrEqual(1);
+      }
+    }
+  });
+
+  test("simulateBinomialGridSummary respects summarizeOn = logit", () => {
+    const summary = simulateBinomialGridSummary({
+      ...bounds,
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram,
+      nRealizations: 4,
+      baseSeed: 11,
+      quantiles: [0.5],
+      summarizeOn: "logit",
+    });
+    expect(summary.summarizeOn).toBe("logit");
+    for (let j = 0; j < bounds.yCells; j++) {
+      for (let i = 0; i < bounds.xCells; i++) {
+        // Logit-scale quantile must be a finite real (not bounded to [0,1]).
+        expect(Number.isFinite(summary.quantiles[0].values[j][i])).toBe(true);
+      }
+    }
+  });
+
+  test("simulateBinomialGrid rejects degenerate grid bounds", () => {
+    expect(() =>
+      simulateBinomialGrid({
+        ...bounds,
+        west: 1,
+        east: 1,
+        lats,
+        lons,
+        successes,
+        trials,
+        variogram,
+        seed: 0,
+      })
+    ).toThrow(KrigingError);
+    expect(() =>
+      simulateBinomialGrid({
+        ...bounds,
+        xCells: 0,
+        lats,
+        lons,
+        successes,
+        trials,
+        variogram,
+        seed: 0,
+      })
+    ).toThrow(KrigingError);
+  });
+});
+
+describe("Polygon aggregation over ensembles", () => {
+  // Synthetic ensemble: 5 realizations × 6 targets, prevalence = (k * 0.1) + j * 0.01
+  // and a logit field = -1 + 0.2 * k + 0.05 * j.
+  function buildEnsemble(
+    nRealizations: number,
+    nTargets: number,
+    p: (k: number, j: number) => number,
+    l: (k: number, j: number) => number
+  ) {
+    const prev = new Float64Array(nRealizations * nTargets);
+    const logit = new Float64Array(nRealizations * nTargets);
+    for (let k = 0; k < nRealizations; k++) {
+      const off = k * nTargets;
+      for (let j = 0; j < nTargets; j++) {
+        prev[off + j] = p(k, j);
+        logit[off + j] = l(k, j);
+      }
+    }
+    return {
+      nRealizations,
+      nTargets,
+      logitSamples: logit,
+      prevalenceSamples: prev,
+    };
+  }
+
+  test("aggregatePrevalenceByPolygon: simple area mean matches hand calculation", () => {
+    const ens = buildEnsemble(
+      5,
+      6,
+      (k, j) => k * 0.1 + j * 0.01,
+      (k, j) => -1 + 0.2 * k + 0.05 * j
+    );
+    const polygons = [
+      { id: "all", indices: [0, 1, 2, 3, 4, 5], weights: [1, 1, 1, 1, 1, 1] },
+      { id: "right-half", indices: [3, 4, 5], weights: [1, 1, 1] },
+    ];
+    const result = aggregatePrevalenceByPolygon({
+      ensemble: ens,
+      polygons,
+      quantiles: [0.0, 0.5, 1.0],
+    });
+    expect(result).toHaveLength(2);
+    expect(result[0].id).toBe("all");
+    expect(result[0].summarizeOn).toBe("prevalence");
+    expect(result[0].nRealizations).toBe(5);
+    expect(result[0].totalWeight).toBe(6);
+
+    // For polygon "all": realization k area-mean = k*0.1 + 0.025
+    // -> values 0.025, 0.125, 0.225, 0.325, 0.425; mean = 0.225, var = 0.025
+    // Tolerances reflect the crate-default f32 precision of the WASM aggregator
+    // (about 7 decimal digits for O(1) magnitudes).
+    expect(result[0].mean).toBeCloseTo(0.225, 6);
+    expect(result[0].variance).not.toBeNull();
+    expect(result[0].variance as number).toBeCloseTo(0.025, 6);
+    expect(result[0].quantiles[0].value).toBeCloseTo(0.025, 6);
+    expect(result[0].quantiles[1].value).toBeCloseTo(0.225, 6);
+    expect(result[0].quantiles[2].value).toBeCloseTo(0.425, 6);
+
+    // For polygon "right-half": realization k area-mean = k*0.1 + 0.04
+    // -> mean = 0.24, var = 0.025
+    expect(result[1].mean).toBeCloseTo(0.24, 6);
+    expect((result[1].variance as number)).toBeCloseTo(0.025, 6);
+  });
+
+  test("aggregatePrevalenceByPolygon: weighted mean honors per-cell weights", () => {
+    // 2 realizations × 2 targets, prevalence row 0 = [0, 1], row 1 = [0.4, 0.8]
+    const ens = {
+      nRealizations: 2,
+      nTargets: 2,
+      logitSamples: new Float64Array([-2, 2, -2, 2]),
+      prevalenceSamples: new Float64Array([0, 1, 0.4, 0.8]),
+    };
+    // Weights (1, 3) -> 0.25 * x_0 + 0.75 * x_1
+    const result = aggregatePrevalenceByPolygon({
+      ensemble: ens,
+      polygons: [{ indices: [0, 1], weights: [1, 3] }],
+    });
+    // Row 0 weighted mean: 0.25*0 + 0.75*1 = 0.75
+    // Row 1 weighted mean: 0.25*0.4 + 0.75*0.8 = 0.7
+    // Mean = 0.725 (f32-precision aggregator; see "simple area mean" test).
+    expect(result[0].mean).toBeCloseTo(0.725, 6);
+    expect(result[0].totalWeight).toBe(4);
+  });
+
+  test("aggregatePrevalenceByPolygon: summarizeOn='logit' summarizes the logit buffer", () => {
+    const ens = buildEnsemble(
+      4,
+      3,
+      (k) => 0.1 + k * 0.01,
+      (k, j) => k - j
+    );
+    const result = aggregatePrevalenceByPolygon({
+      ensemble: ens,
+      polygons: [{ id: "p", indices: [0, 1, 2], weights: [1, 1, 1] }],
+      summarizeOn: "logit",
+      quantiles: [0.5],
+    });
+    // Per realization k, mean of (k, k-1, k-2) = k - 1.
+    // Across k = 0..3 -> values [-1, 0, 1, 2], mean = 0.5 (f32 aggregator).
+    expect(result[0].summarizeOn).toBe("logit");
+    expect(result[0].mean).toBeCloseTo(0.5, 6);
+    expect(result[0].quantiles[0].value).toBeCloseTo(0.5, 6);
+  });
+
+  test("aggregatePrevalenceByPolygon integrates with simulateBinomialGridEnsemble", () => {
+    const lats = [0, 0, 1, 1];
+    const lons = [0, 1, 0, 1];
+    const successes = [3, 7, 4, 9];
+    const trials = [10, 12, 9, 15];
+    const variogram = {
+      variogramType: "exponential" as VariogramTypeName,
+      nugget: 0.05,
+      sill: 1.0,
+      range: 500,
+    };
+    const ens = simulateBinomialGridEnsemble({
+      west: 0,
+      south: 0,
+      east: 1,
+      north: 1,
+      xCells: 4,
+      yCells: 3,
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram,
+      nRealizations: 6,
+      baseSeed: 21,
+    });
+    // Polygon = upper-left 2×2 quadrant
+    const upperLeft = polygonCellsFromMask({
+      xCells: ens.xCells,
+      yCells: ens.yCells,
+      mask: [
+        [1, 1, 0, 0],
+        [1, 1, 0, 0],
+        [0, 0, 0, 0],
+      ],
+      id: "upper-left",
+    });
+    const result = aggregatePrevalenceByPolygon({
+      ensemble: ens,
+      polygons: [upperLeft],
+      quantiles: [0.025, 0.5, 0.975],
+    });
+    expect(result[0].id).toBe("upper-left");
+    expect(result[0].nRealizations).toBe(6);
+    expect(result[0].totalWeight).toBe(4);
+    expect(result[0].mean).toBeGreaterThan(0);
+    expect(result[0].mean).toBeLessThan(1);
+    const [lo, med, hi] = result[0].quantiles.map((q) => q.value);
+    expect(lo).toBeLessThanOrEqual(med);
+    expect(med).toBeLessThanOrEqual(hi);
+    expect(lo).toBeGreaterThanOrEqual(0);
+    expect(hi).toBeLessThanOrEqual(1);
+  });
+
+  test("aggregatePrevalenceByPolygon: single realization yields null variance", () => {
+    const ens = {
+      nRealizations: 1,
+      nTargets: 3,
+      logitSamples: new Float64Array([0, 0, 0]),
+      prevalenceSamples: new Float64Array([0.2, 0.3, 0.4]),
+    };
+    const result = aggregatePrevalenceByPolygon({
+      ensemble: ens,
+      polygons: [{ indices: [0, 1, 2], weights: [1, 1, 1] }],
+      quantiles: [0.5],
+    });
+    expect(result[0].variance).toBeNull();
+    expect(result[0].mean).toBeCloseTo(0.3, 6);
+  });
+
+  test("aggregatePrevalenceByPolygon validates inputs", () => {
+    const ens = {
+      nRealizations: 2,
+      nTargets: 3,
+      logitSamples: new Float64Array(6),
+      prevalenceSamples: new Float64Array(6),
+    };
+    expect(() =>
+      aggregatePrevalenceByPolygon({ ensemble: ens, polygons: [] })
+    ).toThrow(KrigingError);
+    expect(() =>
+      aggregatePrevalenceByPolygon({
+        ensemble: ens,
+        polygons: [{ indices: [], weights: [] }],
+      })
+    ).toThrow(KrigingError);
+    expect(() =>
+      aggregatePrevalenceByPolygon({
+        ensemble: ens,
+        polygons: [{ indices: [0, 1], weights: [1] }],
+      })
+    ).toThrow(KrigingError);
+    expect(() =>
+      aggregatePrevalenceByPolygon({
+        ensemble: ens,
+        polygons: [{ indices: [3], weights: [1] }],
+      })
+    ).toThrow(KrigingError);
+    expect(() =>
+      aggregatePrevalenceByPolygon({
+        ensemble: ens,
+        polygons: [{ indices: [0], weights: [-1] }],
+      })
+    ).toThrow(KrigingError);
+    expect(() =>
+      aggregatePrevalenceByPolygon({
+        ensemble: ens,
+        polygons: [{ indices: [0, 1], weights: [0, 0] }],
+      })
+    ).toThrow(KrigingError);
+    expect(() =>
+      aggregatePrevalenceByPolygon({
+        ensemble: ens,
+        polygons: [{ indices: [0], weights: [1] }],
+        quantiles: [-0.1],
+      })
+    ).toThrow(KrigingError);
+  });
+
+  test("polygonCellsFromMask: indicator and weighted masks both work", () => {
+    const indicator = polygonCellsFromMask({
+      xCells: 3,
+      yCells: 2,
+      mask: [
+        [1, 0, 1],
+        [0, 1, 0],
+      ],
+    });
+    expect(Array.from(indicator.indices)).toEqual([0, 2, 4]);
+    expect(Array.from(indicator.weights)).toEqual([1, 1, 1]);
+
+    const weighted = polygonCellsFromMask({
+      id: "pop",
+      xCells: 3,
+      yCells: 2,
+      mask: [
+        [10, 0, 5],
+        [0, 20, 0],
+      ],
+    });
+    expect(weighted.id).toBe("pop");
+    expect(Array.from(weighted.indices)).toEqual([0, 2, 4]);
+    expect(Array.from(weighted.weights)).toEqual([10, 5, 20]);
+
+    // Booleans + nullish entries
+    const boolMask = polygonCellsFromMask({
+      xCells: 2,
+      yCells: 2,
+      mask: [
+        [true, false],
+        [null, true],
+      ],
+    });
+    expect(Array.from(boolMask.indices)).toEqual([0, 3]);
+    expect(Array.from(boolMask.weights)).toEqual([1, 1]);
+  });
+
+  test("polygonCellsFromMask validates shape and emptiness", () => {
+    expect(() =>
+      polygonCellsFromMask({
+        xCells: 2,
+        yCells: 2,
+        mask: [[1, 1]],
+      })
+    ).toThrow(KrigingError);
+    expect(() =>
+      polygonCellsFromMask({
+        xCells: 2,
+        yCells: 2,
+        mask: [
+          [1, 1, 1],
+          [1, 1, 1],
+        ],
+      })
+    ).toThrow(KrigingError);
+    expect(() =>
+      polygonCellsFromMask({
+        xCells: 2,
+        yCells: 2,
+        mask: [
+          [0, 0],
+          [0, 0],
+        ],
+      })
+    ).toThrow(KrigingError);
   });
 });

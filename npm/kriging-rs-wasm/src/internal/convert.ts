@@ -51,9 +51,19 @@ export function requireNumber(value: unknown): number {
   return value;
 }
 
-/** Like {@link requireNumber} but returns 0 for non-finite values instead of throwing. */
-export function requireFiniteOrZero(value: unknown): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) return 0;
+/**
+ * Like {@link requireNumber} but allows `NaN` through. Use for statistics that are
+ * legitimately undefined when there is no data to summarize (e.g. RMSE / MSDR over
+ * zero evaluated residuals): `NaN` is the honest answer, while a non-number
+ * payload still indicates a serialization bug and throws.
+ */
+export function requireFiniteOrNaN(value: unknown): number {
+  if (typeof value !== "number") {
+    throw new Error("Expected numeric output from WASM");
+  }
+  if (!Number.isFinite(value) && !Number.isNaN(value)) {
+    throw new Error("Expected finite or NaN numeric output from WASM");
+  }
   return value;
 }
 

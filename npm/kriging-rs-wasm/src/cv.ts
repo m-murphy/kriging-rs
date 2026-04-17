@@ -19,7 +19,7 @@
  * @module
  */
 
-import { KrigingError, wrapThrown } from "./errors.js";
+import { wrapThrown } from "./errors.js";
 import { toFloat64Array, toUint32Array } from "./internal/convert.js";
 import { mapBinomialCvOutput, mapCvOutput } from "./internal/mappers.js";
 import { requireLoadedModule } from "./internal/module.js";
@@ -32,6 +32,7 @@ import type {
   BinomialCvResult,
   CvResult,
   KFoldBinomialOptions,
+  KFoldBinomialProjectedOptions,
   KFoldOptions,
   KFoldProjectedOptions,
   KFoldSimpleOptions,
@@ -41,6 +42,7 @@ import type {
   KFoldSpaceTimeUniversalOptions,
   KFoldUniversalOptions,
   LeaveOneOutBinomialOptions,
+  LeaveOneOutBinomialProjectedOptions,
   LeaveOneOutOptions,
   LeaveOneOutProjectedOptions,
   LeaveOneOutSimpleOptions,
@@ -51,15 +53,6 @@ import type {
   LeaveOneOutUniversalOptions,
 } from "./types.js";
 
-function unavailable(method: string): never {
-  throw new KrigingError(
-    `${method} is not available; rebuild the WASM package`,
-    {
-      code: "backend_unavailable",
-    }
-  );
-}
-
 /**
  * Leave-one-out cross-validation: for each station, predict its value from the other
  * `n − 1` stations using ordinary kriging with the supplied variogram. Returns
@@ -67,7 +60,6 @@ function unavailable(method: string): never {
  */
 export function leaveOneOut(options: LeaveOneOutOptions): CvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.leaveOneOut !== "function") unavailable("leaveOneOut");
   try {
     const out = mod.leaveOneOut(
       toFloat64Array(options.lats),
@@ -92,7 +84,6 @@ export function leaveOneOut(options: LeaveOneOutOptions): CvResult {
  */
 export function kFold(options: KFoldOptions): CvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.kFold !== "function") unavailable("kFold");
   try {
     const out = mod.kFold(
       toFloat64Array(options.lats),
@@ -117,8 +108,6 @@ export function kFold(options: KFoldOptions): CvResult {
  */
 export function leaveOneOutSimple(options: LeaveOneOutSimpleOptions): CvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.leaveOneOutSimple !== "function")
-    unavailable("leaveOneOutSimple");
   try {
     const out = mod.leaveOneOutSimple(
       toFloat64Array(options.lats),
@@ -140,7 +129,6 @@ export function leaveOneOutSimple(options: LeaveOneOutSimpleOptions): CvResult {
 /** K-fold CV over simple kriging. See {@link leaveOneOutSimple} for `mean` semantics. */
 export function kFoldSimple(options: KFoldSimpleOptions): CvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.kFoldSimple !== "function") unavailable("kFoldSimple");
   try {
     const out = mod.kFoldSimple(
       toFloat64Array(options.lats),
@@ -169,9 +157,6 @@ export function leaveOneOutUniversal(
   options: LeaveOneOutUniversalOptions
 ): CvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.leaveOneOutUniversal !== "function") {
-    unavailable("leaveOneOutUniversal");
-  }
   try {
     const out = mod.leaveOneOutUniversal(
       toFloat64Array(options.lats),
@@ -193,7 +178,6 @@ export function leaveOneOutUniversal(
 /** K-fold CV over universal kriging with the given polynomial drift. */
 export function kFoldUniversal(options: KFoldUniversalOptions): CvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.kFoldUniversal !== "function") unavailable("kFoldUniversal");
   try {
     const out = mod.kFoldUniversal(
       toFloat64Array(options.lats),
@@ -222,9 +206,6 @@ export function leaveOneOutProjected(
   options: LeaveOneOutProjectedOptions
 ): CvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.leaveOneOutProjected !== "function") {
-    unavailable("leaveOneOutProjected");
-  }
   try {
     const out = mod.leaveOneOutProjected(
       toFloat64Array(options.xs),
@@ -247,7 +228,6 @@ export function leaveOneOutProjected(
 /** K-fold CV over projected kriging. See {@link leaveOneOutProjected} for coord semantics. */
 export function kFoldProjected(options: KFoldProjectedOptions): CvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.kFoldProjected !== "function") unavailable("kFoldProjected");
   try {
     const out = mod.kFoldProjected(
       toFloat64Array(options.xs),
@@ -278,9 +258,6 @@ export function leaveOneOutBinomial(
   options: LeaveOneOutBinomialOptions
 ): BinomialCvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.leaveOneOutBinomial !== "function") {
-    unavailable("leaveOneOutBinomial");
-  }
   const { alpha, beta } = resolveBinomialPrior(options.prior);
   try {
     const out = mod.leaveOneOutBinomial(
@@ -305,7 +282,6 @@ export function leaveOneOutBinomial(
 /** K-fold CV over binomial kriging. See {@link leaveOneOutBinomial} for result shape. */
 export function kFoldBinomial(options: KFoldBinomialOptions): BinomialCvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.kFoldBinomial !== "function") unavailable("kFoldBinomial");
   const { alpha, beta } = resolveBinomialPrior(options.prior);
   try {
     const out = mod.kFoldBinomial(
@@ -313,6 +289,67 @@ export function kFoldBinomial(options: KFoldBinomialOptions): BinomialCvResult {
       toFloat64Array(options.lons),
       toUint32Array(options.successes),
       toUint32Array(options.trials),
+      options.k,
+      options.variogram.variogramType,
+      options.variogram.nugget,
+      options.variogram.sill,
+      options.variogram.range,
+      options.variogram.shape,
+      alpha,
+      beta
+    );
+    return mapBinomialCvOutput(out);
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+}
+
+/**
+ * Leave-one-out CV over **projected** binomial kriging on planar `(x, y)` coordinates
+ * with optional 2-D geometric anisotropy. See {@link leaveOneOutBinomial} for result
+ * shape (dual logit + prevalence residuals).
+ */
+export function leaveOneOutBinomialProjected(
+  options: LeaveOneOutBinomialProjectedOptions
+): BinomialCvResult {
+  const mod = requireLoadedModule();
+  const { alpha, beta } = resolveBinomialPrior(options.prior);
+  try {
+    const out = mod.leaveOneOutBinomialProjected(
+      toFloat64Array(options.xs),
+      toFloat64Array(options.ys),
+      toUint32Array(options.successes),
+      toUint32Array(options.trials),
+      options.majorAngleDeg,
+      options.rangeRatio,
+      options.variogram.variogramType,
+      options.variogram.nugget,
+      options.variogram.sill,
+      options.variogram.range,
+      options.variogram.shape,
+      alpha,
+      beta
+    );
+    return mapBinomialCvOutput(out);
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+}
+
+/** K-fold CV over projected binomial kriging. */
+export function kFoldBinomialProjected(
+  options: KFoldBinomialProjectedOptions
+): BinomialCvResult {
+  const mod = requireLoadedModule();
+  const { alpha, beta } = resolveBinomialPrior(options.prior);
+  try {
+    const out = mod.kFoldBinomialProjected(
+      toFloat64Array(options.xs),
+      toFloat64Array(options.ys),
+      toUint32Array(options.successes),
+      toUint32Array(options.trials),
+      options.majorAngleDeg,
+      options.rangeRatio,
       options.k,
       options.variogram.variogramType,
       options.variogram.nugget,
@@ -340,9 +377,6 @@ export function leaveOneOutSpaceTime(
   options: LeaveOneOutSpaceTimeOptions
 ): CvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.leaveOneOutSpaceTime !== "function") {
-    unavailable("leaveOneOutSpaceTime");
-  }
   const packed = packSpaceTimeVariogram(options.variogram);
   try {
     const out = mod.leaveOneOutSpaceTime(
@@ -374,7 +408,6 @@ export function leaveOneOutSpaceTime(
 /** K-fold CV for space-time ordinary kriging. */
 export function kFoldSpaceTime(options: KFoldSpaceTimeOptions): CvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.kFoldSpaceTime !== "function") unavailable("kFoldSpaceTime");
   const packed = packSpaceTimeVariogram(options.variogram);
   try {
     const out = mod.kFoldSpaceTime(
@@ -409,9 +442,6 @@ export function leaveOneOutSpaceTimeSimple(
   options: LeaveOneOutSpaceTimeSimpleOptions
 ): CvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.leaveOneOutSpaceTimeSimple !== "function") {
-    unavailable("leaveOneOutSpaceTimeSimple");
-  }
   const packed = packSpaceTimeVariogram(options.variogram);
   try {
     const out = mod.leaveOneOutSpaceTimeSimple(
@@ -446,9 +476,6 @@ export function kFoldSpaceTimeSimple(
   options: KFoldSpaceTimeSimpleOptions
 ): CvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.kFoldSpaceTimeSimple !== "function") {
-    unavailable("kFoldSpaceTimeSimple");
-  }
   const packed = packSpaceTimeVariogram(options.variogram);
   try {
     const out = mod.kFoldSpaceTimeSimple(
@@ -487,9 +514,6 @@ export function leaveOneOutSpaceTimeUniversal(
   options: LeaveOneOutSpaceTimeUniversalOptions
 ): CvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.leaveOneOutSpaceTimeUniversal !== "function") {
-    unavailable("leaveOneOutSpaceTimeUniversal");
-  }
   const packed = packSpaceTimeVariogram(options.variogram);
   const trend = requireSpaceTimeUniversalTrend(options.trend);
   try {
@@ -525,9 +549,6 @@ export function kFoldSpaceTimeUniversal(
   options: KFoldSpaceTimeUniversalOptions
 ): CvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.kFoldSpaceTimeUniversal !== "function") {
-    unavailable("kFoldSpaceTimeUniversal");
-  }
   const packed = packSpaceTimeVariogram(options.variogram);
   const trend = requireSpaceTimeUniversalTrend(options.trend);
   try {
@@ -567,9 +588,6 @@ export function leaveOneOutSpaceTimeBinomial(
   options: LeaveOneOutSpaceTimeBinomialOptions
 ): BinomialCvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.leaveOneOutSpaceTimeBinomial !== "function") {
-    unavailable("leaveOneOutSpaceTimeBinomial");
-  }
   const { alpha, beta } = resolveBinomialPrior(options.prior);
   const packed = packSpaceTimeVariogram(options.variogram);
   try {
@@ -607,9 +625,6 @@ export function kFoldSpaceTimeBinomial(
   options: KFoldSpaceTimeBinomialOptions
 ): BinomialCvResult {
   const mod = requireLoadedModule();
-  if (typeof mod.kFoldSpaceTimeBinomial !== "function") {
-    unavailable("kFoldSpaceTimeBinomial");
-  }
   const { alpha, beta } = resolveBinomialPrior(options.prior);
   const packed = packSpaceTimeVariogram(options.variogram);
   try {

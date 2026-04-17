@@ -6,7 +6,7 @@
  * @module
  */
 
-import { KrigingError, wrapThrown } from "./errors.js";
+import { wrapThrown } from "./errors.js";
 import {
   asRecord,
   requireFloat64Array,
@@ -100,12 +100,6 @@ export function computeEmpiricalVariogram(
   options: ComputeEmpiricalVariogramOptions
 ): EmpiricalVariogramResult {
   const mod = requireLoadedModule();
-  if (typeof mod.computeEmpiricalVariogram !== "function") {
-    throw new KrigingError(
-      "computeEmpiricalVariogram is not available; rebuild the WASM package",
-      { code: "backend_unavailable" }
-    );
-  }
   const {
     sampleLats,
     sampleLons,
@@ -141,12 +135,6 @@ export function computeDirectionalEmpiricalVariogram(
   options: ComputeDirectionalEmpiricalVariogramOptions
 ): EmpiricalVariogramResult {
   const mod = requireLoadedModule();
-  if (typeof mod.computeDirectionalEmpiricalVariogram !== "function") {
-    throw new KrigingError(
-      "computeDirectionalEmpiricalVariogram is not available; rebuild the WASM package",
-      { code: "backend_unavailable" }
-    );
-  }
   const { xs, ys, values, maxDistance, nBins, azimuthDeg, toleranceDeg } =
     options;
   try {
@@ -179,12 +167,6 @@ export function evaluateNestedVariogram(
   distances: NumericArrayInput
 ): NestedVariogramEvaluation {
   const mod = requireLoadedModule();
-  if (typeof mod.evaluateNestedVariogram !== "function") {
-    throw new KrigingError(
-      "evaluateNestedVariogram is not available; rebuild the WASM package",
-      { code: "backend_unavailable" }
-    );
-  }
   try {
     const out = mod.evaluateNestedVariogram(
       components.map((c) => ({
