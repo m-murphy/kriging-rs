@@ -7,10 +7,12 @@
 
 import type {
   BinomialBatchArrayOutput,
+  BinomialBuildNotes,
   BinomialCvResidual,
   BinomialCvResult,
   BinomialCvSummary,
   BinomialPrediction,
+  BinomialPriorParams,
   CvResidual,
   CvResult,
   CvSummary,
@@ -78,6 +80,48 @@ export function mapBinomialPredictionArray(
     throw new Error("Expected binomial prediction array output");
   }
   return value.map((item) => mapBinomialPrediction(item));
+}
+
+function mapBinomialPriorFromNotes(value: unknown): BinomialPriorParams {
+  const rec = asRecord(value);
+  return {
+    alpha: requireNumber(rec.alpha),
+    beta: requireNumber(rec.beta),
+  };
+}
+
+function mapZeroTrialDroppedIndices(value: unknown): number[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new Error("Expected zeroTrialDroppedIndices array from WASM");
+  }
+  return value.map((x) => requireNumber(x));
+}
+
+/** Map raw `getBuildNotes()` JSON from WASM to {@link BinomialBuildNotes}. */
+export function mapBinomialBuildNotes(value: unknown): BinomialBuildNotes {
+  const rec = asRecord(value);
+  const priorRaw = rec.prior ?? rec.Prior;
+  const calVer =
+    rec.calibrationVersion ?? rec.calibration_version;
+  const logitInfl =
+    rec.logitInflation ?? rec.logit_inflation;
+  const nAttempts = rec.nBuildAttempts ?? rec.n_build_attempts;
+  const dropped =
+    rec.zeroTrialDroppedIndices ?? rec.zero_trial_dropped_indices;
+  const fromLogitsOnly =
+    rec.fromPrecomputedLogitsOnly ?? rec.from_precomputed_logits_only;
+  if (typeof fromLogitsOnly !== "boolean") {
+    throw new Error("Expected boolean fromPrecomputedLogitsOnly from WASM");
+  }
+  return {
+    calibrationVersion: requireNumber(calVer),
+    logitInflation: requireNumber(logitInfl),
+    nBuildAttempts: requireNumber(nAttempts),
+    prior: mapBinomialPriorFromNotes(priorRaw),
+    zeroTrialDroppedIndices: mapZeroTrialDroppedIndices(dropped),
+    fromPrecomputedLogitsOnly: fromLogitsOnly,
+  };
 }
 
 export function mapOrdinaryBatchArrayOutput(

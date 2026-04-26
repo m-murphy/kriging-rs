@@ -2,8 +2,8 @@
  * Projected (planar) binomial kriging on `(x, y)` coordinates with 2D anisotropy.
  *
  * The planar / anisotropic counterpart of {@link BinomialKriging}: count data
- * (`successes`, `trials`) is mapped to a smoothed logit scale (Jeffreys
- * Beta(½, ½) by default) and ordinary kriging runs on those logits using
+ * (`successes`, `trials`) is mapped to a smoothed logit scale (default
+ * Beta(1, 1) prior, matching Rust) and ordinary kriging runs on those logits using
  * Euclidean (optionally anisotropy-deformed) distances. Predictions are
  * back-transformed to prevalences via the logistic function with a delta-method
  * variance approximation. See {@link BinomialKriging} for the geographic
@@ -15,6 +15,7 @@ import { KrigingError, wrapThrown } from "../errors.js";
 import { toFloat64Array, toUint32Array } from "../internal/convert.js";
 import {
   mapBinomialBatchArrayOutput,
+  mapBinomialBuildNotes,
   mapBinomialPrediction,
   mapBinomialPredictionArray,
 } from "../internal/mappers.js";
@@ -22,6 +23,7 @@ import { requireLoadedModule } from "../internal/module.js";
 import type { WasmBinomialProjectedInstance } from "../internal/wasm-shapes.js";
 import type {
   BinomialBatchArrayOutput,
+  BinomialBuildNotes,
   BinomialPrediction,
   BinomialProjectedFromPrecomputedLogitsOptions,
   BinomialProjectedKrigingOptions,
@@ -43,8 +45,8 @@ export class BinomialProjectedKriging {
   private inner: WasmBinomialProjectedInstance | null;
 
   /**
-   * Build a projected binomial kriging model with default Jeffreys Beta(½, ½)
-   * prior. Use {@link BinomialProjectedKriging.newWithPrior} for an explicit
+   * Build a projected binomial kriging model with default Beta(1, 1) prior.
+   * Use {@link BinomialProjectedKriging.newWithPrior} for an explicit
    * Beta prior, or {@link BinomialProjectedKriging.fromPrecomputedLogits} when
    * the caller already has finite logit estimates.
    *
@@ -97,7 +99,7 @@ export class BinomialProjectedKriging {
   ): BinomialProjectedKriging {
     const mod = requireLoadedModule();
     const ctor = mod.WasmBinomialProjectedKriging;
-    if (!ctor || typeof ctor.fromArraysWithPrior !== "function") {
+    if (!ctor) {
       throw new KrigingError(
         "BinomialProjectedKriging is not available; rebuild the WASM package",
         { code: "backend_unavailable" }
@@ -141,7 +143,7 @@ export class BinomialProjectedKriging {
   ): BinomialProjectedKriging {
     const mod = requireLoadedModule();
     const ctor = mod.WasmBinomialProjectedKriging;
-    if (!ctor || typeof ctor.fromPrecomputedLogits !== "function") {
+    if (!ctor) {
       throw new KrigingError(
         "BinomialProjectedKriging is not available; rebuild the WASM package",
         { code: "backend_unavailable" }
@@ -183,6 +185,15 @@ export class BinomialProjectedKriging {
   /** Explicit-resource-management disposer; calls {@link free}. */
   [Symbol.dispose](): void {
     this.free();
+  }
+
+  /** Build-time diagnostics (prior, dropped rows, logit inflation, …). */
+  getBuildNotes(): BinomialBuildNotes {
+    try {
+      return mapBinomialBuildNotes(this.requireInner().getBuildNotes());
+    } catch (e) {
+      throw wrapThrown(e);
+    }
   }
 
   /** Single-point prevalence prediction at planar `(x, y)`. */

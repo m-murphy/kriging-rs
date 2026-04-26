@@ -24,7 +24,10 @@ use crate::distance::GeoCoord;
 use crate::geo_dataset::GeoDataset;
 #[cfg(feature = "gpu")]
 use crate::gpu::detect_gpu_support;
-use crate::kriging::binomial::{BinomialKrigingModel, BinomialObservation, BinomialPrior};
+use crate::kriging::binomial::{
+    BinomialBuildNotes, BinomialKrigingModel, BinomialObservation, BinomialPrior,
+    HeteroskedasticBinomialConfig, build_binomial_observations_dropping_zero_trials,
+};
 use crate::kriging::ordinary::{Neighborhood, OrdinaryKrigingModel};
 use crate::kriging::simple::SimpleKrigingModel;
 use crate::kriging::universal::{UniversalKrigingModel, UniversalTrend};
@@ -207,27 +210,27 @@ fn error_code_for(err: &crate::error::KrigingError) -> &'static str {
     }
 }
 
+/// Geo binomial call sites: drop `trials == 0` rows, keep their original row indices
+/// (for [`BinomialKrigingModel::new_with_config`] / build notes).
 fn build_observations(
     lats: &[f64],
     lons: &[f64],
     successes: &[u32],
     trials: &[u32],
-) -> Result<Vec<BinomialObservation>, JsValue> {
+) -> Result<(Vec<BinomialObservation>, Vec<usize>), JsValue> {
     if lats.len() != lons.len() || lats.len() != successes.len() || lats.len() != trials.len() {
         return Err(coded_err(
             "all input arrays must have same length",
             "mismatched_arrays",
         ));
     }
-    let mut out = Vec::with_capacity(lats.len());
+    let mut coords = Vec::with_capacity(lats.len());
     for i in 0..lats.len() {
-        let coord =
-            GeoCoord::try_new(lats[i] as Real, lons[i] as Real).map_err(kriging_err_to_js)?;
-        out.push(
-            BinomialObservation::new(coord, successes[i], trials[i]).map_err(kriging_err_to_js)?,
-        );
+        coords
+            .push(GeoCoord::try_new(lats[i] as Real, lons[i] as Real).map_err(kriging_err_to_js)?);
     }
-    Ok(out)
+    build_binomial_observations_dropping_zero_trials(coords, successes, trials)
+        .map_err(kriging_err_to_js)
 }
 
 #[derive(Debug, Serialize)]
@@ -590,6 +593,7 @@ impl WasmOrdinaryKriging {
 #[wasm_bindgen]
 pub struct WasmBinomialKriging {
     inner: BinomialKrigingModel,
+    build_notes: BinomialBuildNotes,
 }
 
 #[wasm_bindgen]
@@ -598,8 +602,14 @@ impl WasmBinomialKriging {
     pub fn new(options: JsValue) -> Result<WasmBinomialKriging, JsValue> {
         let opts: BinomialKrigingOptions =
             serde_wasm_bindgen::from_value(options).map_err(err_to_js)?;
-        let observations =
+        let (observations, zero_trial_drops) =
             build_observations(&opts.lats, &opts.lons, &opts.successes, &opts.trials)?;
+        if observations.len() < 2 {
+            return Err(coded_err(
+                "need at least two non-zero-trial sites after dropping trials==0 rows",
+                "insufficient_data",
+            ));
+        }
         let model = parse_variogram(
             &opts.variogram.variogram_type,
             opts.variogram.nugget,
@@ -607,8 +617,19 @@ impl WasmBinomialKriging {
             opts.variogram.range,
             opts.variogram.shape,
         )?;
-        let inner = BinomialKrigingModel::new(observations, model).map_err(kriging_err_to_js)?;
-        Ok(Self { inner })
+        let hcfg = HeteroskedasticBinomialConfig::default();
+        let fit = BinomialKrigingModel::new_with_config(
+            observations,
+            model,
+            BinomialPrior::default(),
+            hcfg,
+            &zero_trial_drops,
+        )
+        .map_err(kriging_err_to_js)?;
+        Ok(Self {
+            inner: fit.model,
+            build_notes: fit.notes,
+        })
     }
 
     /// Zero-(extra-)copy factory: takes typed arrays directly instead of a JS object. See
@@ -625,10 +646,27 @@ impl WasmBinomialKriging {
         range: f64,
         shape: Option<f64>,
     ) -> Result<WasmBinomialKriging, JsValue> {
-        let observations = build_observations(lats, lons, successes, trials)?;
+        let (observations, zero_trial_drops) = build_observations(lats, lons, successes, trials)?;
+        if observations.len() < 2 {
+            return Err(coded_err(
+                "need at least two non-zero-trial sites after dropping trials==0 rows",
+                "insufficient_data",
+            ));
+        }
         let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
-        let inner = BinomialKrigingModel::new(observations, model).map_err(kriging_err_to_js)?;
-        Ok(Self { inner })
+        let hcfg = HeteroskedasticBinomialConfig::default();
+        let fit = BinomialKrigingModel::new_with_config(
+            observations,
+            model,
+            BinomialPrior::default(),
+            hcfg,
+            &zero_trial_drops,
+        )
+        .map_err(kriging_err_to_js)?;
+        Ok(Self {
+            inner: fit.model,
+            build_notes: fit.notes,
+        })
     }
 
     /// Factory for binomial kriging when the caller already has finite logit values (for
@@ -654,17 +692,26 @@ impl WasmBinomialKriging {
         let coords = to_coords(lats, lons)?;
         let logits_real: Vec<Real> = logits.iter().map(|v| *v as Real).collect();
         let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
-        let inner = BinomialKrigingModel::from_precomputed_logits(coords, logits_real, model)
+        let fit = BinomialKrigingModel::from_precomputed_logits(coords, logits_real, model)
             .map_err(kriging_err_to_js)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner: fit.model,
+            build_notes: fit.notes,
+        })
     }
 
     #[wasm_bindgen(js_name = newWithPrior)]
     pub fn new_with_prior(options: JsValue) -> Result<WasmBinomialKriging, JsValue> {
         let opts: BinomialKrigingWithPriorOptions =
             serde_wasm_bindgen::from_value(options).map_err(err_to_js)?;
-        let observations =
+        let (observations, zero_trial_drops) =
             build_observations(&opts.lats, &opts.lons, &opts.successes, &opts.trials)?;
+        if observations.len() < 2 {
+            return Err(coded_err(
+                "need at least two non-zero-trial sites after dropping trials==0 rows",
+                "insufficient_data",
+            ));
+        }
         let model = parse_variogram(
             &opts.variogram.variogram_type,
             opts.variogram.nugget,
@@ -674,9 +721,26 @@ impl WasmBinomialKriging {
         )?;
         let prior = BinomialPrior::new(opts.prior.alpha as Real, opts.prior.beta as Real)
             .map_err(kriging_err_to_js)?;
-        let inner = BinomialKrigingModel::new_with_prior(observations, model, prior)
-            .map_err(kriging_err_to_js)?;
-        Ok(Self { inner })
+        let hcfg = HeteroskedasticBinomialConfig::default();
+        let fit = BinomialKrigingModel::new_with_config(
+            observations,
+            model,
+            prior,
+            hcfg,
+            &zero_trial_drops,
+        )
+        .map_err(kriging_err_to_js)?;
+        Ok(Self {
+            inner: fit.model,
+            build_notes: fit.notes,
+        })
+    }
+
+    /// Build diagnostics: calibration version, prior, logit inflation, and dropped
+    /// zero-trial input rows (by original array index). See [`BinomialBuildNotes`].
+    #[wasm_bindgen(js_name = getBuildNotes)]
+    pub fn get_build_notes(&self) -> Result<JsValue, JsValue> {
+        serde_wasm_bindgen::to_value(&self.build_notes).map_err(err_to_js)
     }
 
     pub fn predict(&self, lat: f64, lon: f64) -> Result<JsValue, JsValue> {
@@ -1283,27 +1347,33 @@ fn build_projected_binomial_observations(
     ys: &[f64],
     successes: &[u32],
     trials: &[u32],
-) -> Result<Vec<ProjectedBinomialObservation>, JsValue> {
+) -> Result<(Vec<ProjectedBinomialObservation>, Vec<usize>), JsValue> {
     if xs.len() != ys.len() || xs.len() != successes.len() || xs.len() != trials.len() {
         return Err(coded_err(
             "xs, ys, successes and trials must have the same length",
             "mismatched_arrays",
         ));
     }
-    let mut out = Vec::with_capacity(xs.len());
+    let mut out = Vec::new();
+    let mut dropped: Vec<usize> = Vec::new();
     for i in 0..xs.len() {
+        if trials[i] == 0 {
+            dropped.push(i);
+            continue;
+        }
         let coord = ProjectedCoord::new(xs[i] as Real, ys[i] as Real);
         out.push(
             ProjectedBinomialObservation::new(coord, successes[i], trials[i])
                 .map_err(kriging_err_to_js)?,
         );
     }
-    Ok(out)
+    Ok((out, dropped))
 }
 
 #[wasm_bindgen]
 pub struct WasmBinomialProjectedKriging {
     inner: BinomialProjectedKrigingModel,
+    build_notes: BinomialBuildNotes,
 }
 
 #[wasm_bindgen]
@@ -1311,7 +1381,7 @@ impl WasmBinomialProjectedKriging {
     /// Construct a binomial projected kriging model on planar `(x, y)`
     /// coordinates. Mirrors [`WasmBinomialKriging::fromArrays`] but with
     /// 2-D anisotropy (`majorAngleDeg`, `rangeRatio`). Uses
-    /// `BinomialPrior::default()` (Jeffreys' Beta(½, ½)) for empirical-Bayes
+    /// `BinomialPrior::default()` (Beta(1, 1)) for empirical-Bayes
     /// smoothing of the per-station logits.
     #[wasm_bindgen(js_name = fromArrays)]
     pub fn from_arrays(
@@ -1327,13 +1397,26 @@ impl WasmBinomialProjectedKriging {
         major_angle_deg: f64,
         range_ratio: f64,
     ) -> Result<WasmBinomialProjectedKriging, JsValue> {
-        let observations = build_projected_binomial_observations(xs, ys, successes, trials)?;
+        let (observations, zero_trial_drops) =
+            build_projected_binomial_observations(xs, ys, successes, trials)?;
+        if observations.len() < 2 {
+            return Err(coded_err(
+                "need at least two non-zero-trial sites after dropping trials==0 rows",
+                "insufficient_data",
+            ));
+        }
         let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
         let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
             .map_err(kriging_err_to_js)?;
-        let inner = BinomialProjectedKrigingModel::new(observations, model, anisotropy)
+        let fit = BinomialProjectedKrigingModel::new(observations, model, anisotropy)
             .map_err(kriging_err_to_js)?;
-        Ok(Self { inner })
+        let mut build_notes = fit.notes;
+        build_notes.zero_trial_dropped_indices = zero_trial_drops;
+        build_notes.zero_trial_dropped_indices.sort_unstable();
+        Ok(Self {
+            inner: fit.model,
+            build_notes,
+        })
     }
 
     /// As [`fromArrays`](Self::from_arrays), with an explicit Beta prior.
@@ -1353,16 +1436,29 @@ impl WasmBinomialProjectedKriging {
         prior_alpha: f64,
         prior_beta: f64,
     ) -> Result<WasmBinomialProjectedKriging, JsValue> {
-        let observations = build_projected_binomial_observations(xs, ys, successes, trials)?;
+        let (observations, zero_trial_drops) =
+            build_projected_binomial_observations(xs, ys, successes, trials)?;
+        if observations.len() < 2 {
+            return Err(coded_err(
+                "need at least two non-zero-trial sites after dropping trials==0 rows",
+                "insufficient_data",
+            ));
+        }
         let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
         let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
             .map_err(kriging_err_to_js)?;
         let prior = BinomialPrior::new(prior_alpha as Real, prior_beta as Real)
             .map_err(kriging_err_to_js)?;
-        let inner =
+        let fit =
             BinomialProjectedKrigingModel::new_with_prior(observations, model, anisotropy, prior)
                 .map_err(kriging_err_to_js)?;
-        Ok(Self { inner })
+        let mut build_notes = fit.notes;
+        build_notes.zero_trial_dropped_indices = zero_trial_drops;
+        build_notes.zero_trial_dropped_indices.sort_unstable();
+        Ok(Self {
+            inner: fit.model,
+            build_notes,
+        })
     }
 
     /// Build a projected binomial model from caller-supplied logit values,
@@ -1395,14 +1491,24 @@ impl WasmBinomialProjectedKriging {
         let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
         let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
             .map_err(kriging_err_to_js)?;
-        let inner = BinomialProjectedKrigingModel::from_precomputed_logits(
+        let fit = BinomialProjectedKrigingModel::from_precomputed_logits(
             coords,
             logits_real,
             model,
             anisotropy,
         )
         .map_err(kriging_err_to_js)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner: fit.model,
+            build_notes: fit.notes,
+        })
+    }
+
+    /// Build / conditioning diagnostics for the projected binomial model. See
+    /// [`BinomialBuildNotes`].
+    #[wasm_bindgen(js_name = getBuildNotes)]
+    pub fn get_build_notes(&self) -> Result<JsValue, JsValue> {
+        serde_wasm_bindgen::to_value(&self.build_notes).map_err(err_to_js)
     }
 
     pub fn predict(&self, x: f64, y: f64) -> Result<JsValue, JsValue> {

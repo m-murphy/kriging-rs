@@ -71,12 +71,19 @@ impl Neighborhood {
 /// Build from a [`GeoDataset`] and a [`VariogramModel`]
 /// with [`new`](Self::new), then call [`predict`](Self::predict) for a single location or
 /// [`predict_batch`](Self::predict_batch) for many. See also the `ordinary_kriging` example.
+///
+/// For per-station observation noise in addition to the nugget and numerical jitter, use
+/// [`new_with_extra_diagonal`](Self::new_with_extra_diagonal).
 #[derive(Debug)]
 pub struct OrdinaryKrigingModel {
     coords: Vec<GeoCoord>,
     prepared_coords: Vec<PreparedGeoCoord>,
     values: Vec<Real>,
     variogram: VariogramModel,
+    /// Non-negative extra variance per station, added to the main diagonal of the
+    /// covariance (same units as the `sill`). Empty means homoscedastic: no extra
+    /// diagonal. When set, the slice length must equal the number of stations.
+    observation_diagonal: Vec<Real>,
     cov_at_zero: Real,
     system: DMatrix<Real>,
     /// Shared LU factorization. Wrapped in `Arc` so `Clone` is `O(1)` instead of
@@ -94,6 +101,7 @@ impl Clone for OrdinaryKrigingModel {
             values: self.values.clone(),
             variogram: self.variogram,
             cov_at_zero: self.cov_at_zero,
+            observation_diagonal: self.observation_diagonal.clone(),
             system: self.system.clone(),
             system_lu: Arc::clone(&self.system_lu),
             neighborhood: self.neighborhood,
@@ -103,14 +111,59 @@ impl Clone for OrdinaryKrigingModel {
 
 impl OrdinaryKrigingModel {
     pub fn new(dataset: GeoDataset, variogram: VariogramModel) -> Result<Self, KrigingError> {
+        Self::new_with_extra_diagonal_internal(dataset, variogram, &[])
+    }
+
+    /// Like [`new`](Self::new) but adds `extra` (length `n`) to each main-diagonal
+    /// covariance term for that station, modeling observation-specific (non-spatial) noise
+    /// on top of the nugget, micro-scale, and [`kriging_diagonal_jitter`].
+    ///
+    /// Use this for heteroskedastic observation noise, e.g. from binomial / survey sampling
+    /// on a transformed (logit) working scale. Each entry must be finite and
+    /// non-negative.
+    pub fn new_with_extra_diagonal(
+        dataset: GeoDataset,
+        variogram: VariogramModel,
+        extra: Vec<Real>,
+    ) -> Result<Self, KrigingError> {
+        if !extra.is_empty() && extra.len() != dataset.len() {
+            return Err(KrigingError::InvalidInput(
+                "extra observation diagonal must be empty (homoscedastic) or the same length as the dataset"
+                    .to_string(),
+            ));
+        }
+        for &v in &extra {
+            if !v.is_finite() || v < 0.0 {
+                return Err(KrigingError::InvalidInput(
+                    "observation diagonal entries must be finite and non-negative".to_string(),
+                ));
+            }
+        }
+        let mut s = Self::new_with_extra_diagonal_internal(dataset, variogram, &extra)?;
+        s.observation_diagonal = extra;
+        Ok(s)
+    }
+
+    fn new_with_extra_diagonal_internal(
+        dataset: GeoDataset,
+        variogram: VariogramModel,
+        extra: &[Real],
+    ) -> Result<Self, KrigingError> {
         let (coords, values) = dataset.into_parts();
+        let n = coords.len();
+        if !extra.is_empty() && extra.len() != n {
+            return Err(KrigingError::InvalidInput(
+                "internal: extra length mismatch for ordinary kriging".to_string(),
+            ));
+        }
+        debug_assert!(extra.is_empty() || extra.len() == n);
         let prepared_coords = coords
             .iter()
             .copied()
             .map(prepare_geo_coord)
             .collect::<Vec<_>>();
 
-        let system = build_ordinary_system(&prepared_coords, variogram);
+        let system = build_ordinary_system(&prepared_coords, variogram, extra);
         let system_lu = Arc::new(system.clone().lu());
         // Validate solvability up front so prediction failures are not deferred.
         let mut probe_rhs = DVector::from_element(coords.len() + 1, 0.0);
@@ -125,6 +178,7 @@ impl OrdinaryKrigingModel {
             prepared_coords,
             values,
             variogram,
+            observation_diagonal: Vec::new(),
             cov_at_zero: variogram.covariance(0.0),
             system,
             system_lu,
@@ -308,6 +362,9 @@ impl OrdinaryKrigingModel {
                 ));
                 if i == j {
                     cov += diag_eps;
+                    if let Some(&d) = self.observation_diagonal.get(si) {
+                        cov += d;
+                    }
                 }
                 a[(i, j)] = cov;
                 a[(j, i)] = cov;
@@ -436,9 +493,16 @@ pub fn kriging_diagonal_jitter(n_stations: usize, variogram: VariogramModel) -> 
     }
 }
 
-fn build_ordinary_system(coords: &[PreparedGeoCoord], variogram: VariogramModel) -> DMatrix<Real> {
+fn build_ordinary_system(
+    coords: &[PreparedGeoCoord],
+    variogram: VariogramModel,
+    obs_extra: &[Real],
+) -> DMatrix<Real> {
     let n = coords.len();
     let diag_eps = kriging_diagonal_jitter(n, variogram);
+    if !obs_extra.is_empty() {
+        debug_assert_eq!(obs_extra.len(), n);
+    }
 
     // Compute only the upper triangle of covariances as a flat buffer indexed by
     // `row_upper_triangle_index(i, j) = i * n - i*(i+1)/2 + j` for i <= j. This halves the
@@ -451,6 +515,9 @@ fn build_ordinary_system(coords: &[PreparedGeoCoord], variogram: VariogramModel)
             let mut cov = variogram.covariance(haversine_distance_prepared(coords[i], coords[j]));
             if i == j {
                 cov += diag_eps;
+                if let Some(&d) = obs_extra.get(i) {
+                    cov += d;
+                }
             }
             row.push(cov);
         }
@@ -481,6 +548,34 @@ mod tests {
     use super::*;
     use crate::geo_dataset::GeoDataset;
     use crate::variogram::models::VariogramType;
+
+    #[test]
+    fn extra_diagonal_nudges_weights_toward_high_trust_sites() {
+        let coords = vec![
+            GeoCoord::try_new(0.0, 0.0).unwrap(),
+            GeoCoord::try_new(0.0, 1.0).unwrap(),
+            GeoCoord::try_new(1.0, 0.0).unwrap(),
+        ];
+        let values = vec![0.0, 0.0, 10.0];
+        let variogram = VariogramModel::new(0.01, 5.0, 500.0, VariogramType::Exponential).unwrap();
+        let dataset = GeoDataset::new(coords.clone(), values.clone()).unwrap();
+        let homo = OrdinaryKrigingModel::new(dataset, variogram).expect("homo");
+        // Heavy observation noise on station 2: should pull midpoint prediction down vs homo.
+        let extra = vec![0.0, 0.0, 2.0];
+        let het = OrdinaryKrigingModel::new_with_extra_diagonal(
+            GeoDataset::new(coords, values).unwrap(),
+            variogram,
+            extra,
+        )
+        .expect("het");
+        let t = GeoCoord::try_new(0.1, 0.1).unwrap();
+        let ph = homo.predict(t).expect("h").value;
+        let phe = het.predict(t).expect("e").value;
+        assert!(
+            phe < ph,
+            "noisy high-value site should be down-weighted: phe={phe} ph={ph}"
+        );
+    }
 
     #[test]
     fn predicts_close_to_training_value_for_collocated_point() {

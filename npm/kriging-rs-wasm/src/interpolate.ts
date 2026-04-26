@@ -14,6 +14,7 @@ import {
 import { BinomialKriging } from "./kriging/binomial.js";
 import { OrdinaryKriging } from "./kriging/ordinary.js";
 import type {
+  BinomialBuildNotes,
   BinomialCvSummary,
   BinomialGridOutput,
   InterpolateBinomialToGridOptions,
@@ -70,7 +71,7 @@ export function interpolateOrdinaryToGrid(
  *
  * The variogram fit and the kriging system both see
  * `logit((sᵢ + α)/(nᵢ + α + β))` per station, with `α/β` from the supplied
- * `prior` (default Beta(½, ½)) — so the fitted nugget/sill/range are calibrated
+ * `prior` (default Beta(1, 1)) — so the fitted nugget/sill/range are calibrated
  * for the field the model actually solves on. Pass `estimator: "cressie-hawkins"`
  * for a robust fit when counts are small / heavy-tailed.
  *
@@ -120,6 +121,7 @@ export function interpolateBinomialToGrid(
       });
 
   let grids: BinomialGridOutput;
+  let buildNotes: BinomialBuildNotes;
   try {
     grids = model.predictGrid({
       west: options.west,
@@ -129,6 +131,7 @@ export function interpolateBinomialToGrid(
       xCells: options.xCells,
       yCells: options.yCells,
     });
+    buildNotes = model.getBuildNotes();
   } finally {
     model.free();
   }
@@ -136,6 +139,7 @@ export function interpolateBinomialToGrid(
   const result: InterpolateBinomialToGridResult = {
     ...grids,
     fittedVariogram: fitted,
+    buildNotes,
   };
 
   const cvSummary = runBinomialCvIfRequested(options, fitted);

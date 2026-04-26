@@ -655,7 +655,8 @@ pub fn leave_one_out_binomial(
         if observations.len() < 2 {
             return Err(KrigingError::InsufficientData(2));
         }
-        let model = BinomialKrigingModel::new_with_prior(observations, variogram, prior)?;
+        let model =
+            BinomialKrigingModel::new_with_prior(observations, variogram, prior)?.into_model();
         let pred = model.predict(coords[i])?;
         out.push(make_binomial_residual(
             i,
@@ -687,7 +688,8 @@ pub fn k_fold_binomial(
         if observations.len() < 2 {
             return Err(KrigingError::InsufficientData(2));
         }
-        let model = BinomialKrigingModel::new_with_prior(observations, variogram, prior)?;
+        let model =
+            BinomialKrigingModel::new_with_prior(observations, variogram, prior)?.into_model();
         let test_coords: Vec<GeoCoord> = test.iter().map(|&j| coords[j]).collect();
         let preds = model.predict_batch(&test_coords)?;
         for (&idx, pred) in test.iter().zip(preds.iter()) {
@@ -762,7 +764,8 @@ pub fn leave_one_out_binomial_projected(
             variogram,
             anisotropy,
             prior,
-        )?;
+        )?
+        .into_model();
         let pred = model.predict(coords[i])?;
         out.push(make_binomial_residual(
             i,
@@ -801,7 +804,8 @@ pub fn k_fold_binomial_projected(
             variogram,
             anisotropy,
             prior,
-        )?;
+        )?
+        .into_model();
         let test_coords: Vec<ProjectedCoord> = test.iter().map(|&j| coords[j]).collect();
         let preds = model.predict_batch(&test_coords)?;
         for (&idx, pred) in test.iter().zip(preds.iter()) {
@@ -1046,7 +1050,8 @@ pub fn leave_one_out_spacetime_binomial<M: SpatialMetric>(
             return Err(KrigingError::InsufficientData(2));
         }
         let model =
-            SpaceTimeBinomialKrigingModel::new_with_prior(metric, observations, variogram, prior)?;
+            SpaceTimeBinomialKrigingModel::new_with_prior(metric, observations, variogram, prior)?
+                .into_model();
         let pred = model.predict(coords[i])?;
         out.push(make_binomial_residual(
             i,
@@ -1081,7 +1086,8 @@ pub fn k_fold_spacetime_binomial<M: SpatialMetric>(
             return Err(KrigingError::InsufficientData(2));
         }
         let model =
-            SpaceTimeBinomialKrigingModel::new_with_prior(metric, observations, variogram, prior)?;
+            SpaceTimeBinomialKrigingModel::new_with_prior(metric, observations, variogram, prior)?
+                .into_model();
         let test_coords: Vec<SpaceTimeCoord<M::Coord>> = test.iter().map(|&j| coords[j]).collect();
         let preds = model.predict_batch(&test_coords)?;
         for (&idx, pred) in test.iter().zip(preds.iter()) {

@@ -48,6 +48,13 @@ println!("{:?}", prediction.value);
 - Optional WASM bindings for browser applications
 - `Real` abstraction defaults to `f32` for compute paths
 - Optional cross-platform GPU capability path via `wgpu`
+- **Binomial (prevalence) default:** empirical-Bayes `Beta(1,1)` (or user prior) → logit
+  working values → **ordinary kriging with per-site logit observation variance** (calibrated
+  binomial) on the covariance diagonal, then `logistic` to prevalence; *not* a full
+  binomial-likelihood field model. Build diagnostics are always returned on the Rust side
+  ([`BinomialBuildNotes`]) and exposed in WASM as `getBuildNotes()`. See
+  [benches/BROWSER_BENCHMARKS.md](benches/BROWSER_BENCHMARKS.md) for a large
+  browser-representative prediction workload
 
 Build with `--features wasm` for browser; see below for GPU.
 
@@ -89,7 +96,7 @@ GPU batch prediction APIs are on `OrdinaryKrigingModel` / `BinomialKrigingModel`
 
 ## Performance
 
-Run `cargo bench` for current numbers; see [bench-results/README.md](bench-results/README.md) for logging and comparison.
+Run `cargo bench` for current numbers; see [bench-results/README.md](bench-results/README.md) for logging and comparison. A **browser-oriented** (large grid, mixed trial counts) binomial *prediction* benchmark and workload description is in [benches/BROWSER_BENCHMARKS.md](benches/BROWSER_BENCHMARKS.md) (`bench_binomial_browser_representative`).
 
 ## License
 

@@ -41,7 +41,10 @@ use crate::Real;
 use crate::distance::GeoCoord;
 use crate::error::KrigingError;
 use crate::geo_dataset::GeoDataset;
-use crate::kriging::binomial::{BinomialKrigingModel, BinomialObservation, BinomialPrior};
+use crate::kriging::binomial::{
+    BinomialKrigingModel, BinomialObservation, BinomialPrior, HeteroskedasticBinomialConfig,
+    logit_observation_variance_empirical_bayes,
+};
 use crate::kriging::ordinary::OrdinaryKrigingModel;
 use crate::kriging::simple::SimpleKrigingModel;
 use crate::kriging::universal::{UniversalKrigingModel, UniversalTrend};
@@ -431,6 +434,7 @@ pub fn conditional_simulate_binomial_projected(
     }
     let mut pool_coords: Vec<ProjectedCoord> = Vec::with_capacity(conditioning_coords.len());
     let mut pool_logits: Vec<Real> = Vec::with_capacity(conditioning_coords.len());
+    let mut pool_obs_var: Vec<Real> = Vec::with_capacity(conditioning_coords.len());
     for i in 0..conditioning_coords.len() {
         if trials[i] == 0 {
             continue;
@@ -439,6 +443,11 @@ pub fn conditional_simulate_binomial_projected(
             ProjectedBinomialObservation::new(conditioning_coords[i], successes[i], trials[i])?;
         pool_coords.push(obs.coord());
         pool_logits.push(obs.smoothed_logit_with_prior(prior));
+        pool_obs_var.push(logit_observation_variance_empirical_bayes(
+            prior,
+            successes[i],
+            trials[i],
+        ));
     }
     if pool_coords.len() < 2 {
         return Err(KrigingError::InsufficientData(2));
@@ -451,12 +460,16 @@ pub fn conditional_simulate_binomial_projected(
     let mut prev_out = vec![0.0 as Real; n_targets];
 
     for &target_idx in &order {
-        let model = BinomialProjectedKrigingModel::from_precomputed_logits(
+        let model = BinomialProjectedKrigingModel::from_precomputed_logits_with_logit_observation_variances(
             pool_coords.clone(),
             pool_logits.clone(),
             variogram,
             anisotropy,
-        )?;
+            pool_obs_var.clone(),
+            HeteroskedasticBinomialConfig::default(),
+            prior,
+        )?
+        .into_model();
         let pred = model.predict(targets[target_idx])?;
         let sigma = pred.variance.max(0.0).sqrt();
         let logit_sample = pred.logit_value + sigma * rng.next_standard_normal();
@@ -465,6 +478,7 @@ pub fn conditional_simulate_binomial_projected(
         prev_out[target_idx] = prevalence_sample;
         pool_coords.push(targets[target_idx]);
         pool_logits.push(logit_sample);
+        pool_obs_var.push(0.0);
     }
 
     Ok(BinomialSimulationResult {
@@ -502,6 +516,7 @@ pub fn conditional_simulate_many_binomial_projected(
     }
     let mut initial_coords: Vec<ProjectedCoord> = Vec::with_capacity(conditioning_coords.len());
     let mut initial_logits: Vec<Real> = Vec::with_capacity(conditioning_coords.len());
+    let mut initial_obs_var: Vec<Real> = Vec::with_capacity(conditioning_coords.len());
     for i in 0..conditioning_coords.len() {
         if trials[i] == 0 {
             continue;
@@ -510,6 +525,11 @@ pub fn conditional_simulate_many_binomial_projected(
             ProjectedBinomialObservation::new(conditioning_coords[i], successes[i], trials[i])?;
         initial_coords.push(obs.coord());
         initial_logits.push(obs.smoothed_logit_with_prior(prior));
+        initial_obs_var.push(logit_observation_variance_empirical_bayes(
+            prior,
+            successes[i],
+            trials[i],
+        ));
     }
     if initial_coords.len() < 2 {
         return Err(KrigingError::InsufficientData(2));
@@ -521,6 +541,7 @@ pub fn conditional_simulate_many_binomial_projected(
 
     let mut pool_coords = initial_coords;
     let mut pool_logits = initial_logits;
+    let mut pool_obs_var = initial_obs_var;
     let mut logit_out = vec![0.0 as Real; n_realizations * n_targets];
     let mut prev_out = vec![0.0 as Real; n_realizations * n_targets];
 
@@ -529,12 +550,16 @@ pub fn conditional_simulate_many_binomial_projected(
         let mut rng = Rng::new(seed);
         let row_off = k * n_targets;
         for &target_idx in &order {
-            let model = BinomialProjectedKrigingModel::from_precomputed_logits(
+            let model = BinomialProjectedKrigingModel::from_precomputed_logits_with_logit_observation_variances(
                 pool_coords.clone(),
                 pool_logits.clone(),
                 variogram,
                 anisotropy,
-            )?;
+                pool_obs_var.clone(),
+                HeteroskedasticBinomialConfig::default(),
+                prior,
+            )?
+            .into_model();
             let pred = model.predict(targets[target_idx])?;
             let sigma = pred.variance.max(0.0).sqrt();
             let logit_sample = pred.logit_value + sigma * rng.next_standard_normal();
@@ -543,9 +568,11 @@ pub fn conditional_simulate_many_binomial_projected(
             prev_out[row_off + target_idx] = prevalence_sample;
             pool_coords.push(targets[target_idx]);
             pool_logits.push(logit_sample);
+            pool_obs_var.push(0.0);
         }
         pool_coords.truncate(initial_n);
         pool_logits.truncate(initial_n);
+        pool_obs_var.truncate(initial_n);
     }
 
     Ok(BinomialSimulationManyResult {
@@ -567,10 +594,12 @@ pub fn conditional_simulate_many_binomial_projected(
 ///
 /// Steps:
 /// 1. Drop stations with `trials == 0` (they carry no information).
-/// 2. Convert remaining stations to smoothed logits using [`BinomialPrior`].
-/// 3. At each target, fit a binomial kriging model against the growing pool of logits,
-///    predict, draw `N(logit̂, σ²̂_logit)`, convert via `logistic` to prevalence, and append
-///    the logit sample to the pool for subsequent targets.
+/// 2. Convert remaining stations to smoothed logits using [`BinomialPrior`], and store
+///    per-site logit **observation** variances (binomial) for conditioning; simulated latent
+///    values appended to the pool are treated with zero extra observation noise.
+/// 3. At each target, fit a **heteroskedastic** binomial (logit) model against the growing
+///    pool, predict, draw `N(logit̂, σ²̂_logit)`, convert via `logistic` to prevalence, and
+///    append the logit sample to the pool for subsequent targets.
 ///
 /// Both `logit_samples` and `prevalence_samples` are returned in the **original** target
 /// input order.
@@ -598,9 +627,10 @@ pub fn conditional_simulate_binomial(
         )));
     }
 
-    // Build initial logit pool from stations with trials > 0.
+    // Build initial logit pool and binomial (logit) observation variances for data sites.
     let mut pool_coords: Vec<GeoCoord> = Vec::with_capacity(conditioning_coords.len());
     let mut pool_logits: Vec<Real> = Vec::with_capacity(conditioning_coords.len());
+    let mut pool_obs_var: Vec<Real> = Vec::with_capacity(conditioning_coords.len());
     for i in 0..conditioning_coords.len() {
         if trials[i] == 0 {
             continue;
@@ -608,6 +638,11 @@ pub fn conditional_simulate_binomial(
         let obs = BinomialObservation::new(conditioning_coords[i], successes[i], trials[i])?;
         pool_coords.push(obs.coord());
         pool_logits.push(obs.smoothed_logit_with_prior(prior));
+        pool_obs_var.push(logit_observation_variance_empirical_bayes(
+            prior,
+            successes[i],
+            trials[i],
+        ));
     }
     if pool_coords.len() < 2 {
         return Err(KrigingError::InsufficientData(2));
@@ -621,11 +656,15 @@ pub fn conditional_simulate_binomial(
     let mut prev_out = vec![0.0 as Real; n_targets];
 
     for &target_idx in &order {
-        let model = BinomialKrigingModel::from_precomputed_logits(
+        let model = BinomialKrigingModel::from_precomputed_logits_with_logit_observation_variances(
             pool_coords.clone(),
             pool_logits.clone(),
             variogram,
-        )?;
+            pool_obs_var.clone(),
+            HeteroskedasticBinomialConfig::default(),
+            prior,
+        )?
+        .into_model();
         let pred = model.predict(targets[target_idx])?;
         let sigma = pred.variance.max(0.0).sqrt();
         let logit_sample = pred.logit_value + sigma * rng.next_standard_normal();
@@ -634,6 +673,7 @@ pub fn conditional_simulate_binomial(
         prev_out[target_idx] = prevalence_sample;
         pool_coords.push(targets[target_idx]);
         pool_logits.push(logit_sample);
+        pool_obs_var.push(0.0);
     }
 
     Ok(BinomialSimulationResult {
@@ -787,6 +827,7 @@ pub fn conditional_simulate_spacetime_binomial<M: SpatialMetric>(
     let mut pool_coords: Vec<SpaceTimeCoord<M::Coord>> =
         Vec::with_capacity(conditioning_coords.len());
     let mut pool_logits: Vec<Real> = Vec::with_capacity(conditioning_coords.len());
+    let mut pool_obs_var: Vec<Real> = Vec::with_capacity(conditioning_coords.len());
     for i in 0..conditioning_coords.len() {
         if trials[i] == 0 {
             continue;
@@ -795,6 +836,11 @@ pub fn conditional_simulate_spacetime_binomial<M: SpatialMetric>(
             SpaceTimeBinomialObservation::new(conditioning_coords[i], successes[i], trials[i])?;
         pool_coords.push(obs.coord());
         pool_logits.push(obs.smoothed_logit_with_prior(prior));
+        pool_obs_var.push(logit_observation_variance_empirical_bayes(
+            prior,
+            successes[i],
+            trials[i],
+        ));
     }
     if pool_coords.len() < 2 {
         return Err(KrigingError::InsufficientData(2));
@@ -808,12 +854,16 @@ pub fn conditional_simulate_spacetime_binomial<M: SpatialMetric>(
     let mut prev_out = vec![0.0 as Real; n_targets];
 
     for &target_idx in &order {
-        let model = SpaceTimeBinomialKrigingModel::from_precomputed_logits(
+        let model = SpaceTimeBinomialKrigingModel::from_precomputed_logits_with_logit_observation_variances(
             metric,
             pool_coords.clone(),
             pool_logits.clone(),
             variogram,
-        )?;
+            pool_obs_var.clone(),
+            HeteroskedasticBinomialConfig::default(),
+            prior,
+        )?
+        .into_model();
         let pred = model.predict(targets[target_idx])?;
         let sigma = pred.variance.max(0.0).sqrt();
         let logit_sample = pred.logit_value + sigma * rng.next_standard_normal();
@@ -822,6 +872,7 @@ pub fn conditional_simulate_spacetime_binomial<M: SpatialMetric>(
         prev_out[target_idx] = prevalence_sample;
         pool_coords.push(targets[target_idx]);
         pool_logits.push(logit_sample);
+        pool_obs_var.push(0.0);
     }
 
     Ok(BinomialSimulationResult {
@@ -971,6 +1022,7 @@ pub fn conditional_simulate_many_binomial(
 
     let mut initial_coords: Vec<GeoCoord> = Vec::with_capacity(conditioning_coords.len());
     let mut initial_logits: Vec<Real> = Vec::with_capacity(conditioning_coords.len());
+    let mut initial_obs_var: Vec<Real> = Vec::with_capacity(conditioning_coords.len());
     for i in 0..conditioning_coords.len() {
         if trials[i] == 0 {
             continue;
@@ -978,6 +1030,11 @@ pub fn conditional_simulate_many_binomial(
         let obs = BinomialObservation::new(conditioning_coords[i], successes[i], trials[i])?;
         initial_coords.push(obs.coord());
         initial_logits.push(obs.smoothed_logit_with_prior(prior));
+        initial_obs_var.push(logit_observation_variance_empirical_bayes(
+            prior,
+            successes[i],
+            trials[i],
+        ));
     }
     if initial_coords.len() < 2 {
         return Err(KrigingError::InsufficientData(2));
@@ -989,6 +1046,7 @@ pub fn conditional_simulate_many_binomial(
 
     let mut pool_coords = initial_coords;
     let mut pool_logits = initial_logits;
+    let mut pool_obs_var = initial_obs_var;
     let mut logit_out = vec![0.0 as Real; n_realizations * n_targets];
     let mut prev_out = vec![0.0 as Real; n_realizations * n_targets];
 
@@ -997,11 +1055,16 @@ pub fn conditional_simulate_many_binomial(
         let mut rng = Rng::new(seed);
         let row_off = k * n_targets;
         for &target_idx in &order {
-            let model = BinomialKrigingModel::from_precomputed_logits(
-                pool_coords.clone(),
-                pool_logits.clone(),
-                variogram,
-            )?;
+            let model =
+                BinomialKrigingModel::from_precomputed_logits_with_logit_observation_variances(
+                    pool_coords.clone(),
+                    pool_logits.clone(),
+                    variogram,
+                    pool_obs_var.clone(),
+                    HeteroskedasticBinomialConfig::default(),
+                    prior,
+                )?
+                .into_model();
             let pred = model.predict(targets[target_idx])?;
             let sigma = pred.variance.max(0.0).sqrt();
             let logit_sample = pred.logit_value + sigma * rng.next_standard_normal();
@@ -1010,9 +1073,11 @@ pub fn conditional_simulate_many_binomial(
             prev_out[row_off + target_idx] = prevalence_sample;
             pool_coords.push(targets[target_idx]);
             pool_logits.push(logit_sample);
+            pool_obs_var.push(0.0);
         }
         pool_coords.truncate(initial_n);
         pool_logits.truncate(initial_n);
+        pool_obs_var.truncate(initial_n);
     }
 
     Ok(BinomialSimulationManyResult {
@@ -1051,6 +1116,7 @@ pub fn conditional_simulate_many_spacetime_binomial<M: SpatialMetric>(
     let mut initial_coords: Vec<SpaceTimeCoord<M::Coord>> =
         Vec::with_capacity(conditioning_coords.len());
     let mut initial_logits: Vec<Real> = Vec::with_capacity(conditioning_coords.len());
+    let mut initial_obs_var: Vec<Real> = Vec::with_capacity(conditioning_coords.len());
     for i in 0..conditioning_coords.len() {
         if trials[i] == 0 {
             continue;
@@ -1059,6 +1125,11 @@ pub fn conditional_simulate_many_spacetime_binomial<M: SpatialMetric>(
             SpaceTimeBinomialObservation::new(conditioning_coords[i], successes[i], trials[i])?;
         initial_coords.push(obs.coord());
         initial_logits.push(obs.smoothed_logit_with_prior(prior));
+        initial_obs_var.push(logit_observation_variance_empirical_bayes(
+            prior,
+            successes[i],
+            trials[i],
+        ));
     }
     if initial_coords.len() < 2 {
         return Err(KrigingError::InsufficientData(2));
@@ -1070,6 +1141,7 @@ pub fn conditional_simulate_many_spacetime_binomial<M: SpatialMetric>(
 
     let mut pool_coords = initial_coords;
     let mut pool_logits = initial_logits;
+    let mut pool_obs_var = initial_obs_var;
     let mut logit_out = vec![0.0 as Real; n_realizations * n_targets];
     let mut prev_out = vec![0.0 as Real; n_realizations * n_targets];
 
@@ -1078,12 +1150,16 @@ pub fn conditional_simulate_many_spacetime_binomial<M: SpatialMetric>(
         let mut rng = Rng::new(seed);
         let row_off = k * n_targets;
         for &target_idx in &order {
-            let model = SpaceTimeBinomialKrigingModel::from_precomputed_logits(
+            let model = SpaceTimeBinomialKrigingModel::from_precomputed_logits_with_logit_observation_variances(
                 metric,
                 pool_coords.clone(),
                 pool_logits.clone(),
                 variogram,
-            )?;
+                pool_obs_var.clone(),
+                HeteroskedasticBinomialConfig::default(),
+                prior,
+            )?
+            .into_model();
             let pred = model.predict(targets[target_idx])?;
             let sigma = pred.variance.max(0.0).sqrt();
             let logit_sample = pred.logit_value + sigma * rng.next_standard_normal();
@@ -1092,9 +1168,11 @@ pub fn conditional_simulate_many_spacetime_binomial<M: SpatialMetric>(
             prev_out[row_off + target_idx] = prevalence_sample;
             pool_coords.push(targets[target_idx]);
             pool_logits.push(logit_sample);
+            pool_obs_var.push(0.0);
         }
         pool_coords.truncate(initial_n);
         pool_logits.truncate(initial_n);
+        pool_obs_var.truncate(initial_n);
     }
 
     Ok(BinomialSimulationManyResult {

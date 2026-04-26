@@ -3,10 +3,17 @@ declare module "../pkg/kriging_rs.js" {
   export default init;
 
   export const initSync: (module: unknown) => unknown;
-  export const WasmOrdinaryKriging: new (options: unknown) => unknown;
+  /** Use `fromArrays` for the normal fast path; see internal/wasm-shapes.ts. */
+  export const WasmOrdinaryKriging: {
+    new (options: unknown): unknown;
+    fromArrays(...args: unknown[]): unknown;
+  };
+  /** Factory methods; instance shape includes getBuildNotes and predictGridArrays. */
   export const WasmBinomialKriging: {
     new (options: unknown): unknown;
     newWithPrior(options: unknown): unknown;
+    fromArrays(...args: unknown[]): unknown;
+    fromPrecomputedLogits(...args: unknown[]): unknown;
   };
   export const WasmVariogramType: {
     readonly Spherical: number;

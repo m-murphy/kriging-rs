@@ -155,6 +155,31 @@ fn wasm_binomial_predict_returns_serializable_object() {
 }
 
 #[wasm_bindgen_test]
+fn wasm_binomial_get_build_notes_includes_version() {
+    let lats = [0.0, 0.0, 1.0];
+    let lons = [0.0, 1.0, 0.0];
+    let successes = [1u32, 3, 4];
+    let trials = [5u32, 5, 5];
+    let opts = binomial_options(
+        &lats,
+        &lons,
+        &successes,
+        &trials,
+        "exponential",
+        0.01,
+        2.0,
+        300.0,
+    );
+    let model = WasmBinomialKriging::new(opts).expect("model should construct");
+    let notes = model.get_build_notes().expect("build notes");
+    let v = Reflect::get(&notes, &JsValue::from_str("calibrationVersion"))
+        .expect("calibrationVersion")
+        .as_f64()
+        .unwrap();
+    assert!(v >= 1.0);
+}
+
+#[wasm_bindgen_test]
 fn wasm_binomial_batch_returns_array() {
     let lats = [0.0, 0.0, 1.0];
     let lons = [0.0, 1.0, 0.0];

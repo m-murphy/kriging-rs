@@ -20,7 +20,11 @@ use std::num::NonZeroUsize;
 use crate::Real;
 use crate::distance::GeoCoord;
 use crate::error::KrigingError;
-use crate::kriging::binomial::{BinomialPrediction, BinomialPrior};
+use crate::kriging::binomial::{
+    BINOMIAL_CALIBRATION_VERSION, BinomialBuildNotes, BinomialCalibratedResult, BinomialPrediction,
+    BinomialPrior, HeteroskedasticBinomialConfig, logit_observation_variance_empirical_bayes,
+};
+
 use crate::kriging::ordinary::{Prediction, kriging_diagonal_jitter};
 use crate::utils::{Probability, logistic, logit};
 use crate::variogram::empirical::{EmpiricalVariogram, PositiveReal};
@@ -308,9 +312,47 @@ impl ProjectedKrigingModel {
         variogram: VariogramModel,
         anisotropy: Anisotropy2D,
     ) -> Result<Self, KrigingError> {
+        Self::new_with_extra_diagonal_internal(dataset, variogram, anisotropy, &[])
+    }
+
+    /// Like [`new`](Self::new) but adds `extra` (length `n`) to each main-diagonal covariance
+    /// term, modeling observation-specific (non-spatial) noise in addition to jitter.
+    pub fn new_with_extra_diagonal(
+        dataset: ProjectedDataset,
+        variogram: VariogramModel,
+        anisotropy: Anisotropy2D,
+        extra: Vec<Real>,
+    ) -> Result<Self, KrigingError> {
+        if !extra.is_empty() && extra.len() != dataset.coords.len() {
+            return Err(KrigingError::InvalidInput(
+                "extra observation diagonal must be empty (homoscedastic) or the same length as the dataset"
+                    .to_string(),
+            ));
+        }
+        for &v in &extra {
+            if !v.is_finite() || v < 0.0 {
+                return Err(KrigingError::InvalidInput(
+                    "observation diagonal entries must be finite and non-negative".to_string(),
+                ));
+            }
+        }
+        Self::new_with_extra_diagonal_internal(dataset, variogram, anisotropy, &extra)
+    }
+
+    fn new_with_extra_diagonal_internal(
+        dataset: ProjectedDataset,
+        variogram: VariogramModel,
+        anisotropy: Anisotropy2D,
+        extra: &[Real],
+    ) -> Result<Self, KrigingError> {
         let coords = dataset.coords;
         let values = dataset.values;
         let n = coords.len();
+        if !extra.is_empty() && extra.len() != n {
+            return Err(KrigingError::InvalidInput(
+                "internal: extra length mismatch for projected kriging".to_string(),
+            ));
+        }
         let mut system = DMatrix::from_element(n + 1, n + 1, 0.0);
         let diag_eps = kriging_diagonal_jitter(n, variogram);
         for i in 0..n {
@@ -319,6 +361,9 @@ impl ProjectedKrigingModel {
                 let mut cov = variogram.covariance(d);
                 if i == j {
                     cov += diag_eps;
+                    if let Some(&dextra) = extra.get(i) {
+                        cov += dextra;
+                    }
                 }
                 system[(i, j)] = cov;
                 system[(j, i)] = cov;
@@ -492,11 +537,9 @@ fn binomial_prediction_from(pred: Prediction) -> BinomialPrediction {
 /// geometric anisotropy.
 ///
 /// This is the planar/anisotropic counterpart of
-/// [`crate::BinomialKrigingModel`]. Kriging happens on the **logit** scale,
-/// using empirical-Bayes-smoothed log-odds derived from `(successes, trials)`
-/// counts and a Beta prior. Predictions report both the logit value (with its
-/// kriging variance) and the back-transformed prevalence (with a delta-method
-/// variance approximation). See [`BinomialPrediction`].
+/// [`crate::BinomialKrigingModel`]. Kriging happens on the **logit** scale, with
+/// per-site logit observation variance (calibrated binomial path) when built from
+/// counts. See [`BinomialBuildNotes`].
 ///
 /// Use [`Anisotropy2D::isotropic`] to disable anisotropy.
 #[derive(Debug, Clone)]
@@ -504,16 +547,17 @@ pub struct BinomialProjectedKrigingModel {
     inner: ProjectedKrigingModel,
 }
 
+/// Planar / anisotropic binomial fit: model + [`BinomialBuildNotes`].
+pub type ProjectedBinomialFit = BinomialCalibratedResult<BinomialProjectedKrigingModel>;
+
 impl BinomialProjectedKrigingModel {
-    /// Build a binomial projected kriging model from `(coord, successes, trials)`
-    /// observations and a (possibly anisotropic) variogram. Uses
-    /// `BinomialPrior::default()` (Jeffreys' Beta(½, ½)) for empirical-Bayes
-    /// smoothing of the logit values.
+    /// Build a binomial projected kriging model from `(coord, successes, trials)` with the
+    /// default `Beta(1, 1)` prior.
     pub fn new(
         observations: Vec<ProjectedBinomialObservation>,
         variogram: VariogramModel,
         anisotropy: Anisotropy2D,
-    ) -> Result<Self, KrigingError> {
+    ) -> Result<ProjectedBinomialFit, KrigingError> {
         Self::new_with_prior(
             observations,
             variogram,
@@ -522,13 +566,13 @@ impl BinomialProjectedKrigingModel {
         )
     }
 
-    /// As [`new`](Self::new), with an explicit Beta prior.
+    /// As [`new`](Self::new), with an explicit Beta prior. Uses heteroskedastic (calibrated) conditioning.
     pub fn new_with_prior(
         observations: Vec<ProjectedBinomialObservation>,
         variogram: VariogramModel,
         anisotropy: Anisotropy2D,
         prior: BinomialPrior,
-    ) -> Result<Self, KrigingError> {
+    ) -> Result<ProjectedBinomialFit, KrigingError> {
         if observations.len() < 2 {
             return Err(KrigingError::InsufficientData(2));
         }
@@ -537,20 +581,58 @@ impl BinomialProjectedKrigingModel {
             .iter()
             .map(|o| o.smoothed_logit_with_prior(prior))
             .collect();
-        Self::from_precomputed_logits(coords, logits, variogram, anisotropy)
+        let base: Vec<Real> = observations
+            .iter()
+            .map(|o| logit_observation_variance_empirical_bayes(prior, o.successes(), o.trials()))
+            .map(|v| v.max(HeteroskedasticBinomialConfig::default().min_logit_observation_variance))
+            .collect();
+        let n_tries = HeteroskedasticBinomialConfig::default()
+            .max_build_attempts
+            .max(1);
+        let config = HeteroskedasticBinomialConfig::default();
+        let mut last_err: Option<KrigingError> = None;
+        let mut inflation = 1.0 as Real;
+        for attempt in 0..n_tries {
+            let extra: Vec<Real> = base
+                .iter()
+                .map(|&v| (v * inflation).max(config.min_logit_observation_variance))
+                .collect();
+            let dataset = ProjectedDataset::new(coords.clone(), logits.clone())?;
+            match ProjectedKrigingModel::new_with_extra_diagonal(
+                dataset, variogram, anisotropy, extra,
+            ) {
+                Ok(inner) => {
+                    return Ok(BinomialCalibratedResult {
+                        model: Self { inner },
+                        notes: BinomialBuildNotes {
+                            calibration_version: BINOMIAL_CALIBRATION_VERSION,
+                            logit_inflation: inflation,
+                            n_build_attempts: attempt + 1,
+                            prior,
+                            zero_trial_dropped_indices: Vec::new(),
+                            from_precomputed_logits_only: false,
+                        },
+                    });
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+            inflation *= 2.0 as Real;
+        }
+        Err(last_err.unwrap_or_else(|| {
+            KrigingError::MatrixError("binomial projected kriging build failed".to_string())
+        }))
     }
 
-    /// Build a binomial projected model from pre-computed logit values.
-    ///
-    /// Useful when the caller wants to apply a custom logit transform (e.g. a
-    /// different prior, manual Laplace correction, or pre-fit smoothing).
-    /// `logits` must be finite and have the same length as `coords`.
+    /// Pre-computed logits with no per-trial data (no observation variance on the diagonal
+    /// except variogram and jitter). See [`crate::BinomialKrigingModel::from_precomputed_logits`].
     pub fn from_precomputed_logits(
         coords: Vec<ProjectedCoord>,
         logits: Vec<Real>,
         variogram: VariogramModel,
         anisotropy: Anisotropy2D,
-    ) -> Result<Self, KrigingError> {
+    ) -> Result<ProjectedBinomialFit, KrigingError> {
         if logits.iter().any(|v| !v.is_finite()) {
             return Err(KrigingError::InvalidInput(
                 "logits must all be finite (no NaN/inf)".to_string(),
@@ -558,7 +640,87 @@ impl BinomialProjectedKrigingModel {
         }
         let dataset = ProjectedDataset::new(coords, logits)?;
         let inner = ProjectedKrigingModel::new(dataset, variogram, anisotropy)?;
-        Ok(Self { inner })
+        Ok(BinomialCalibratedResult {
+            model: Self { inner },
+            notes: BinomialBuildNotes {
+                calibration_version: BINOMIAL_CALIBRATION_VERSION,
+                logit_inflation: 1.0,
+                n_build_attempts: 1,
+                prior: BinomialPrior::default(),
+                zero_trial_dropped_indices: Vec::new(),
+                from_precomputed_logits_only: true,
+            },
+        })
+    }
+
+    /// Pre-computed logit field with per-site logit observation variances and stability policy.
+    pub fn from_precomputed_logits_with_logit_observation_variances(
+        coords: Vec<ProjectedCoord>,
+        logits: Vec<Real>,
+        variogram: VariogramModel,
+        anisotropy: Anisotropy2D,
+        base_logit_observation_variance: Vec<Real>,
+        config: HeteroskedasticBinomialConfig,
+        prior_for_notes: BinomialPrior,
+    ) -> Result<ProjectedBinomialFit, KrigingError> {
+        if logits.len() != coords.len() {
+            return Err(KrigingError::DimensionMismatch(
+                "coords and logits must have equal length".to_string(),
+            ));
+        }
+        if base_logit_observation_variance.len() != coords.len() {
+            return Err(KrigingError::InvalidInput(
+                "logit observation variance must match coords length".to_string(),
+            ));
+        }
+        if logits.iter().any(|v| !v.is_finite()) {
+            return Err(KrigingError::InvalidInput(
+                "logits must all be finite (no NaN/inf)".to_string(),
+            ));
+        }
+        for &v in &base_logit_observation_variance {
+            if !v.is_finite() || v < 0.0 {
+                return Err(KrigingError::InvalidInput(
+                    "logit observation variances must be finite and non-negative".to_string(),
+                ));
+            }
+        }
+        let n_tries = config.max_build_attempts.max(1);
+        let mut last_err: Option<KrigingError> = None;
+        let mut inflation = 1.0 as Real;
+        for attempt in 0..n_tries {
+            let extra: Vec<Real> = base_logit_observation_variance
+                .iter()
+                .map(|&v| (v * inflation).max(config.min_logit_observation_variance))
+                .collect();
+            let dataset = ProjectedDataset::new(coords.clone(), logits.clone())?;
+            match ProjectedKrigingModel::new_with_extra_diagonal(
+                dataset, variogram, anisotropy, extra,
+            ) {
+                Ok(inner) => {
+                    return Ok(BinomialCalibratedResult {
+                        model: Self { inner },
+                        notes: BinomialBuildNotes {
+                            calibration_version: BINOMIAL_CALIBRATION_VERSION,
+                            logit_inflation: inflation,
+                            n_build_attempts: attempt + 1,
+                            prior: prior_for_notes,
+                            zero_trial_dropped_indices: Vec::new(),
+                            from_precomputed_logits_only: false,
+                        },
+                    });
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+            inflation *= 2.0 as Real;
+        }
+        Err(last_err.unwrap_or_else(|| {
+            KrigingError::MatrixError(
+                "from_precomputed (projected) with observation variances: build failed".to_string(),
+            )
+        }))
     }
 
     pub fn anisotropy(&self) -> Anisotropy2D {
@@ -728,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn binomial_projected_recovers_smoothed_logit_at_collocated_point() {
+    fn binomial_projected_smoothed_logit_near_collocated_with_calibrated_diagonal() {
         let obs = vec![
             ProjectedBinomialObservation::new(ProjectedCoord::new(0.0, 0.0), 3, 10).unwrap(),
             ProjectedBinomialObservation::new(ProjectedCoord::new(10.0, 0.0), 7, 10).unwrap(),
@@ -742,10 +904,15 @@ mod tests {
             Anisotropy2D::isotropic(),
             prior,
         )
-        .unwrap();
+        .unwrap()
+        .model;
         let pred = model.predict(obs[0].coord()).unwrap();
         let expected_logit = obs[0].smoothed_logit_with_prior(prior);
-        assert!((pred.logit_value - expected_logit).abs() < 1e-3);
+        // Per-site logit observation noise: collocated prediction need not match local EB logit.
+        assert!(
+            (pred.logit_value - expected_logit).abs() < 0.35,
+            "logit err"
+        );
         assert!(pred.prevalence > 0.0 && pred.prevalence < 1.0);
         assert!(pred.variance >= 0.0);
         assert!(pred.prevalence_variance >= 0.0);
@@ -763,13 +930,15 @@ mod tests {
         let variogram = VariogramModel::new(0.01, 1.0, 20.0, VariogramType::Exponential).unwrap();
         let iso =
             BinomialProjectedKrigingModel::new(obs.clone(), variogram, Anisotropy2D::isotropic())
-                .unwrap();
+                .unwrap()
+                .model;
         let aniso = BinomialProjectedKrigingModel::new(
             obs.clone(),
             variogram,
             Anisotropy2D::new(0.0, 0.2).unwrap(),
         )
-        .unwrap();
+        .unwrap()
+        .model;
         let target = ProjectedCoord::new(0.0, 0.0);
         let iso_pred = iso.predict(target).unwrap();
         let aniso_pred = aniso.predict(target).unwrap();

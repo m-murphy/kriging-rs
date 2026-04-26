@@ -10,7 +10,7 @@ export interface WasmOrdinaryInstance {
   predict(lat: number, lon: number): unknown;
   predictBatch(lats: Float64Array, lons: Float64Array): unknown;
   predictBatchArrays(lats: Float64Array, lons: Float64Array): unknown;
-  predictGridArrays?(
+  predictGridArrays(
     xMin: number,
     xMax: number,
     yMin: number,
@@ -18,11 +18,11 @@ export interface WasmOrdinaryInstance {
     xCells: number,
     yCells: number
   ): unknown;
-  setNeighborhood?(
+  setNeighborhood(
     maxNeighbors: number | undefined,
     maxRadius: number | undefined
   ): void;
-  neighborhood?(): unknown;
+  neighborhood(): unknown;
   free?: () => void;
   predictBatchGpu?(lats: Float64Array, lons: Float64Array): Promise<unknown>;
   predictBatchGpuOrCpu?(
@@ -61,6 +61,7 @@ export interface WasmBinomialProjectedInstance {
   predict(x: number, y: number): unknown;
   predictBatch(xs: Float64Array, ys: Float64Array): unknown;
   predictBatchArrays(xs: Float64Array, ys: Float64Array): unknown;
+  getBuildNotes(): unknown;
   free?: () => void;
 }
 
@@ -69,7 +70,8 @@ export interface WasmBinomialInstance {
   predict(lat: number, lon: number): unknown;
   predictBatch(lats: Float64Array, lons: Float64Array): unknown;
   predictBatchArrays(lats: Float64Array, lons: Float64Array): unknown;
-  predictGridArrays?(
+  getBuildNotes(): unknown;
+  predictGridArrays(
     xMin: number,
     xMax: number,
     yMin: number,
@@ -122,7 +124,7 @@ export type RawModule = {
   default: (input?: unknown) => Promise<unknown>;
   WasmOrdinaryKriging: {
     new (options: OrdinaryKrigingOptionsWasm): WasmOrdinaryInstance;
-    fromArrays?(
+    fromArrays(
       lats: Float64Array,
       lons: Float64Array,
       values: Float64Array,
@@ -138,7 +140,7 @@ export type RawModule = {
     newWithPrior(
       options: BinomialKrigingWithPriorOptionsWasm
     ): WasmBinomialInstance;
-    fromArrays?(
+    fromArrays(
       lats: Float64Array,
       lons: Float64Array,
       successes: Uint32Array,
@@ -149,7 +151,7 @@ export type RawModule = {
       range: number,
       shape?: number
     ): WasmBinomialInstance;
-    fromPrecomputedLogits?(
+    fromPrecomputedLogits(
       lats: Float64Array,
       lons: Float64Array,
       logits: Float64Array,
@@ -1092,5 +1094,6 @@ export interface WasmSpaceTimeBinomialInstance {
     lons: Float64Array,
     times: Float64Array
   ): unknown;
+  getBuildNotes(): unknown;
   free?: () => void;
 }

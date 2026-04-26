@@ -2,8 +2,12 @@
 //! and optional WASM and GPU support.
 //!
 //! This crate provides spatial interpolation via ordinary kriging and prevalence-surface
-//! estimation via binomial kriging. It includes empirical variogram computation, parametric
-//! model fitting, and Haversine-based geographic coordinates. Build with `wasm` for browser
+//! estimation via binomial kriging. **Default binomial kriging** is empirical-Bayes
+//! (Beta-prior) logit on the link, **calibrated** ordinary kriging with per-site logit
+//! observation variance on the covariance diagonal, and logistic back to prevalence; see
+//! [`BinomialKrigingModel`] and [`BinomialBuildNotes`] (not a full binomial-likelihood
+//! spatial model). The crate also includes empirical variogram computation, parametric model
+//! fitting, and Haversine-based geographic coordinates. Build with `wasm` for browser
 //! bindings or `gpu` for GPU-accelerated batch prediction.
 //!
 //! # Scope
@@ -122,14 +126,17 @@ pub use geo_dataset::GeoDataset;
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuBackend, GpuSupport, build_rhs_covariances_gpu, detect_gpu_support, gpu_square};
 pub use kriging::binomial::{
+    BINOMIAL_CALIBRATION_VERSION, BinomialBuildNotes, BinomialCalibratedResult, BinomialFit,
     BinomialKrigingModel, BinomialObservation, BinomialPrediction, BinomialPrior,
+    HeteroskedasticBinomialConfig, build_binomial_observations_dropping_zero_trials,
+    indices_of_zero_trials, logit_observation_variance_empirical_bayes,
 };
 pub use kriging::ordinary::{Neighborhood, OrdinaryKrigingModel, Prediction};
 pub use kriging::simple::SimpleKrigingModel;
 pub use kriging::universal::{UniversalKrigingModel, UniversalTrend};
 pub use projected::{
-    Anisotropy2D, BinomialProjectedKrigingModel, DirectionalConfig, ProjectedBinomialObservation,
-    ProjectedCoord, ProjectedDataset, ProjectedKrigingModel,
+    Anisotropy2D, BinomialProjectedKrigingModel, DirectionalConfig, ProjectedBinomialFit,
+    ProjectedBinomialObservation, ProjectedCoord, ProjectedDataset, ProjectedKrigingModel,
     compute_directional_empirical_variogram, euclidean_distance, euclidean_distance_squared,
 };
 pub use variogram::fitting::{FitResult, fit_variogram};
@@ -137,4 +144,5 @@ pub use variogram::models::{VariogramModel, VariogramType};
 pub use variogram::nested::NestedVariogram;
 pub use variogram::{
     EmpiricalEstimator, PositiveReal, VariogramConfig, compute_empirical_variogram,
+    compute_empirical_variogram_binomial_calibrated,
 };

@@ -209,7 +209,7 @@ export interface InterpolateOrdinaryToGridOptions {
  * The variogram is fit on `logit((s + α) / (n + α + β))` per station, matching
  * the values the binomial kriger interpolates internally — so the fitted
  * `nugget`, `sill`, and `range` are calibrated for the same field. The default
- * prior is `Beta(½, ½)`; override with `prior` to match a custom shrinkage
+ * prior is `Beta(1, 1)`; override with `prior` to match a custom shrinkage
  * choice.
  *
  * Pass `withCv: true` (or `withCv: { k: <folds> }`) to additionally run
@@ -242,7 +242,7 @@ export interface InterpolateBinomialToGridOptions {
   maxDistance?: number;
   /** Optional nugget override when building model from fitted variogram. */
   nuggetOverride?: number;
-  /** Optional Beta(alpha, beta) prior for binomial model (default Beta(½, ½)). */
+  /** Optional Beta(alpha, beta) prior for binomial model (default Beta(1, 1)). */
   prior?: BinomialPriorParams;
   /**
    * Empirical estimator passed to {@link fitVariogram}. `"cressie-hawkins"` is
@@ -261,12 +261,14 @@ export interface InterpolateBinomialToGridOptions {
 
 /**
  * Result of {@link interpolateBinomialToGrid}. Extends {@link BinomialGridOutput}
- * with the fitted variogram used internally and (when `withCv` is set) the
- * binomial CV summary.
+ * with the fitted variogram used internally, {@link BinomialBuildNotes} from the
+ * kriging build, and (when `withCv` is set) the binomial CV summary.
  */
 export interface InterpolateBinomialToGridResult extends BinomialGridOutput {
   /** Variogram parameters fit from the EB-smoothed logits. */
   fittedVariogram: FittedVariogram;
+  /** Diagnostics from the binomial model build (prior, dropped rows, inflation, …). */
+  buildNotes: BinomialBuildNotes;
   /** Binomial CV summary; present iff the caller supplied `withCv`. */
   cv?: BinomialCvSummary;
 }
@@ -295,7 +297,7 @@ export interface GeoGridBounds {
  * Options for {@link simulateBinomialGrid}: draw a single binomial SGS realization
  * over a regular lat/lon grid and shape it as nested 2-D arrays `[yCells][xCells]`.
  *
- * `prior` defaults to `Beta(½, ½)`. The `seed` controls reproducibility.
+ * `prior` defaults to `Beta(1, 1)`. The `seed` controls reproducibility.
  */
 export interface SimulateBinomialGridOptions extends GeoGridBounds {
   /** Conditioning station latitudes (degrees). */
@@ -673,6 +675,28 @@ export interface BinomialPriorParams {
 }
 
 /**
+ * Build-time diagnostics for a calibrated binomial kriging model (geographic,
+ * projected, or space–time). Returned by {@link BinomialKriging.getBuildNotes}
+ * and included on {@link InterpolateBinomialToGridResult}.
+ *
+ * Field names match the WASM JSON (`camelCase`).
+ */
+export interface BinomialBuildNotes {
+  /** Calibration pipeline version; bumps when statistical meaning changes. */
+  calibrationVersion: number;
+  /** Multiplier applied to base logit observation variances (1 = first attempt). */
+  logitInflation: number;
+  /** Number of factorization attempts (1-based). */
+  nBuildAttempts: number;
+  /** Beta prior used for EB-smoothed logits and observation variances. */
+  prior: BinomialPriorParams;
+  /** Original input row indices with `trials === 0` (dropped before fit). */
+  zeroTrialDroppedIndices: number[];
+  /** True when the model was built from caller logits only (no per-trial variances). */
+  fromPrecomputedLogitsOnly: boolean;
+}
+
+/**
  * Options for constructing a binomial kriging model with a prior. Pass a single
  * object to {@link BinomialKriging.newWithPrior}.
  */
@@ -955,7 +979,7 @@ export interface LeaveOneOutBinomialOptions {
   successes: ArrayLike<number> | Uint32Array;
   trials: ArrayLike<number> | Uint32Array;
   variogram: VariogramParams;
-  /** Optional Beta(alpha, beta) prior; defaults to Beta(½, ½) when omitted. */
+  /** Optional Beta(alpha, beta) prior; defaults to Beta(1, 1) when omitted. */
   prior?: BinomialPriorParams;
 }
 
@@ -981,7 +1005,7 @@ export interface LeaveOneOutBinomialProjectedOptions {
   majorAngleDeg: number;
   /** Ratio of minor range to major range, in (0, 1]. `1` = isotropic. */
   rangeRatio: number;
-  /** Optional Beta(alpha, beta) prior; defaults to Beta(½, ½) when omitted. */
+  /** Optional Beta(alpha, beta) prior; defaults to Beta(1, 1) when omitted. */
   prior?: BinomialPriorParams;
 }
 
@@ -1154,7 +1178,7 @@ export interface ConditionalSimulateBinomialOptions {
   targetLats: NumericArrayInput;
   targetLons: NumericArrayInput;
   variogram: VariogramParams;
-  /** Optional Beta(alpha, beta) prior; defaults to Beta(½, ½) when omitted. */
+  /** Optional Beta(alpha, beta) prior; defaults to Beta(1, 1) when omitted. */
   prior?: BinomialPriorParams;
   /** RNG seed for reproducibility (defaults to `0n`). */
   seed?: number | bigint;
@@ -1207,7 +1231,7 @@ export interface ConditionalSimulateBinomialProjectedOptions {
   majorAngleDeg: number;
   /** Ratio of minor range to major range, in (0, 1]. `1` = isotropic. */
   rangeRatio: number;
-  /** Optional Beta(alpha, beta) prior; defaults to Beta(½, ½) when omitted. */
+  /** Optional Beta(alpha, beta) prior; defaults to Beta(1, 1) when omitted. */
   prior?: BinomialPriorParams;
   /** RNG seed for reproducibility (defaults to `0n`). */
   seed?: number | bigint;
@@ -1625,7 +1649,7 @@ export interface LeaveOneOutSpaceTimeBinomialOptions {
   successes: IntegerArrayInput;
   trials: IntegerArrayInput;
   variogram: SpaceTimeVariogramParams;
-  /** Optional Beta(alpha, beta) prior; defaults to Beta(½, ½) when omitted. */
+  /** Optional Beta(alpha, beta) prior; defaults to Beta(1, 1) when omitted. */
   prior?: BinomialPriorParams;
 }
 
@@ -1692,7 +1716,7 @@ export interface ConditionalSimulateSpaceTimeBinomialOptions {
   targetLons: NumericArrayInput;
   targetTimes: NumericArrayInput;
   variogram: SpaceTimeVariogramParams;
-  /** Optional Beta(alpha, beta) prior; defaults to Beta(½, ½) when omitted. */
+  /** Optional Beta(alpha, beta) prior; defaults to Beta(1, 1) when omitted. */
   prior?: BinomialPriorParams;
   /** RNG seed for reproducibility (defaults to `0n`). */
   seed?: number | bigint;

@@ -11,7 +11,7 @@ pub mod nested;
 
 pub use empirical::{
     EmpiricalEstimator, EmpiricalVariogram, PositiveReal, VariogramConfig,
-    compute_empirical_variogram,
+    compute_empirical_variogram, compute_empirical_variogram_binomial_calibrated,
 };
 pub use fitting::{FitResult, fit_variogram};
 pub use models::{VariogramModel, VariogramType};

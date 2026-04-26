@@ -114,6 +114,7 @@ export { datesFromTimes, timesFromDates } from "./time.js";
 export type {
   AggregatePrevalenceByPolygonOptions,
   BinomialBatchArrayOutput,
+  BinomialBuildNotes,
   BinomialCvResidual,
   BinomialCvResult,
   BinomialCvSummary,

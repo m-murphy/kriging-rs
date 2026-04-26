@@ -64,14 +64,52 @@ impl<M: SpatialMetric> SpaceTimeOrdinaryKrigingModel<M> {
         dataset: SpaceTimeDataset<M::Coord>,
         variogram: SpaceTimeVariogram,
     ) -> Result<Self, KrigingError> {
+        Self::new_with_extra_diagonal_internal(metric, dataset, variogram, &[])
+    }
+
+    /// Per-station observation noise on the covariance main diagonal.
+    pub fn new_with_extra_diagonal(
+        metric: M,
+        dataset: SpaceTimeDataset<M::Coord>,
+        variogram: SpaceTimeVariogram,
+        extra: Vec<Real>,
+    ) -> Result<Self, KrigingError> {
+        let n = dataset.len();
+        if !extra.is_empty() && extra.len() != n {
+            return Err(KrigingError::InvalidInput(
+                "extra observation diagonal must be empty (homoscedastic) or the same length as the dataset"
+                    .to_string(),
+            ));
+        }
+        for &v in &extra {
+            if !v.is_finite() || v < 0.0 {
+                return Err(KrigingError::InvalidInput(
+                    "observation diagonal entries must be finite and non-negative".to_string(),
+                ));
+            }
+        }
+        Self::new_with_extra_diagonal_internal(metric, dataset, variogram, &extra)
+    }
+
+    fn new_with_extra_diagonal_internal(
+        metric: M,
+        dataset: SpaceTimeDataset<M::Coord>,
+        variogram: SpaceTimeVariogram,
+        extra: &[Real],
+    ) -> Result<Self, KrigingError> {
         let (coords, values) = dataset.into_parts();
+        let n = coords.len();
+        if !extra.is_empty() && extra.len() != n {
+            return Err(KrigingError::InvalidInput(
+                "internal: extra length mismatch for space-time ordinary kriging".to_string(),
+            ));
+        }
         let prepared_spatial: Vec<M::Prepared> =
             coords.iter().map(|c| metric.prepare(c.spatial)).collect();
         let times: Vec<Real> = coords.iter().map(|c| c.time).collect();
 
-        let system = build_ordinary_system(&metric, &prepared_spatial, &times, variogram);
+        let system = build_ordinary_system(&metric, &prepared_spatial, &times, variogram, extra);
         let system_lu = Arc::new(system.lu());
-        let n = coords.len();
         let mut probe = DVector::from_element(n + 1, 0.0);
         probe[n] = 1.0;
         if system_lu.solve(&probe).is_none() {
@@ -203,8 +241,12 @@ fn build_ordinary_system<M: SpatialMetric>(
     prepared_spatial: &[M::Prepared],
     times: &[Real],
     variogram: SpaceTimeVariogram,
+    extra: &[Real],
 ) -> DMatrix<Real> {
     let n = prepared_spatial.len();
+    if !extra.is_empty() {
+        debug_assert_eq!(extra.len(), n);
+    }
     let diag_eps = spacetime_diagonal_jitter(n, variogram);
     let mut m = DMatrix::from_element(n + 1, n + 1, 0.0);
     for i in 0..n {
@@ -214,6 +256,9 @@ fn build_ordinary_system<M: SpatialMetric>(
             let mut cov = variogram.covariance(hs, ht);
             if i == j {
                 cov += diag_eps;
+                if let Some(&d) = extra.get(i) {
+                    cov += d;
+                }
             }
             m[(i, j)] = cov;
             m[(j, i)] = cov;

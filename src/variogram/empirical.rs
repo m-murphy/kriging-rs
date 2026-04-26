@@ -198,6 +198,144 @@ pub fn compute_empirical_variogram(
     })
 }
 
+/// For binomial (logit) inputs: classical empirical variogram on **adjusted** per-pair
+/// contributions `max(0, ½(Δz)² − ½(σ_i²+σ_j²))` (σ² = per-site logit observation variances
+/// as in the binomial model), weighted by
+/// `1 / (0.5·(σ_i²+σ_j²) + ε)`.
+///
+/// This targets the **latent** logit field rather than inflating the empirical γ with
+/// independent sampling noise on the observations. Requires
+/// `per_site_logit_variance.len() == dataset.len()`. **Cressie–Hawkins** is not supported
+/// (returns [`KrigingError::FittingError`]); use [`EmpiricalEstimator::Classical`].
+pub fn compute_empirical_variogram_binomial_calibrated(
+    dataset: &GeoDataset,
+    per_site_logit_variance: &[Real],
+    config: &VariogramConfig,
+    rel_weight_eps: Real,
+) -> Result<EmpiricalVariogram, KrigingError> {
+    if !matches!(config.estimator, EmpiricalEstimator::Classical) {
+        return Err(KrigingError::FittingError(
+            "binomial_calibrated variogram: use Estimator::Classical only; Cressie-Hawkins is not implemented for this path".to_string(),
+        ));
+    }
+    let n = dataset.len();
+    if per_site_logit_variance.len() != n {
+        return Err(KrigingError::FittingError(
+            "per_site_logitVariance must have same length as dataset values".to_string(),
+        ));
+    }
+    for &v in per_site_logit_variance {
+        if !v.is_finite() || v < 0.0 {
+            return Err(KrigingError::FittingError(
+                "per-site logit variance must be finite and non-negative".to_string(),
+            ));
+        }
+    }
+    let coords = dataset.coords();
+    let values = dataset.values();
+    let n_bins = config.n_bins.get();
+    let mut dist_weighted: Vec<Real> = vec![0.0; n_bins];
+    let mut gamma_weighted: Vec<Real> = vec![0.0; n_bins];
+    let mut weight_sums: Vec<Real> = vec![0.0; n_bins];
+    let mut counts: Vec<usize> = vec![0usize; n_bins];
+
+    let (distances, semivariances, n_pairs) = {
+        if let Some(max_dist) = config.max_distance {
+            let max_d = max_dist.get();
+            let bin_width = max_d / n_bins as Real;
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let d = haversine_distance(coords[i], coords[j]);
+                    if d > max_d {
+                        continue;
+                    }
+                    let mut bin = (d / bin_width).floor() as usize;
+                    if bin >= n_bins {
+                        bin = n_bins - 1;
+                    }
+                    let vi = per_site_logit_variance[i];
+                    let vj = per_site_logit_variance[j];
+                    let w = 1.0 / (0.5 * (vi + vj) + rel_weight_eps);
+                    if !w.is_finite() {
+                        continue;
+                    }
+                    let half_sq = 0.5 * (values[i] - values[j]) * (values[i] - values[j]);
+                    let half_noise = 0.5 * (vi + vj);
+                    let g = (half_sq - half_noise).max(0.0);
+                    dist_weighted[bin] += w * d;
+                    gamma_weighted[bin] += w * g;
+                    weight_sums[bin] += w;
+                    counts[bin] += 1;
+                }
+            }
+        } else {
+            let mut max_observed: Real = 0.0;
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let d = haversine_distance(coords[i], coords[j]);
+                    if d > max_observed {
+                        max_observed = d;
+                    }
+                }
+            }
+            if max_observed <= 0.0 {
+                return Err(KrigingError::FittingError(
+                    "max distance must be positive".to_string(),
+                ));
+            }
+            let bin_width = max_observed / n_bins as Real;
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let d = haversine_distance(coords[i], coords[j]);
+                    let mut bin = (d / bin_width).floor() as usize;
+                    if bin >= n_bins {
+                        bin = n_bins - 1;
+                    }
+                    let vi = per_site_logit_variance[i];
+                    let vj = per_site_logit_variance[j];
+                    let w = 1.0 / (0.5 * (vi + vj) + rel_weight_eps);
+                    if !w.is_finite() {
+                        continue;
+                    }
+                    let half_sq = 0.5 * (values[i] - values[j]) * (values[i] - values[j]);
+                    let half_noise = 0.5 * (vi + vj);
+                    let g = (half_sq - half_noise).max(0.0);
+                    dist_weighted[bin] += w * d;
+                    gamma_weighted[bin] += w * g;
+                    weight_sums[bin] += w;
+                    counts[bin] += 1;
+                }
+            }
+        }
+
+        let mut distances = Vec::new();
+        let mut semivariances = Vec::new();
+        let mut n_pairs = Vec::new();
+        for i in 0..n_bins {
+            if counts[i] == 0 || weight_sums[i] <= 0.0 {
+                continue;
+            }
+            let wsum = weight_sums[i];
+            distances.push(dist_weighted[i] / wsum);
+            semivariances.push(gamma_weighted[i] / wsum);
+            n_pairs.push(counts[i]);
+        }
+        (distances, semivariances, n_pairs)
+    };
+
+    if distances.is_empty() {
+        return Err(KrigingError::FittingError(
+            "no pairs in selected distance range (binomial calibrated variogram)".to_string(),
+        ));
+    }
+
+    Ok(EmpiricalVariogram {
+        distances,
+        semivariances,
+        n_pairs,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,7 +3,9 @@
 //! - **Ordinary kriging** ([`ordinary`]): [`crate::OrdinaryKrigingModel`] and [`crate::Prediction`] for
 //!   interpolating a continuous spatial field from point observations.
 //! - **Binomial kriging** ([`binomial`]): [`crate::BinomialKrigingModel`], [`crate::BinomialObservation`],
-//!   and related types for estimating prevalence surfaces from count data (successes/trials per location).
+//!   and related types for prevalence surfaces. The default path is empirical-Bayes
+//!   logit + ordinary kriging. [`crate::HeteroBinomialFit`] documents an experimental
+//!   heteroskedastic variant.
 
 pub mod binomial;
 pub mod ordinary;

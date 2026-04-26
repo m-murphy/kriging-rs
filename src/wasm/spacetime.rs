@@ -11,6 +11,7 @@
 use js_sys::{Float64Array, Object};
 use wasm_bindgen::prelude::*;
 
+use crate::BinomialBuildNotes;
 use crate::Real;
 use crate::distance::GeoCoord;
 use crate::projected::{Anisotropy2D, ProjectedCoord};
@@ -519,6 +520,7 @@ impl WasmSpaceTimeUniversalKriging {
 #[wasm_bindgen]
 pub struct WasmSpaceTimeBinomialKriging {
     inner: SpaceTimeBinomialKrigingModel<GeoMetric>,
+    build_notes: BinomialBuildNotes,
 }
 
 #[wasm_bindgen]
@@ -555,8 +557,13 @@ impl WasmSpaceTimeBinomialKriging {
                 "mismatched_arrays",
             ));
         }
-        let mut observations = Vec::with_capacity(lats.len());
+        let mut observations = Vec::new();
+        let mut zero_trial_drops: Vec<usize> = Vec::new();
         for i in 0..lats.len() {
+            if trials[i] == 0 {
+                zero_trial_drops.push(i);
+                continue;
+            }
             let coord =
                 GeoCoord::try_new(lats[i] as Real, lons[i] as Real).map_err(kriging_err_to_js)?;
             let st = SpaceTimeCoord::try_new(coord, times[i] as Real).map_err(kriging_err_to_js)?;
@@ -564,6 +571,12 @@ impl WasmSpaceTimeBinomialKriging {
                 SpaceTimeBinomialObservation::new(st, successes[i], trials[i])
                     .map_err(kriging_err_to_js)?,
             );
+        }
+        if observations.len() < 2 {
+            return Err(coded_err(
+                "need at least two non-zero-trial space-time sites after dropping trials==0",
+                "insufficient_data",
+            ));
         }
         let variogram = parse_spacetime_variogram(
             family,
@@ -581,9 +594,20 @@ impl WasmSpaceTimeBinomialKriging {
             k2,
             k3,
         )?;
-        let inner = SpaceTimeBinomialKrigingModel::new(GeoMetric, observations, variogram)
+        let fit = SpaceTimeBinomialKrigingModel::new(GeoMetric, observations, variogram)
             .map_err(kriging_err_to_js)?;
-        Ok(Self { inner })
+        let mut build_notes = fit.notes;
+        build_notes.zero_trial_dropped_indices = zero_trial_drops;
+        build_notes.zero_trial_dropped_indices.sort_unstable();
+        Ok(Self {
+            inner: fit.model,
+            build_notes,
+        })
+    }
+
+    #[wasm_bindgen(js_name = getBuildNotes)]
+    pub fn get_build_notes(&self) -> Result<JsValue, JsValue> {
+        serde_wasm_bindgen::to_value(&self.build_notes).map_err(err_to_js)
     }
 
     pub fn predict(&self, lat: f64, lon: f64, time: f64) -> Result<JsValue, JsValue> {

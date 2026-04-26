@@ -223,6 +223,14 @@ const model = BinomialKriging.newWithPrior({
 });
 ```
 
+**Model contract (Rust / wasm consumers):** The default `BinomialKriging` path is
+empirical-Bayes–smoothed logit + **ordinary kriging with per-site logit observation
+variance** (calibrated default) + `logistic`, not a full binomial-likelihood field
+model. `getBuildNotes()` returns `BinomialBuildNotes` (version, prior, logit
+inflation, etc.); rows with `trials === 0` are dropped. See
+`benches/BROWSER_BENCHMARKS.md` in the repository for large-grid prediction
+benchmarks.
+
 ### Batch prediction and typed arrays
 
 For large prediction grids, use `predictBatchArrays` to get `Float64Array` outputs and avoid per-point object allocation:
@@ -407,7 +415,7 @@ Binomial CV is special: a held-out station has a logit-scale observation (natura
 ```ts
 const binomial = leaveOneOutBinomial({
   lats, lons, successes, trials, variogram,
-  // priorAlpha, priorBeta — optional; must appear together, defaults to Beta(½, ½).
+  // priorAlpha, priorBeta — optional; must appear together, defaults to Beta(1, 1).
 });
 
 // Each residual carries both scales:
@@ -491,7 +499,7 @@ const bin = conditionalSimulateBinomial({
   successes, trials,
   targetLats: gridLats, targetLons: gridLons,
   variogram, seed: 7,
-  // priorAlpha: 1, priorBeta: 1   // optional; default Beta(½, ½)
+  // priorAlpha: 0.5, priorBeta: 0.5   // optional Jeffreys; default Beta(1, 1)
 });
 bin.logitSamples;      // Float64Array — simulated logit values (unbounded)
 bin.prevalenceSamples; // Float64Array — logistic(logitSamples), in (0, 1)
@@ -768,6 +776,7 @@ const result = interpolateBinomialToGrid({
 });
 result.prevalences;       // [yCells][xCells]
 result.fittedVariogram;   // re-usable for simulation
+result.buildNotes;        // prior, dropped zero-trial rows, calibration version, …
 result.cv?.prevalence.rmse; // calibration on the prevalence scale
 ```
 
@@ -984,8 +993,9 @@ const summary = simulateBinomialSpaceTimeGridSummaryAtDate({
   `ensembleQuantiles` / `ensembleExceedanceProbability`.
 - **`BinomialCvSummary.logit.msdr ≈ 1`** is the cleanest signal that the
   variogram is well calibrated; values far from 1 suggest tuning the nugget.
-- **Use a Beta(1, 1) prior** for routine work; switch to `Beta(½, ½)` (the
-  default if you omit `prior`) for the Jeffreys-prior smoothing.
+- **Default binomial prior is Beta(1, 1)** (uniform on prevalence, matching the
+  Rust crate). Pass explicit `prior` / `priorAlpha`+`priorBeta` when you want
+  Jeffreys `Beta(½, ½)` or another shrinkage choice.
 
 ## Error handling
 

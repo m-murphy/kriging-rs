@@ -4,7 +4,7 @@
  * @module
  */
 
-import { KrigingError, wrapThrown } from "../errors.js";
+import { wrapThrown } from "../errors.js";
 import { toFloat64Array } from "../internal/convert.js";
 import {
   mapEmpiricalSpaceTimeVariogram,
@@ -31,20 +31,13 @@ function defaultEstimator(
  * `maxTemporalLag` are omitted, half the maximum observed pair lag is used for each
  * axis.
  *
- * @throws {@link KrigingError} for invalid inputs (mismatched arrays, zero bins,
- *   non-positive max-distance/lag, etc.).
+ * @throws {Error} When WASM rejects the inputs (mismatched arrays, zero bins, etc.).
  */
 export function computeEmpiricalSpaceTimeVariogram(
   options: ComputeEmpiricalSpaceTimeVariogramOptions
 ): EmpiricalSpaceTimeVariogramResult {
   const mod = requireLoadedModule();
   const fn = mod.wasmComputeEmpiricalSpaceTimeVariogram;
-  if (typeof fn !== "function") {
-    throw new KrigingError(
-      "wasmComputeEmpiricalSpaceTimeVariogram is not available; rebuild the WASM package",
-      { code: "backend_unavailable" }
-    );
-  }
   try {
     const out = fn(
       toFloat64Array(options.lats),
@@ -75,12 +68,6 @@ export function fitSpaceTimeVariogram(
 ): FitSpaceTimeVariogramResult {
   const mod = requireLoadedModule();
   const fn = mod.wasmFitSpaceTimeVariogram;
-  if (typeof fn !== "function") {
-    throw new KrigingError(
-      "wasmFitSpaceTimeVariogram is not available; rebuild the WASM package",
-      { code: "backend_unavailable" }
-    );
-  }
   try {
     const out = fn(
       toFloat64Array(options.lats),

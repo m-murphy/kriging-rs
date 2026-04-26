@@ -7,12 +7,12 @@
 import { KrigingError, wrapThrown } from "../errors.js";
 import { toFloat64Array, toUint32Array } from "../internal/convert.js";
 import {
-  buildGridLatsLons,
   fittedToVariogramParamsWithNuggetOverride,
   reshapeFlatToGrid,
 } from "../internal/grid.js";
 import {
   mapBinomialBatchArrayOutput,
+  mapBinomialBuildNotes,
   mapBinomialPrediction,
   mapBinomialPredictionArray,
 } from "../internal/mappers.js";
@@ -24,6 +24,7 @@ import type {
 } from "../internal/wasm-shapes.js";
 import type {
   BinomialBatchArrayOutput,
+  BinomialBuildNotes,
   BinomialFromPrecomputedLogitsOptions,
   BinomialGridOutput,
   BinomialKrigingFromFittedVariogramOptions,
@@ -90,22 +91,17 @@ export class BinomialKriging {
   constructor(options: BinomialKrigingOptions) {
     const mod = requireLoadedModule();
     try {
-      const ctor = mod.WasmBinomialKriging;
-      if (typeof ctor.fromArrays === "function") {
-        this.inner = ctor.fromArrays(
-          toFloat64Array(options.lats),
-          toFloat64Array(options.lons),
-          toUint32Array(options.successes),
-          toUint32Array(options.trials),
-          options.variogram.variogramType,
-          options.variogram.nugget,
-          options.variogram.sill,
-          options.variogram.range,
-          options.variogram.shape
-        );
-      } else {
-        this.inner = new ctor(toBinomialOptionsWasm(options));
-      }
+      this.inner = mod.WasmBinomialKriging.fromArrays(
+        toFloat64Array(options.lats),
+        toFloat64Array(options.lons),
+        toUint32Array(options.successes),
+        toUint32Array(options.trials),
+        options.variogram.variogramType,
+        options.variogram.nugget,
+        options.variogram.sill,
+        options.variogram.range,
+        options.variogram.shape
+      );
     } catch (e) {
       throw wrapThrown(e);
     }
@@ -131,12 +127,6 @@ export class BinomialKriging {
   ): BinomialKriging {
     const mod = requireLoadedModule();
     const ctor = mod.WasmBinomialKriging;
-    if (typeof ctor.fromPrecomputedLogits !== "function") {
-      throw new KrigingError(
-        "fromPrecomputedLogits is not available; rebuild the WASM package",
-        { code: "backend_unavailable" }
-      );
-    }
     const instance = Object.create(
       BinomialKriging.prototype
     ) as BinomialKriging;
@@ -249,6 +239,18 @@ export class BinomialKriging {
   }
 
   /**
+   * Build-time diagnostics (prior, dropped zero-trial rows, logit inflation, …).
+   * Matches the JSON from WASM `getBuildNotes`.
+   */
+  getBuildNotes(): BinomialBuildNotes {
+    try {
+      return mapBinomialBuildNotes(this.requireInner().getBuildNotes());
+    } catch (e) {
+      throw wrapThrown(e);
+    }
+  }
+
+  /**
    * Single-point prevalence prediction at (lat, lon) in degrees.
    *
    * @param lat - Latitude in degrees.
@@ -308,20 +310,14 @@ export class BinomialKriging {
     const inner = this.requireInner();
     const nRows = Math.max(1, Math.floor(options.yCells));
     const nCols = Math.max(1, Math.floor(options.xCells));
-    let out: unknown;
-    if (typeof inner.predictGridArrays === "function") {
-      out = inner.predictGridArrays(
-        options.west,
-        options.east,
-        options.south,
-        options.north,
-        nCols,
-        nRows
-      );
-    } else {
-      const { lats, lons } = buildGridLatsLons(options);
-      out = inner.predictBatchArrays(lats, lons);
-    }
+    const out = inner.predictGridArrays(
+      options.west,
+      options.east,
+      options.south,
+      options.north,
+      nCols,
+      nRows
+    );
     const {
       prevalences: pFlat,
       logitValues: lFlat,

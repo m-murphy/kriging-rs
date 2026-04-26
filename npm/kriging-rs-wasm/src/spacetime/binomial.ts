@@ -10,6 +10,7 @@ import { toFloat64Array, toUint32Array } from "../internal/convert.js";
 import { buildGridLatsLons, reshapeFlatToGrid } from "../internal/grid.js";
 import {
   mapBinomialBatchArrayOutput,
+  mapBinomialBuildNotes,
   mapBinomialPrediction,
   mapBinomialPredictionArray,
 } from "../internal/mappers.js";
@@ -22,6 +23,7 @@ import { timesFromDates } from "../time.js";
 import type { WasmSpaceTimeBinomialInstance } from "../internal/wasm-shapes.js";
 import type {
   BinomialBatchArrayOutput,
+  BinomialBuildNotes,
   BinomialGridOutput,
   BinomialPrediction,
   DateAxisOptions,
@@ -109,6 +111,15 @@ export class SpaceTimeBinomialKriging {
   /** Explicit-resource-management disposer; calls {@link free}. */
   [Symbol.dispose](): void {
     this.free();
+  }
+
+  /** Build-time diagnostics (prior, dropped rows, logit inflation, …). */
+  getBuildNotes(): BinomialBuildNotes {
+    try {
+      return mapBinomialBuildNotes(this.requireInner().getBuildNotes());
+    } catch (e) {
+      throw wrapThrown(e);
+    }
   }
 
   predict(lat: number, lon: number, time: number): BinomialPrediction {

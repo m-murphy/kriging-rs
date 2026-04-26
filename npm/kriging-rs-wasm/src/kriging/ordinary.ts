@@ -8,7 +8,6 @@
 import { KrigingError, wrapThrown } from "../errors.js";
 import { asRecord, toFloat64Array } from "../internal/convert.js";
 import {
-  buildGridLatsLons,
   fittedToVariogramParamsWithNuggetOverride,
   reshapeFlatToGrid,
 } from "../internal/grid.js";
@@ -18,10 +17,7 @@ import {
   mapOrdinaryPredictionArray,
 } from "../internal/mappers.js";
 import { requireLoadedModule } from "../internal/module.js";
-import type {
-  OrdinaryKrigingOptionsWasm,
-  WasmOrdinaryInstance,
-} from "../internal/wasm-shapes.js";
+import type { WasmOrdinaryInstance } from "../internal/wasm-shapes.js";
 import type {
   NeighborhoodOptions,
   NumericArrayInput,
@@ -34,23 +30,6 @@ import type {
 } from "../types.js";
 
 const ORDINARY_FREED = "OrdinaryKriging model has been freed";
-
-function toOrdinaryOptionsWasm(
-  opts: OrdinaryKrigingOptions
-): OrdinaryKrigingOptionsWasm {
-  return {
-    lats: Array.from(toFloat64Array(opts.lats)),
-    lons: Array.from(toFloat64Array(opts.lons)),
-    values: Array.from(toFloat64Array(opts.values)),
-    variogram: {
-      variogramType: opts.variogram.variogramType,
-      nugget: opts.variogram.nugget,
-      sill: opts.variogram.sill,
-      range: opts.variogram.range,
-      shape: opts.variogram.shape,
-    },
-  };
-}
 
 /**
  * Ordinary kriging model for spatial interpolation of continuous values.
@@ -76,21 +55,16 @@ export class OrdinaryKriging {
       // Prefer the zero-object-overhead `fromArrays` factory when the WASM package exposes
       // it: it skips the `serde_wasm_bindgen::from_value` deserialization that would
       // otherwise dominate constructor cost for large sample sets.
-      const ctor = mod.WasmOrdinaryKriging;
-      if (typeof ctor.fromArrays === "function") {
-        this.inner = ctor.fromArrays(
-          toFloat64Array(options.lats),
-          toFloat64Array(options.lons),
-          toFloat64Array(options.values),
-          options.variogram.variogramType,
-          options.variogram.nugget,
-          options.variogram.sill,
-          options.variogram.range,
-          options.variogram.shape
-        );
-      } else {
-        this.inner = new ctor(toOrdinaryOptionsWasm(options));
-      }
+      this.inner = mod.WasmOrdinaryKriging.fromArrays(
+        toFloat64Array(options.lats),
+        toFloat64Array(options.lons),
+        toFloat64Array(options.values),
+        options.variogram.variogramType,
+        options.variogram.nugget,
+        options.variogram.sill,
+        options.variogram.range,
+        options.variogram.shape
+      );
     } catch (e) {
       throw wrapThrown(e);
     }
@@ -138,12 +112,6 @@ export class OrdinaryKriging {
    */
   setNeighborhood(options?: NeighborhoodOptions): void {
     const inner = this.requireInner();
-    if (typeof inner.setNeighborhood !== "function") {
-      throw new KrigingError(
-        "setNeighborhood is not available; rebuild the WASM package",
-        { code: "backend_unavailable" }
-      );
-    }
     try {
       inner.setNeighborhood(options?.maxNeighbors, options?.maxRadius);
     } catch (e) {
@@ -157,7 +125,6 @@ export class OrdinaryKriging {
    */
   neighborhood(): NeighborhoodOptions | null {
     const inner = this.requireInner();
-    if (typeof inner.neighborhood !== "function") return null;
     const out = inner.neighborhood();
     if (out === null || out === undefined) return null;
     const rec = asRecord(out);
@@ -248,26 +215,14 @@ export class OrdinaryKriging {
     const inner = this.requireInner();
     const nRows = Math.max(1, Math.floor(options.yCells));
     const nCols = Math.max(1, Math.floor(options.xCells));
-    // Prefer the WASM-side flat-buffer grid when available: it skips building JS lat/lon
-    // arrays and the extra JS→WASM copy of those arrays.
-    if (typeof inner.predictGridArrays === "function") {
-      const out = inner.predictGridArrays(
-        options.west,
-        options.east,
-        options.south,
-        options.north,
-        nCols,
-        nRows
-      );
-      const { values: valuesFlat, variances: variancesFlat } =
-        mapOrdinaryBatchArrayOutput(out);
-      return {
-        values: reshapeFlatToGrid(valuesFlat, nRows, nCols),
-        variances: reshapeFlatToGrid(variancesFlat, nRows, nCols),
-      };
-    }
-    const { lats, lons } = buildGridLatsLons(options);
-    const out = inner.predictBatchArrays(lats, lons);
+    const out = inner.predictGridArrays(
+      options.west,
+      options.east,
+      options.south,
+      options.north,
+      nCols,
+      nRows
+    );
     const { values: valuesFlat, variances: variancesFlat } =
       mapOrdinaryBatchArrayOutput(out);
     return {

@@ -10,16 +10,16 @@
 
 import type { BinomialPriorParams } from "../types.js";
 
-/** Default Beta(α, β) used when the caller omits a prior — matches Rust's `BinomialPrior::default()`. */
+/** Default Beta(α, β) used when the caller omits a prior — matches Rust's `BinomialPrior::default()` (Beta(1, 1)). */
 export const DEFAULT_BINOMIAL_PRIOR: Readonly<BinomialPriorParams> = Object.freeze({
-  alpha: 0.5,
-  beta: 0.5,
+  alpha: 1,
+  beta: 1,
 });
 
 /**
  * Resolve a user-supplied prior object to the positional `(alpha, beta)` form the
  * WASM functions expect. Returns `undefined` for both fields when `prior` is
- * omitted so the Rust side falls back to its default Beta(1/2, 1/2).
+ * omitted so the Rust side falls back to its default Beta(1, 1).
  */
 export function resolveBinomialPrior(
   prior: BinomialPriorParams | undefined

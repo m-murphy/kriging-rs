@@ -530,6 +530,9 @@ describe("Binomial kriging", () => {
     expect(out.fittedVariogram.variogramType).toBe("exponential");
     expect(Number.isFinite(out.fittedVariogram.range)).toBe(true);
     expect(out.cv).toBeUndefined();
+    expect(out.buildNotes.calibrationVersion).toBeGreaterThanOrEqual(1);
+    expect(out.buildNotes.prior.alpha).toBe(1);
+    expect(out.buildNotes.prior.beta).toBe(1);
   });
 
   test("interpolateBinomialToGrid fits on smoothed logits (matches manual pipeline)", () => {
@@ -548,8 +551,8 @@ describe("Binomial kriging", () => {
       nBins: 12,
     });
 
-    const ALPHA = 0.5;
-    const BETA = 0.5;
+    const ALPHA = 1;
+    const BETA = 1;
     const manualLogits = successes.map((s, i) => {
       const p = (s + ALPHA) / (trials[i] + ALPHA + BETA);
       return Math.log(p / (1 - p));
@@ -592,6 +595,8 @@ describe("Binomial kriging", () => {
       expect(out.fittedVariogram.nugget).toBeCloseTo(manualFit.nugget, 12);
       expect(out.fittedVariogram.sill).toBeCloseTo(manualFit.sill, 12);
       expect(out.fittedVariogram.range).toBeCloseTo(manualFit.range, 12);
+      expect(out.buildNotes.prior.alpha).toBe(1);
+      expect(out.buildNotes.prior.beta).toBe(1);
     } finally {
       manualModel.free();
     }

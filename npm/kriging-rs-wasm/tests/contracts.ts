@@ -26,9 +26,11 @@ import {
   leaveOneOutSpaceTimeUniversal,
   VariogramType,
   type BinomialBatchArrayOutput,
+  type BinomialBuildNotes,
   type BinomialCvResult,
   type BinomialPrediction,
   type BinomialGridOutput,
+  type InterpolateBinomialToGridResult,
   type BinomialSimulationResult,
   type CvResult,
   type EmpiricalSpaceTimeVariogramResult,
@@ -248,6 +250,7 @@ const stBinomial = new SpaceTimeBinomialKriging({
   variogram: stVariogram,
 });
 const _stBinomialPred: BinomialPrediction = stBinomial.predict(0.5, 0.5, 1.0);
+const _stBinNotes: BinomialBuildNotes = stBinomial.getBuildNotes();
 const _stBinomialBatchArrays: BinomialBatchArrayOutput =
   stBinomial.predictBatchArrays(lats, lons, times);
 
@@ -401,7 +404,7 @@ const _stSgsBin: BinomialSimulationResult =
     seed: 1n,
   });
 
-const _oneShotBinomial: BinomialGridOutput = interpolateBinomialToGrid({
+const _oneShotBinomial: InterpolateBinomialToGridResult = interpolateBinomialToGrid({
   lats: Array.from(lats),
   lons: Array.from(lons),
   successes: Array.from(successes),

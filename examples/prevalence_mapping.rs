@@ -61,9 +61,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let successes: Vec<u32> = raw.iter().map(|(_, _, s, _)| *s).collect();
     let trials: Vec<u32> = raw.iter().map(|(_, _, _, n)| *n).collect();
 
-    // Beta(1, 1) is a mild flat prior. Use Jeffreys' Beta(½, ½) (the
-    // `BinomialPrior::default()`) for routine work if you want minimal
-    // shrinkage of small denominators.
+    // `BinomialPrior::default()` in this crate is **Beta(1, 1)** (uniform on prevalence),
+    // which matches the calibrated default binomial kriging path. For Jeffreys `Beta(½, ½)`
+    // (stronger mass near 0/1 for small `n`), use e.g. `BinomialPrior::new(0.5, 0.5)?`.
     let prior = BinomialPrior::new(1.0, 1.0)?;
 
     // ---------------------------------------------------------------------

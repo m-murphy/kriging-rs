@@ -48,6 +48,75 @@ fn build_prediction_grid(count: usize, step: Real) -> Vec<GeoCoord> {
         .collect::<Vec<_>>()
 }
 
+/// Representative of a large **visual** web workload: ~400 conditioning stations and
+/// 200×200 = 40_000 target cells. Models are pre-built; benches measure `predict_batch` only.
+/// See `benches/BROWSER_BENCHMARKS.md`.
+fn build_browser_binomial_400() -> (Vec<BinomialObservation>, VariogramModel) {
+    let p_at = |i: usize| (0.12f32 + (i % 23) as f32 * 0.003).min(0.92) as Real;
+    let mut obs = Vec::with_capacity(400);
+    for row in 0..20u32 {
+        for col in 0..20u32 {
+            let i = (row * 20 + col) as usize;
+            // Mixed denominators: every other site has few trials.
+            let trials: u32 = if i.is_multiple_of(2) { 8 } else { 180 };
+            let p = p_at(i);
+            let successes = ((p * trials as Real).round() as u32).min(trials);
+            let lat = 35.0 + (row as Real) * 0.02;
+            let lon = -120.0 + (col as Real) * 0.02;
+            obs.push(
+                BinomialObservation::new(GeoCoord::try_new(lat, lon).unwrap(), successes, trials)
+                    .unwrap(),
+            );
+        }
+    }
+    // Fixed, smooth exponential — matches typical fitted shapes without benching the fitter.
+    let var = VariogramModel::new(0.04, 3.5, 0.4, VariogramType::Exponential).unwrap();
+    (obs, var)
+}
+
+fn build_200x200_target_grid() -> Vec<GeoCoord> {
+    let n = 200usize;
+    let (south, west) = (35.0f32, -120.0f32);
+    let (north, east) = (39.0f32, -116.0f32);
+    let dlat = (north - south) / (n - 1) as f32;
+    let dlon = (east - west) / (n - 1) as f32;
+    let mut out = Vec::with_capacity(n * n);
+    for r in 0..n {
+        for c in 0..n {
+            out.push(
+                GeoCoord::try_new(
+                    (south + dlat * r as f32) as Real,
+                    (west + dlon * c as f32) as Real,
+                )
+                .unwrap(),
+            );
+        }
+    }
+    out
+}
+
+fn bench_binomial_browser_representative(c: &mut Criterion) {
+    let (ref observations, variogram) = build_browser_binomial_400();
+    let grid_40k = build_200x200_target_grid();
+    assert_eq!(grid_40k.len(), 40_000);
+    let prior = BinomialPrior::default();
+    let m = BinomialKrigingModel::new_with_prior(observations.clone(), variogram, prior)
+        .expect("binomial 400");
+    c.bench_function("browser_binomial_pred_only_40k_cal_400st", |b| {
+        b.iter(|| {
+            let _ = m.predict_batch(&grid_40k);
+        });
+    });
+    #[cfg(all(feature = "gpu-blocking", not(target_arch = "wasm32")))]
+    {
+        c.bench_function("browser_binomial_pred_only_40k_cal_400st_gpu", |b| {
+            b.iter(|| {
+                let _ = m.predict_batch_gpu_blocking(&grid_40k).expect("gpu");
+            });
+        });
+    }
+}
+
 fn run_ordinary_pipeline(
     coords: &[GeoCoord],
     values: &[Real],
@@ -474,6 +543,7 @@ criterion_group!(
     bench_single_prediction,
     bench_batch_prediction,
     bench_binomial,
+    bench_binomial_browser_representative,
     bench_spacetime,
     bench_quick_phase_profile
 );

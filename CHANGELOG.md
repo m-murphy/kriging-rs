@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.4.0] - 2026-04-26
+
+### Added
+
+- **Calibrated binomial kriging (default):** per-site logit *observation* variance
+  (Empirical-Bayes `Beta(α,β)` + delta method) on the ordinary-kriging diagonal, with
+  automatic inflation retries and always-returned [`BinomialBuildNotes`]
+  (`calibrationVersion`, `logitInflation`, `nBuildAttempts`, prior, dropped zero-trial
+  indices). The geographic fit type is `BinomialFit` (`BinomialCalibratedResult<BinomialKrigingModel>`);
+  use [`BinomialKrigingModel::new_with_config`] for full control. (The older separate
+  “hetero-only” constructor is removed; `new` / `new_with_prior` are heteroskedastic
+  by default with `HeteroskedasticBinomialConfig::default()`.)
+- **WASM:** `WasmBinomialKriging`, `WasmBinomialProjectedKriging`, and
+  `WasmSpaceTimeBinomialKriging` store build notes and expose `getBuildNotes()`. Count
+  inputs with `trials==0` are dropped before fit (at least two retained sites required).
+- **TypeScript:** `interpolateBinomialToGrid` includes `buildNotes` on
+  `InterpolateBinomialToGridResult`. `getBuildNotes()` is available on
+  `BinomialKriging`, `BinomialProjectedKriging`, and `SpaceTimeBinomialKriging`.
+- **Empirical variogram (binomial):** `compute_empirical_variogram_binomial_calibrated`
+  (pair-noise aware classical estimator) for the calibrated default.
+- `OrdinaryKrigingModel::new_with_extra_diagonal` for arbitrary (homogeneous or) **site-specific**
+  non-spatial noise on the covariance diagonal.
+- Browser-representative workload and **prediction-only** benchmark: `benches/BROWSER_BENCHMARKS.md`
+  and Criterion `bench_binomial_browser_representative` (`400` stations, `200×200` target grid;
+  optional `gpu-blocking` sub-bench for WebGPU class RHS).
+
+### Changed (breaking / migration from 0.3.x)
+
+- **Default binomial prior is `Beta(1, 1)`** in Rust and when the TS/JS `prior` is
+  omitted; use explicit `0.5/0.5` for Jeffreys.
+- **Rust return types:** `BinomialKrigingModel::new` / `new_with_prior` /
+  `new_with_config` (and the analogous **projected** and **space–time** binomial
+  builders, including some `from_precomputed_logits*`) return
+  `BinomialCalibratedResult<…>` (alias `BinomialFit` in geographic 2D). Use
+  `.model`, `.into_model()`, or `Deref` to `&InnerModel` for `predict` / `predict_batch`.
+- **WASM/TS** consumers must **rebuild** the published `pkg` for `getBuildNotes` and
+  the `trials==0` / minimum-site validation behavior.
+- **Binomial SGS** (`conditional_simulate*`) uses heteroskedastic (logit observation
+  variance) conditioning in the per-target sequential fits for closer alignment with
+  calibrated binomial prediction.
+
 ## [0.3.0] - 2026-04-16
 
 0.3.0 is a large feature release. Highlights:
@@ -195,6 +238,7 @@ Higher-level ergonomics layered on top of the WASM bindings.
   - `KrigingError` (JS class with `cause`); `webgpuAvailable` when built with GPU support.
   - Batch and typed-array prediction APIs.
 
+[0.4.0]: https://github.com/m-murphy/kriging-rs/releases/tag/v0.4.0
 [0.3.0]: https://github.com/m-murphy/kriging-rs/releases/tag/v0.3.0
 [0.2.3]: https://github.com/m-murphy/kriging-rs/releases/tag/v0.2.3
 [0.2.2]: https://github.com/m-murphy/kriging-rs/releases/tag/v0.2.2
