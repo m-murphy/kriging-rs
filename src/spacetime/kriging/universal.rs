@@ -134,6 +134,13 @@ impl<M: SpatialBasis> SpaceTimeUniversalKrigingModel<M> {
         self.trend
     }
 
+    pub fn variogram(&self) -> SpaceTimeVariogram {
+        match &self.inner {
+            SpaceTimeUniversalInner::Constant(engine) => engine.variogram(),
+            SpaceTimeUniversalInner::Drift(engine) => engine.variogram(),
+        }
+    }
+
     pub fn predict(&self, target: SpaceTimeCoord<M::Coord>) -> Result<Prediction, KrigingError> {
         match &self.inner {
             SpaceTimeUniversalInner::Constant(engine) => engine

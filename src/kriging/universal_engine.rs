@@ -89,6 +89,18 @@ impl UniversalKrigingEngine {
         })
     }
 
+    pub fn coords(&self) -> &[GeoCoord] {
+        &self.coords
+    }
+
+    pub fn values(&self) -> &[Real] {
+        &self.values
+    }
+
+    pub fn variogram(&self) -> VariogramModel {
+        self.variogram
+    }
+
     pub fn predict(&self, targets: &[GeoCoord]) -> Result<Vec<Prediction>, KrigingError> {
         if targets.is_empty() {
             return Ok(Vec::new());

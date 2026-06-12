@@ -36,14 +36,16 @@ use crate::spacetime::{
 use crate::variogram::empirical::{EmpiricalEstimator, PositiveReal};
 use crate::variogram::models::{VariogramModel, VariogramType};
 
+use super::cv_options::UnifiedCvOptions;
+use super::model_cv;
+use super::simulate_options::UnifiedSimulateOptions;
 use super::{
     JsBinomialPrediction, JsPrediction, binomial_cv_result_to_js, binomial_many_simulation_to_js,
     binomial_simulation_to_js, coded_err, cv_result_to_js, err_to_js,
     heteroskedastic_config_from_optional_stability_str, kriging_err_to_js,
     map_binomial_predictions, map_predictions, merge_hetero_with_optional_one_step_laplace,
-    parse_binomial_prior, parse_simulation_options, parse_variogram,
-    set_binomial_flat_array_fields, set_object_field, split_binomial_predictions,
-    split_predictions,
+    parse_binomial_prior, parse_variogram, set_binomial_flat_array_fields, set_object_field,
+    split_binomial_predictions, split_predictions,
 };
 
 const FAMILY_HELP: &str = "family must be 'separable' or 'productSum'";
@@ -237,16 +239,46 @@ fn variogram_type_name(vt: VariogramType) -> &'static str {
     }
 }
 
-// ---------- Geo: Ordinary ----------
-
-#[wasm_bindgen]
-pub struct WasmSpaceTimeOrdinaryKriging {
-    inner: SpaceTimeOrdinaryKrigingModel<GeoMetric>,
+fn st_geo_cv_slices(
+    dataset: &SpaceTimeDataset<GeoCoord>,
+) -> (Vec<SpaceTimeCoord<GeoCoord>>, Vec<Real>) {
+    (dataset.coords().to_vec(), dataset.values().to_vec())
 }
 
-#[wasm_bindgen]
+fn st_projected_cv_slices(
+    dataset: &SpaceTimeDataset<ProjectedCoord>,
+    anisotropy: Anisotropy2D,
+) -> (Vec<SpaceTimeCoord<ProjectedCoord>>, Vec<Real>, Anisotropy2D) {
+    (
+        dataset.coords().to_vec(),
+        dataset.values().to_vec(),
+        anisotropy,
+    )
+}
+
+fn st_binomial_cv_slices<C: Copy>(
+    observations: &[SpaceTimeBinomialObservation<C>],
+) -> (Vec<SpaceTimeCoord<C>>, Vec<u32>, Vec<u32>) {
+    let mut coords = Vec::with_capacity(observations.len());
+    let mut successes = Vec::with_capacity(observations.len());
+    let mut trials = Vec::with_capacity(observations.len());
+    for obs in observations {
+        coords.push(obs.coord());
+        successes.push(obs.successes());
+        trials.push(obs.trials());
+    }
+    (coords, successes, trials)
+}
+
+// ---------- Geo: Ordinary ----------
+
+pub(crate) struct WasmSpaceTimeOrdinaryKriging {
+    inner: SpaceTimeOrdinaryKrigingModel<GeoMetric>,
+    cv_coords: Vec<SpaceTimeCoord<GeoCoord>>,
+    cv_values: Vec<Real>,
+}
+
 impl WasmSpaceTimeOrdinaryKriging {
-    #[wasm_bindgen(js_name = fromArrays)]
     pub fn from_arrays(
         lats: &[f64],
         lons: &[f64],
@@ -268,6 +300,7 @@ impl WasmSpaceTimeOrdinaryKriging {
         k3: Option<f64>,
     ) -> Result<WasmSpaceTimeOrdinaryKriging, JsValue> {
         let dataset = build_geo_dataset(lats, lons, times, values)?;
+        let (cv_coords, cv_values) = st_geo_cv_slices(&dataset);
         let variogram = parse_spacetime_variogram(
             family,
             spatial_type,
@@ -286,7 +319,11 @@ impl WasmSpaceTimeOrdinaryKriging {
         )?;
         let inner = SpaceTimeOrdinaryKrigingModel::new(GeoMetric, dataset, variogram)
             .map_err(kriging_err_to_js)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            cv_coords,
+            cv_values,
+        })
     }
 
     pub fn predict(&self, lat: f64, lon: f64, time: f64) -> Result<JsValue, JsValue> {
@@ -300,7 +337,6 @@ impl WasmSpaceTimeOrdinaryKriging {
         .map_err(err_to_js)
     }
 
-    #[wasm_bindgen(js_name = predictBatch)]
     pub fn predict_batch(
         &self,
         lats: &[f64],
@@ -315,7 +351,6 @@ impl WasmSpaceTimeOrdinaryKriging {
         serde_wasm_bindgen::to_value(&map_predictions(out)).map_err(err_to_js)
     }
 
-    #[wasm_bindgen(js_name = predictBatchArrays)]
     pub fn predict_batch_arrays(
         &self,
         lats: &[f64],
@@ -341,18 +376,38 @@ impl WasmSpaceTimeOrdinaryKriging {
         )?;
         Ok(result.into())
     }
+
+    pub fn leave_one_out(&self) -> Result<JsValue, JsValue> {
+        model_cv::spacetime_ordinary_cv(
+            GeoMetric,
+            &self.cv_coords,
+            &self.cv_values,
+            self.inner.variogram(),
+            None,
+        )
+    }
+
+    pub fn k_fold(&self, k: usize) -> Result<JsValue, JsValue> {
+        model_cv::spacetime_ordinary_cv(
+            GeoMetric,
+            &self.cv_coords,
+            &self.cv_values,
+            self.inner.variogram(),
+            Some(k),
+        )
+    }
 }
 
 // ---------- Geo: Simple ----------
 
-#[wasm_bindgen]
-pub struct WasmSpaceTimeSimpleKriging {
+pub(crate) struct WasmSpaceTimeSimpleKriging {
     inner: SpaceTimeSimpleKrigingModel<GeoMetric>,
+    cv_coords: Vec<SpaceTimeCoord<GeoCoord>>,
+    cv_values: Vec<Real>,
+    cv_mean: Real,
 }
 
-#[wasm_bindgen]
 impl WasmSpaceTimeSimpleKriging {
-    #[wasm_bindgen(js_name = fromArrays)]
     pub fn from_arrays(
         lats: &[f64],
         lons: &[f64],
@@ -375,6 +430,7 @@ impl WasmSpaceTimeSimpleKriging {
         k3: Option<f64>,
     ) -> Result<WasmSpaceTimeSimpleKriging, JsValue> {
         let dataset = build_geo_dataset(lats, lons, times, values)?;
+        let (cv_coords, cv_values) = st_geo_cv_slices(&dataset);
         let variogram = parse_spacetime_variogram(
             family,
             spatial_type,
@@ -391,9 +447,15 @@ impl WasmSpaceTimeSimpleKriging {
             k2,
             k3,
         )?;
-        let inner = SpaceTimeSimpleKrigingModel::new(GeoMetric, dataset, variogram, mean as Real)
+        let cv_mean = mean as Real;
+        let inner = SpaceTimeSimpleKrigingModel::new(GeoMetric, dataset, variogram, cv_mean)
             .map_err(kriging_err_to_js)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            cv_coords,
+            cv_values,
+            cv_mean,
+        })
     }
 
     pub fn predict(&self, lat: f64, lon: f64, time: f64) -> Result<JsValue, JsValue> {
@@ -407,7 +469,6 @@ impl WasmSpaceTimeSimpleKriging {
         .map_err(err_to_js)
     }
 
-    #[wasm_bindgen(js_name = predictBatchArrays)]
     pub fn predict_batch_arrays(
         &self,
         lats: &[f64],
@@ -433,18 +494,40 @@ impl WasmSpaceTimeSimpleKriging {
         )?;
         Ok(result.into())
     }
+
+    pub fn leave_one_out(&self) -> Result<JsValue, JsValue> {
+        model_cv::spacetime_simple_cv(
+            GeoMetric,
+            &self.cv_coords,
+            &self.cv_values,
+            self.inner.variogram(),
+            self.cv_mean,
+            None,
+        )
+    }
+
+    pub fn k_fold(&self, k: usize) -> Result<JsValue, JsValue> {
+        model_cv::spacetime_simple_cv(
+            GeoMetric,
+            &self.cv_coords,
+            &self.cv_values,
+            self.inner.variogram(),
+            self.cv_mean,
+            Some(k),
+        )
+    }
 }
 
 // ---------- Geo: Universal ----------
 
-#[wasm_bindgen]
-pub struct WasmSpaceTimeUniversalKriging {
+pub(crate) struct WasmSpaceTimeUniversalKriging {
     inner: SpaceTimeUniversalKrigingModel<GeoMetric>,
+    cv_coords: Vec<SpaceTimeCoord<GeoCoord>>,
+    cv_values: Vec<Real>,
+    cv_trend: SpaceTimeUniversalTrend,
 }
 
-#[wasm_bindgen]
 impl WasmSpaceTimeUniversalKriging {
-    #[wasm_bindgen(js_name = fromArrays)]
     pub fn from_arrays(
         lats: &[f64],
         lons: &[f64],
@@ -467,6 +550,7 @@ impl WasmSpaceTimeUniversalKriging {
         k3: Option<f64>,
     ) -> Result<WasmSpaceTimeUniversalKriging, JsValue> {
         let dataset = build_geo_dataset(lats, lons, times, values)?;
+        let (cv_coords, cv_values) = st_geo_cv_slices(&dataset);
         let variogram = parse_spacetime_variogram(
             family,
             spatial_type,
@@ -486,7 +570,12 @@ impl WasmSpaceTimeUniversalKriging {
         let trend = parse_universal_trend(trend)?;
         let inner = SpaceTimeUniversalKrigingModel::new(GeoMetric, dataset, variogram, trend)
             .map_err(kriging_err_to_js)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            cv_coords,
+            cv_values,
+            cv_trend: trend,
+        })
     }
 
     pub fn predict(&self, lat: f64, lon: f64, time: f64) -> Result<JsValue, JsValue> {
@@ -500,7 +589,6 @@ impl WasmSpaceTimeUniversalKriging {
         .map_err(err_to_js)
     }
 
-    #[wasm_bindgen(js_name = predictBatchArrays)]
     pub fn predict_batch_arrays(
         &self,
         lats: &[f64],
@@ -525,6 +613,28 @@ impl WasmSpaceTimeUniversalKriging {
             &Float64Array::from(variances.as_slice()).into(),
         )?;
         Ok(result.into())
+    }
+
+    pub fn leave_one_out(&self) -> Result<JsValue, JsValue> {
+        model_cv::spacetime_universal_cv(
+            GeoMetric,
+            &self.cv_coords,
+            &self.cv_values,
+            self.inner.variogram(),
+            self.cv_trend,
+            None,
+        )
+    }
+
+    pub fn k_fold(&self, k: usize) -> Result<JsValue, JsValue> {
+        model_cv::spacetime_universal_cv(
+            GeoMetric,
+            &self.cv_coords,
+            &self.cv_values,
+            self.inner.variogram(),
+            self.cv_trend,
+            Some(k),
+        )
     }
 }
 
@@ -581,15 +691,15 @@ struct StBinomialDiagnosticsLoo {
     trials: Vec<u32>,
 }
 
-#[wasm_bindgen]
-pub struct WasmSpaceTimeBinomialKriging {
+pub(crate) struct WasmSpaceTimeBinomialKriging {
     inner: SpaceTimeBinomialKrigingModel<GeoMetric>,
     build_notes: BinomialBuildNotes,
+    cv_coords: Vec<SpaceTimeCoord<GeoCoord>>,
+    cv_successes: Vec<u32>,
+    cv_trials: Vec<u32>,
 }
 
-#[wasm_bindgen]
 impl WasmSpaceTimeBinomialKriging {
-    #[wasm_bindgen(js_name = fromArrays)]
     pub fn from_arrays(
         lats: &[f64],
         lons: &[f64],
@@ -615,6 +725,7 @@ impl WasmSpaceTimeBinomialKriging {
     ) -> Result<WasmSpaceTimeBinomialKriging, JsValue> {
         let (observations, zero_trial_drops) =
             st_binomial_geo_collect_observations(lats, lons, times, successes, trials)?;
+        let (cv_coords, cv_successes, cv_trials) = st_binomial_cv_slices(&observations);
         let variogram = parse_spacetime_variogram(
             family,
             spatial_type,
@@ -643,12 +754,14 @@ impl WasmSpaceTimeBinomialKriging {
         Ok(Self {
             inner: fit.model,
             build_notes,
+            cv_coords,
+            cv_successes,
+            cv_trials,
         })
     }
 
     /// Like [`Self::from_arrays`] but with an explicit Beta(`prior_alpha`, `prior_beta`) prior
     /// on prevalence (same semantics as geo `WasmBinomialKriging::new_with_prior`).
-    #[wasm_bindgen(js_name = fromArraysWithPrior)]
     pub fn from_arrays_with_prior(
         lats: &[f64],
         lons: &[f64],
@@ -676,6 +789,7 @@ impl WasmSpaceTimeBinomialKriging {
     ) -> Result<WasmSpaceTimeBinomialKriging, JsValue> {
         let (observations, zero_trial_drops) =
             st_binomial_geo_collect_observations(lats, lons, times, successes, trials)?;
+        let (cv_coords, cv_successes, cv_trials) = st_binomial_cv_slices(&observations);
         let variogram = parse_spacetime_variogram(
             family,
             spatial_type,
@@ -711,12 +825,14 @@ impl WasmSpaceTimeBinomialKriging {
         Ok(Self {
             inner: fit.model,
             build_notes,
+            cv_coords,
+            cv_successes,
+            cv_trials,
         })
     }
 
     /// Build from pre-computed finite logits at each `(lat, lon, time)` (no per-trial observation
     /// variance on the diagonal; see geo `WasmBinomialKriging::from_precomputed_logits`).
-    #[wasm_bindgen(js_name = fromPrecomputedLogits)]
     pub fn from_precomputed_logits(
         lats: &[f64],
         lons: &[f64],
@@ -783,12 +899,14 @@ impl WasmSpaceTimeBinomialKriging {
         Ok(Self {
             inner: fit.model,
             build_notes: fit.notes,
+            cv_coords: Vec::new(),
+            cv_successes: Vec::new(),
+            cv_trials: Vec::new(),
         })
     }
 
     /// Like [`Self::from_precomputed_logits`], with per-site logit observation variances on the
     /// diagonal. Optional `prior_alpha` / `prior_beta` must be supplied together.
-    #[wasm_bindgen(js_name = fromPrecomputedLogitsWithVariances)]
     pub fn from_precomputed_logits_with_variances(
         lats: &[f64],
         lons: &[f64],
@@ -878,10 +996,12 @@ impl WasmSpaceTimeBinomialKriging {
         Ok(Self {
             inner: fit.model,
             build_notes: fit.notes,
+            cv_coords: Vec::new(),
+            cv_successes: Vec::new(),
+            cv_trials: Vec::new(),
         })
     }
 
-    #[wasm_bindgen(js_name = getBuildNotes)]
     pub fn get_build_notes(&self) -> Result<JsValue, JsValue> {
         serde_wasm_bindgen::to_value(&self.build_notes).map_err(err_to_js)
     }
@@ -889,7 +1009,6 @@ impl WasmSpaceTimeBinomialKriging {
     /// `variogram` is a [`SpaceTimeVariogramParams`]-shaped object; `buildNotes` matches
     /// geographic binomial; optional `logitLooMsdr` when `{ lats, lons, times, successes, trials }`
     /// is supplied (same lengths as the model).
-    #[wasm_bindgen(js_name = getDiagnostics)]
     pub fn get_diagnostics(&self, options: JsValue) -> Result<JsValue, JsValue> {
         let vg = self.inner.variogram();
         let variogram_js = space_time_variogram_diagnostic_js(&vg)?;
@@ -947,7 +1066,6 @@ impl WasmSpaceTimeBinomialKriging {
         .map_err(err_to_js)
     }
 
-    #[wasm_bindgen(js_name = predictBatch)]
     pub fn predict_batch(
         &self,
         lats: &[f64],
@@ -962,7 +1080,6 @@ impl WasmSpaceTimeBinomialKriging {
         serde_wasm_bindgen::to_value(&map_binomial_predictions(out)).map_err(err_to_js)
     }
 
-    #[wasm_bindgen(js_name = predictBatchArrays)]
     pub fn predict_batch_arrays(
         &self,
         lats: &[f64],
@@ -979,18 +1096,52 @@ impl WasmSpaceTimeBinomialKriging {
         set_binomial_flat_array_fields(&result, &pm, &pmean, &logits, &lv, &pv)?;
         Ok(result.into())
     }
+
+    pub fn leave_one_out(&self) -> Result<JsValue, JsValue> {
+        if self.cv_coords.is_empty() {
+            return Err(coded_err(
+                "leaveOneOut requires count data; build the model from successes/trials, not precomputed logits",
+                "invalid_input",
+            ));
+        }
+        model_cv::spacetime_binomial_geo_cv(
+            &self.cv_coords,
+            &self.cv_successes,
+            &self.cv_trials,
+            self.inner.variogram(),
+            self.build_notes.prior,
+            None,
+        )
+    }
+
+    pub fn k_fold(&self, k: usize) -> Result<JsValue, JsValue> {
+        if self.cv_coords.is_empty() {
+            return Err(coded_err(
+                "kFold requires count data; build the model from successes/trials, not precomputed logits",
+                "invalid_input",
+            ));
+        }
+        model_cv::spacetime_binomial_geo_cv(
+            &self.cv_coords,
+            &self.cv_successes,
+            &self.cv_trials,
+            self.inner.variogram(),
+            self.build_notes.prior,
+            Some(k),
+        )
+    }
 }
 
 // ---------- Projected: Ordinary ----------
 
-#[wasm_bindgen]
-pub struct WasmSpaceTimeOrdinaryProjectedKriging {
+pub(crate) struct WasmSpaceTimeOrdinaryProjectedKriging {
     inner: SpaceTimeOrdinaryKrigingModel<ProjectedMetric>,
+    cv_coords: Vec<SpaceTimeCoord<ProjectedCoord>>,
+    cv_values: Vec<Real>,
+    cv_anisotropy: Anisotropy2D,
 }
 
-#[wasm_bindgen]
 impl WasmSpaceTimeOrdinaryProjectedKriging {
-    #[wasm_bindgen(js_name = fromArrays)]
     pub fn from_arrays(
         xs: &[f64],
         ys: &[f64],
@@ -1014,6 +1165,10 @@ impl WasmSpaceTimeOrdinaryProjectedKriging {
         k3: Option<f64>,
     ) -> Result<WasmSpaceTimeOrdinaryProjectedKriging, JsValue> {
         let dataset = build_projected_dataset(xs, ys, times, values)?;
+        let metric = projected_metric(major_angle_deg, range_ratio)?;
+        let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
+            .map_err(kriging_err_to_js)?;
+        let (cv_coords, cv_values, cv_anisotropy) = st_projected_cv_slices(&dataset, anisotropy);
         let variogram = parse_spacetime_variogram(
             family,
             spatial_type,
@@ -1030,10 +1185,14 @@ impl WasmSpaceTimeOrdinaryProjectedKriging {
             k2,
             k3,
         )?;
-        let metric = projected_metric(major_angle_deg, range_ratio)?;
         let inner = SpaceTimeOrdinaryKrigingModel::new(metric, dataset, variogram)
             .map_err(kriging_err_to_js)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            cv_coords,
+            cv_values,
+            cv_anisotropy,
+        })
     }
 
     pub fn predict(&self, x: f64, y: f64, time: f64) -> Result<JsValue, JsValue> {
@@ -1048,7 +1207,6 @@ impl WasmSpaceTimeOrdinaryProjectedKriging {
         .map_err(err_to_js)
     }
 
-    #[wasm_bindgen(js_name = predictBatchArrays)]
     pub fn predict_batch_arrays(
         &self,
         xs: &[f64],
@@ -1073,6 +1231,26 @@ impl WasmSpaceTimeOrdinaryProjectedKriging {
             &Float64Array::from(variances.as_slice()).into(),
         )?;
         Ok(result.into())
+    }
+
+    pub fn leave_one_out(&self) -> Result<JsValue, JsValue> {
+        model_cv::spacetime_ordinary_projected_cv(
+            self.cv_anisotropy,
+            &self.cv_coords,
+            &self.cv_values,
+            self.inner.variogram(),
+            None,
+        )
+    }
+
+    pub fn k_fold(&self, k: usize) -> Result<JsValue, JsValue> {
+        model_cv::spacetime_ordinary_projected_cv(
+            self.cv_anisotropy,
+            &self.cv_coords,
+            &self.cv_values,
+            self.inner.variogram(),
+            Some(k),
+        )
     }
 }
 
@@ -1292,6 +1470,380 @@ fn parse_variogram_type(name: &str) -> Result<VariogramType, JsValue> {
 // Space–time cross-validation
 // ---------------------------------------------------------------------------
 
+fn st_variogram_from_cv_options(opts: &UnifiedCvOptions) -> Result<SpaceTimeVariogram, JsValue> {
+    let family = opts.space_time_family.as_deref().ok_or_else(|| {
+        coded_err(
+            "spaceTimeFamily is required for spacetime CV",
+            "invalid_input",
+        )
+    })?;
+    let spatial_type = opts
+        .spatial_type
+        .as_deref()
+        .ok_or_else(|| coded_err("spatialType is required for spacetime CV", "invalid_input"))?;
+    let temporal_type = opts
+        .temporal_type
+        .as_deref()
+        .ok_or_else(|| coded_err("temporalType is required for spacetime CV", "invalid_input"))?;
+    st_parse_spacetime_variogram_all(
+        family,
+        spatial_type,
+        opts.spatial_nugget.unwrap_or(0.0),
+        opts.spatial_sill.ok_or_else(|| {
+            coded_err("spatialSill is required for spacetime CV", "invalid_input")
+        })?,
+        opts.spatial_range.ok_or_else(|| {
+            coded_err("spatialRange is required for spacetime CV", "invalid_input")
+        })?,
+        opts.spatial_shape,
+        temporal_type,
+        opts.temporal_nugget.unwrap_or(0.0),
+        opts.temporal_sill.ok_or_else(|| {
+            coded_err("temporalSill is required for spacetime CV", "invalid_input")
+        })?,
+        opts.temporal_range.ok_or_else(|| {
+            coded_err(
+                "temporalRange is required for spacetime CV",
+                "invalid_input",
+            )
+        })?,
+        opts.temporal_shape,
+        opts.k1,
+        opts.k2,
+        opts.k3,
+    )
+}
+
+pub(super) fn run_spacetime_cv(opts: &UnifiedCvOptions) -> Result<JsValue, JsValue> {
+    let coords = st_build_geo_coords(&opts.lats, &opts.lons, &opts.times)?;
+    let vg = st_variogram_from_cv_options(opts)?;
+
+    match opts.family.as_str() {
+        "ordinary" => {
+            if opts.values.len() != opts.lats.len() {
+                return Err(coded_err(
+                    "values must have the same length as lats/lons/times",
+                    "mismatched_arrays",
+                ));
+            }
+            let values_real: Vec<Real> = opts.values.iter().map(|v| *v as Real).collect();
+            let predictor = SpacetimeOrdinaryPredictor {
+                metric: GeoMetric,
+                coords: &coords,
+                values: &values_real,
+                variogram: vg,
+            };
+            st_run_cv_with_predictor(&predictor, opts.k)
+        }
+        "simple" => {
+            if opts.values.len() != opts.lats.len() {
+                return Err(coded_err(
+                    "values must have the same length as lats/lons/times",
+                    "mismatched_arrays",
+                ));
+            }
+            let values_real: Vec<Real> = opts.values.iter().map(|v| *v as Real).collect();
+            let mean = opts.mean.ok_or_else(|| {
+                coded_err("mean is required for simple kriging CV", "invalid_input")
+            })?;
+            let predictor = SpacetimeSimplePredictor {
+                metric: GeoMetric,
+                coords: &coords,
+                values: &values_real,
+                variogram: vg,
+                mean: mean as Real,
+            };
+            st_run_cv_with_predictor(&predictor, opts.k)
+        }
+        "universal" => {
+            if opts.values.len() != opts.lats.len() {
+                return Err(coded_err(
+                    "values must have the same length as lats/lons/times",
+                    "mismatched_arrays",
+                ));
+            }
+            let values_real: Vec<Real> = opts.values.iter().map(|v| *v as Real).collect();
+            let trend_str = opts.trend.as_deref().ok_or_else(|| {
+                coded_err(
+                    "trend is required for universal kriging CV",
+                    "invalid_input",
+                )
+            })?;
+            let trend = parse_universal_trend(trend_str)?;
+            let predictor = SpacetimeUniversalPredictor {
+                metric: GeoMetric,
+                coords: &coords,
+                values: &values_real,
+                variogram: vg,
+                trend,
+            };
+            st_run_cv_with_predictor(&predictor, opts.k)
+        }
+        "binomial" => {
+            if opts.lats.len() != opts.successes.len() || opts.lats.len() != opts.trials.len() {
+                return Err(coded_err(
+                    "lats, lons, times, successes, and trials must have the same length",
+                    "mismatched_arrays",
+                ));
+            }
+            let prior = parse_binomial_prior(opts.prior_alpha, opts.prior_beta)?;
+            let predictor = SpacetimeBinomialPredictor {
+                metric: GeoMetric,
+                coords: &coords,
+                successes: &opts.successes,
+                trials: &opts.trials,
+                variogram: vg,
+                prior,
+            };
+            st_run_binomial_cv_with_predictor(&predictor, opts.k)
+        }
+        other => Err(coded_err(
+            &format!("unsupported spacetime CV family {other:?}"),
+            "invalid_input",
+        )),
+    }
+}
+
+fn st_run_cv_with_predictor<P: crate::cv::KrigingPredictor<Residual = crate::cv::CvResidual>>(
+    predictor: &P,
+    k: Option<usize>,
+) -> Result<JsValue, JsValue> {
+    let residuals = match k {
+        None => leave_one_out_cv(predictor).map_err(kriging_err_to_js)?,
+        Some(k) => k_fold_cv(predictor, k).map_err(kriging_err_to_js)?,
+    };
+    cv_result_to_js(residuals)
+}
+
+fn st_run_binomial_cv_with_predictor<
+    P: crate::cv::KrigingPredictor<Residual = crate::cv::BinomialCvResidual>,
+>(
+    predictor: &P,
+    k: Option<usize>,
+) -> Result<JsValue, JsValue> {
+    let residuals = match k {
+        None => leave_one_out_cv(predictor).map_err(kriging_err_to_js)?,
+        Some(k) => k_fold_cv(predictor, k).map_err(kriging_err_to_js)?,
+    };
+    binomial_cv_result_to_js(residuals)
+}
+
+fn st_simulation_options(opts: &UnifiedSimulateOptions) -> crate::simulation::SimulationOptions {
+    crate::simulation::SimulationOptions {
+        seed: opts.seed,
+        target_order: opts
+            .target_order
+            .clone()
+            .map(|v| v.into_iter().map(|x| x as usize).collect()),
+    }
+}
+
+fn st_target_order_usize(opts: &UnifiedSimulateOptions) -> Option<Vec<usize>> {
+    opts.target_order
+        .clone()
+        .map(|v| v.into_iter().map(|x| x as usize).collect())
+}
+
+pub(super) fn run_spacetime_simulate(opts: &UnifiedSimulateOptions) -> Result<JsValue, JsValue> {
+    if opts.conditioning_values.len() != opts.conditioning_lats.len() && opts.family != "binomial" {
+        return Err(coded_err(
+            "conditioningValues must match conditioning lats/lons/times length",
+            "mismatched_arrays",
+        ));
+    }
+    let cond_coords = st_build_geo_coords(
+        &opts.conditioning_lats,
+        &opts.conditioning_lons,
+        &opts.conditioning_times,
+    )?;
+    let targets = st_build_geo_coords(&opts.target_lats, &opts.target_lons, &opts.target_times)?;
+    let family = opts.space_time_family.as_deref().ok_or_else(|| {
+        coded_err(
+            "spaceTimeFamily is required for spacetime simulation",
+            "invalid_input",
+        )
+    })?;
+    let spatial_type = opts.spatial_type.as_deref().ok_or_else(|| {
+        coded_err(
+            "spatialType is required for spacetime simulation",
+            "invalid_input",
+        )
+    })?;
+    let temporal_type = opts.temporal_type.as_deref().ok_or_else(|| {
+        coded_err(
+            "temporalType is required for spacetime simulation",
+            "invalid_input",
+        )
+    })?;
+    let vg = st_parse_spacetime_variogram_all(
+        family,
+        spatial_type,
+        opts.spatial_nugget.unwrap_or(0.0),
+        opts.spatial_sill.ok_or_else(|| {
+            coded_err(
+                "spatialSill is required for spacetime simulation",
+                "invalid_input",
+            )
+        })?,
+        opts.spatial_range.ok_or_else(|| {
+            coded_err(
+                "spatialRange is required for spacetime simulation",
+                "invalid_input",
+            )
+        })?,
+        opts.spatial_shape,
+        temporal_type,
+        opts.temporal_nugget.unwrap_or(0.0),
+        opts.temporal_sill.ok_or_else(|| {
+            coded_err(
+                "temporalSill is required for spacetime simulation",
+                "invalid_input",
+            )
+        })?,
+        opts.temporal_range.ok_or_else(|| {
+            coded_err(
+                "temporalRange is required for spacetime simulation",
+                "invalid_input",
+            )
+        })?,
+        opts.temporal_shape,
+        opts.k1,
+        opts.k2,
+        opts.k3,
+    )?;
+
+    match opts.family.as_str() {
+        "ordinary" => {
+            let cond_values: Vec<Real> = opts
+                .conditioning_values
+                .iter()
+                .map(|v| *v as Real)
+                .collect();
+            let simulator =
+                SpacetimeOrdinarySimulator::new(GeoMetric, &cond_coords, &cond_values, vg)
+                    .map_err(kriging_err_to_js)?;
+            if opts.is_many() {
+                let samples = sequential_gaussian_simulate_many(
+                    simulator,
+                    &targets,
+                    opts.realization_count() as usize,
+                    opts.effective_base_seed(),
+                    st_target_order_usize(opts),
+                )
+                .map_err(kriging_err_to_js)?;
+                let samples_f64: Vec<f64> = samples.iter().map(|v| *v as f64).collect();
+                Ok(Float64Array::from(samples_f64.as_slice()).into())
+            } else {
+                let samples =
+                    sequential_gaussian_simulate(simulator, &targets, st_simulation_options(opts))
+                        .map_err(kriging_err_to_js)?;
+                let samples_f64: Vec<f64> = samples.iter().map(|v| *v as f64).collect();
+                Ok(Float64Array::from(samples_f64.as_slice()).into())
+            }
+        }
+        "simple" => {
+            if opts.conditioning_values.len() != opts.conditioning_lats.len() {
+                return Err(coded_err(
+                    "conditioningValues must match conditioningLats/Lons/Times length",
+                    "mismatched_arrays",
+                ));
+            }
+            let mean = opts.mean.ok_or_else(|| {
+                coded_err(
+                    "mean is required for simple kriging simulation",
+                    "invalid_input",
+                )
+            })?;
+            let cond_values: Vec<Real> = opts
+                .conditioning_values
+                .iter()
+                .map(|v| *v as Real)
+                .collect();
+            let simulator = SpacetimeSimpleSimulator::new(
+                GeoMetric,
+                &cond_coords,
+                &cond_values,
+                vg,
+                mean as Real,
+            )
+            .map_err(kriging_err_to_js)?;
+            let samples =
+                sequential_gaussian_simulate(simulator, &targets, st_simulation_options(opts))
+                    .map_err(kriging_err_to_js)?;
+            let samples_f64: Vec<f64> = samples.iter().map(|v| *v as f64).collect();
+            Ok(Float64Array::from(samples_f64.as_slice()).into())
+        }
+        "universal" => {
+            if opts.conditioning_values.len() != opts.conditioning_lats.len() {
+                return Err(coded_err(
+                    "conditioningValues must match conditioningLats/Lons/Times length",
+                    "mismatched_arrays",
+                ));
+            }
+            let trend_str = opts.trend.as_deref().ok_or_else(|| {
+                coded_err(
+                    "trend is required for universal kriging simulation",
+                    "invalid_input",
+                )
+            })?;
+            let cond_values: Vec<Real> = opts
+                .conditioning_values
+                .iter()
+                .map(|v| *v as Real)
+                .collect();
+            let trend = parse_universal_trend(trend_str)?;
+            let simulator =
+                SpacetimeUniversalSimulator::new(GeoMetric, &cond_coords, &cond_values, vg, trend)
+                    .map_err(kriging_err_to_js)?;
+            let samples =
+                sequential_gaussian_simulate(simulator, &targets, st_simulation_options(opts))
+                    .map_err(kriging_err_to_js)?;
+            let samples_f64: Vec<f64> = samples.iter().map(|v| *v as f64).collect();
+            Ok(Float64Array::from(samples_f64.as_slice()).into())
+        }
+        "binomial" => {
+            if opts.conditioning_lats.len() != opts.conditioning_successes.len()
+                || opts.conditioning_lats.len() != opts.conditioning_trials.len()
+            {
+                return Err(coded_err(
+                    "conditioning lats/lons/times, successes, and trials must have the same length",
+                    "mismatched_arrays",
+                ));
+            }
+            let prior = parse_binomial_prior(opts.prior_alpha, opts.prior_beta)?;
+            let simulator = SpacetimeBinomialSimulator::new(
+                GeoMetric,
+                &cond_coords,
+                &opts.conditioning_successes,
+                &opts.conditioning_trials,
+                vg,
+                prior,
+            )
+            .map_err(kriging_err_to_js)?;
+            if opts.is_many() {
+                let result = sequential_binomial_simulate_many(
+                    simulator,
+                    &targets,
+                    opts.realization_count() as usize,
+                    opts.effective_base_seed(),
+                    st_target_order_usize(opts),
+                )
+                .map_err(kriging_err_to_js)?;
+                binomial_many_simulation_to_js(result)
+            } else {
+                let result =
+                    sequential_binomial_simulate(simulator, &targets, st_simulation_options(opts))
+                        .map_err(kriging_err_to_js)?;
+                binomial_simulation_to_js(result)
+            }
+        }
+        other => Err(coded_err(
+            &format!("unsupported spacetime simulation family {other:?}"),
+            "invalid_input",
+        )),
+    }
+}
+
 fn st_build_geo_coords(
     lats: &[f64],
     lons: &[f64],
@@ -1343,920 +1895,4 @@ fn st_parse_spacetime_variogram_all(
         k2,
         k3,
     )
-}
-
-/// Leave-one-out CV for space-time ordinary kriging on geographic coordinates.
-#[wasm_bindgen(js_name = leaveOneOutSpaceTime)]
-pub fn wasm_leave_one_out_spacetime(
-    lats: &[f64],
-    lons: &[f64],
-    times: &[f64],
-    values: &[f64],
-    family: &str,
-    spatial_type: &str,
-    spatial_nugget: f64,
-    spatial_sill: f64,
-    spatial_range: f64,
-    spatial_shape: Option<f64>,
-    temporal_type: &str,
-    temporal_nugget: f64,
-    temporal_sill: f64,
-    temporal_range: f64,
-    temporal_shape: Option<f64>,
-    k1: Option<f64>,
-    k2: Option<f64>,
-    k3: Option<f64>,
-) -> Result<JsValue, JsValue> {
-    if values.len() != lats.len() {
-        return Err(coded_err(
-            "values must have the same length as lats/lons/times",
-            "mismatched_arrays",
-        ));
-    }
-    let coords = st_build_geo_coords(lats, lons, times)?;
-    let values_real: Vec<Real> = values.iter().map(|v| *v as Real).collect();
-    let vg = st_parse_spacetime_variogram_all(
-        family,
-        spatial_type,
-        spatial_nugget,
-        spatial_sill,
-        spatial_range,
-        spatial_shape,
-        temporal_type,
-        temporal_nugget,
-        temporal_sill,
-        temporal_range,
-        temporal_shape,
-        k1,
-        k2,
-        k3,
-    )?;
-    let residuals = leave_one_out_cv(&SpacetimeOrdinaryPredictor {
-        metric: GeoMetric,
-        coords: &coords,
-        values: &values_real,
-        variogram: vg,
-    })
-    .map_err(kriging_err_to_js)?;
-    cv_result_to_js(residuals)
-}
-
-/// K-fold CV for space-time ordinary kriging on geographic coordinates.
-#[wasm_bindgen(js_name = kFoldSpaceTime)]
-pub fn wasm_k_fold_spacetime(
-    lats: &[f64],
-    lons: &[f64],
-    times: &[f64],
-    values: &[f64],
-    k: usize,
-    family: &str,
-    spatial_type: &str,
-    spatial_nugget: f64,
-    spatial_sill: f64,
-    spatial_range: f64,
-    spatial_shape: Option<f64>,
-    temporal_type: &str,
-    temporal_nugget: f64,
-    temporal_sill: f64,
-    temporal_range: f64,
-    temporal_shape: Option<f64>,
-    k1: Option<f64>,
-    k2: Option<f64>,
-    k3: Option<f64>,
-) -> Result<JsValue, JsValue> {
-    if values.len() != lats.len() {
-        return Err(coded_err(
-            "values must have the same length as lats/lons/times",
-            "mismatched_arrays",
-        ));
-    }
-    let coords = st_build_geo_coords(lats, lons, times)?;
-    let values_real: Vec<Real> = values.iter().map(|v| *v as Real).collect();
-    let vg = st_parse_spacetime_variogram_all(
-        family,
-        spatial_type,
-        spatial_nugget,
-        spatial_sill,
-        spatial_range,
-        spatial_shape,
-        temporal_type,
-        temporal_nugget,
-        temporal_sill,
-        temporal_range,
-        temporal_shape,
-        k1,
-        k2,
-        k3,
-    )?;
-    let residuals = k_fold_cv(
-        &SpacetimeOrdinaryPredictor {
-            metric: GeoMetric,
-            coords: &coords,
-            values: &values_real,
-            variogram: vg,
-        },
-        k,
-    )
-    .map_err(kriging_err_to_js)?;
-    cv_result_to_js(residuals)
-}
-
-/// Leave-one-out CV for space-time simple kriging (known `mean`).
-#[wasm_bindgen(js_name = leaveOneOutSpaceTimeSimple)]
-pub fn wasm_leave_one_out_spacetime_simple(
-    lats: &[f64],
-    lons: &[f64],
-    times: &[f64],
-    values: &[f64],
-    mean: f64,
-    family: &str,
-    spatial_type: &str,
-    spatial_nugget: f64,
-    spatial_sill: f64,
-    spatial_range: f64,
-    spatial_shape: Option<f64>,
-    temporal_type: &str,
-    temporal_nugget: f64,
-    temporal_sill: f64,
-    temporal_range: f64,
-    temporal_shape: Option<f64>,
-    k1: Option<f64>,
-    k2: Option<f64>,
-    k3: Option<f64>,
-) -> Result<JsValue, JsValue> {
-    if values.len() != lats.len() {
-        return Err(coded_err(
-            "values must have the same length as lats/lons/times",
-            "mismatched_arrays",
-        ));
-    }
-    let coords = st_build_geo_coords(lats, lons, times)?;
-    let values_real: Vec<Real> = values.iter().map(|v| *v as Real).collect();
-    let vg = st_parse_spacetime_variogram_all(
-        family,
-        spatial_type,
-        spatial_nugget,
-        spatial_sill,
-        spatial_range,
-        spatial_shape,
-        temporal_type,
-        temporal_nugget,
-        temporal_sill,
-        temporal_range,
-        temporal_shape,
-        k1,
-        k2,
-        k3,
-    )?;
-    let residuals = leave_one_out_cv(&SpacetimeSimplePredictor {
-        metric: GeoMetric,
-        coords: &coords,
-        values: &values_real,
-        variogram: vg,
-        mean: mean as Real,
-    })
-    .map_err(kriging_err_to_js)?;
-    cv_result_to_js(residuals)
-}
-
-/// K-fold CV for space-time simple kriging (known `mean`).
-#[wasm_bindgen(js_name = kFoldSpaceTimeSimple)]
-pub fn wasm_k_fold_spacetime_simple(
-    lats: &[f64],
-    lons: &[f64],
-    times: &[f64],
-    values: &[f64],
-    mean: f64,
-    k: usize,
-    family: &str,
-    spatial_type: &str,
-    spatial_nugget: f64,
-    spatial_sill: f64,
-    spatial_range: f64,
-    spatial_shape: Option<f64>,
-    temporal_type: &str,
-    temporal_nugget: f64,
-    temporal_sill: f64,
-    temporal_range: f64,
-    temporal_shape: Option<f64>,
-    k1: Option<f64>,
-    k2: Option<f64>,
-    k3: Option<f64>,
-) -> Result<JsValue, JsValue> {
-    if values.len() != lats.len() {
-        return Err(coded_err(
-            "values must have the same length as lats/lons/times",
-            "mismatched_arrays",
-        ));
-    }
-    let coords = st_build_geo_coords(lats, lons, times)?;
-    let values_real: Vec<Real> = values.iter().map(|v| *v as Real).collect();
-    let vg = st_parse_spacetime_variogram_all(
-        family,
-        spatial_type,
-        spatial_nugget,
-        spatial_sill,
-        spatial_range,
-        spatial_shape,
-        temporal_type,
-        temporal_nugget,
-        temporal_sill,
-        temporal_range,
-        temporal_shape,
-        k1,
-        k2,
-        k3,
-    )?;
-    let residuals = k_fold_cv(
-        &SpacetimeSimplePredictor {
-            metric: GeoMetric,
-            coords: &coords,
-            values: &values_real,
-            variogram: vg,
-            mean: mean as Real,
-        },
-        k,
-    )
-    .map_err(kriging_err_to_js)?;
-    cv_result_to_js(residuals)
-}
-
-/// Leave-one-out CV for space-time universal kriging with a named polynomial trend.
-#[wasm_bindgen(js_name = leaveOneOutSpaceTimeUniversal)]
-pub fn wasm_leave_one_out_spacetime_universal(
-    lats: &[f64],
-    lons: &[f64],
-    times: &[f64],
-    values: &[f64],
-    trend: &str,
-    family: &str,
-    spatial_type: &str,
-    spatial_nugget: f64,
-    spatial_sill: f64,
-    spatial_range: f64,
-    spatial_shape: Option<f64>,
-    temporal_type: &str,
-    temporal_nugget: f64,
-    temporal_sill: f64,
-    temporal_range: f64,
-    temporal_shape: Option<f64>,
-    k1: Option<f64>,
-    k2: Option<f64>,
-    k3: Option<f64>,
-) -> Result<JsValue, JsValue> {
-    if values.len() != lats.len() {
-        return Err(coded_err(
-            "values must have the same length as lats/lons/times",
-            "mismatched_arrays",
-        ));
-    }
-    let coords = st_build_geo_coords(lats, lons, times)?;
-    let values_real: Vec<Real> = values.iter().map(|v| *v as Real).collect();
-    let vg = st_parse_spacetime_variogram_all(
-        family,
-        spatial_type,
-        spatial_nugget,
-        spatial_sill,
-        spatial_range,
-        spatial_shape,
-        temporal_type,
-        temporal_nugget,
-        temporal_sill,
-        temporal_range,
-        temporal_shape,
-        k1,
-        k2,
-        k3,
-    )?;
-    let trend = parse_universal_trend(trend)?;
-    let residuals = leave_one_out_cv(&SpacetimeUniversalPredictor {
-        metric: GeoMetric,
-        coords: &coords,
-        values: &values_real,
-        variogram: vg,
-        trend,
-    })
-    .map_err(kriging_err_to_js)?;
-    cv_result_to_js(residuals)
-}
-
-/// K-fold CV for space-time universal kriging with a named polynomial trend.
-#[wasm_bindgen(js_name = kFoldSpaceTimeUniversal)]
-pub fn wasm_k_fold_spacetime_universal(
-    lats: &[f64],
-    lons: &[f64],
-    times: &[f64],
-    values: &[f64],
-    trend: &str,
-    k: usize,
-    family: &str,
-    spatial_type: &str,
-    spatial_nugget: f64,
-    spatial_sill: f64,
-    spatial_range: f64,
-    spatial_shape: Option<f64>,
-    temporal_type: &str,
-    temporal_nugget: f64,
-    temporal_sill: f64,
-    temporal_range: f64,
-    temporal_shape: Option<f64>,
-    k1: Option<f64>,
-    k2: Option<f64>,
-    k3: Option<f64>,
-) -> Result<JsValue, JsValue> {
-    if values.len() != lats.len() {
-        return Err(coded_err(
-            "values must have the same length as lats/lons/times",
-            "mismatched_arrays",
-        ));
-    }
-    let coords = st_build_geo_coords(lats, lons, times)?;
-    let values_real: Vec<Real> = values.iter().map(|v| *v as Real).collect();
-    let vg = st_parse_spacetime_variogram_all(
-        family,
-        spatial_type,
-        spatial_nugget,
-        spatial_sill,
-        spatial_range,
-        spatial_shape,
-        temporal_type,
-        temporal_nugget,
-        temporal_sill,
-        temporal_range,
-        temporal_shape,
-        k1,
-        k2,
-        k3,
-    )?;
-    let trend = parse_universal_trend(trend)?;
-    let residuals = k_fold_cv(
-        &SpacetimeUniversalPredictor {
-            metric: GeoMetric,
-            coords: &coords,
-            values: &values_real,
-            variogram: vg,
-            trend,
-        },
-        k,
-    )
-    .map_err(kriging_err_to_js)?;
-    cv_result_to_js(residuals)
-}
-
-/// Leave-one-out CV for space-time binomial kriging. Returns dual-scale residuals.
-#[wasm_bindgen(js_name = leaveOneOutSpaceTimeBinomial)]
-pub fn wasm_leave_one_out_spacetime_binomial(
-    lats: &[f64],
-    lons: &[f64],
-    times: &[f64],
-    successes: &[u32],
-    trials: &[u32],
-    family: &str,
-    spatial_type: &str,
-    spatial_nugget: f64,
-    spatial_sill: f64,
-    spatial_range: f64,
-    spatial_shape: Option<f64>,
-    temporal_type: &str,
-    temporal_nugget: f64,
-    temporal_sill: f64,
-    temporal_range: f64,
-    temporal_shape: Option<f64>,
-    k1: Option<f64>,
-    k2: Option<f64>,
-    k3: Option<f64>,
-    prior_alpha: Option<f64>,
-    prior_beta: Option<f64>,
-) -> Result<JsValue, JsValue> {
-    if lats.len() != lons.len()
-        || lats.len() != times.len()
-        || lats.len() != successes.len()
-        || lats.len() != trials.len()
-    {
-        return Err(coded_err(
-            "lats, lons, times, successes, and trials must all have the same length",
-            "mismatched_arrays",
-        ));
-    }
-    let coords = st_build_geo_coords(lats, lons, times)?;
-    let vg = st_parse_spacetime_variogram_all(
-        family,
-        spatial_type,
-        spatial_nugget,
-        spatial_sill,
-        spatial_range,
-        spatial_shape,
-        temporal_type,
-        temporal_nugget,
-        temporal_sill,
-        temporal_range,
-        temporal_shape,
-        k1,
-        k2,
-        k3,
-    )?;
-    let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
-    let residuals = leave_one_out_cv(&SpacetimeBinomialPredictor {
-        metric: GeoMetric,
-        coords: &coords,
-        successes,
-        trials,
-        variogram: vg,
-        prior,
-    })
-    .map_err(kriging_err_to_js)?;
-    binomial_cv_result_to_js(residuals)
-}
-
-/// K-fold CV for space-time binomial kriging. Returns dual-scale residuals.
-#[wasm_bindgen(js_name = kFoldSpaceTimeBinomial)]
-pub fn wasm_k_fold_spacetime_binomial(
-    lats: &[f64],
-    lons: &[f64],
-    times: &[f64],
-    successes: &[u32],
-    trials: &[u32],
-    k: usize,
-    family: &str,
-    spatial_type: &str,
-    spatial_nugget: f64,
-    spatial_sill: f64,
-    spatial_range: f64,
-    spatial_shape: Option<f64>,
-    temporal_type: &str,
-    temporal_nugget: f64,
-    temporal_sill: f64,
-    temporal_range: f64,
-    temporal_shape: Option<f64>,
-    k1: Option<f64>,
-    k2: Option<f64>,
-    k3: Option<f64>,
-    prior_alpha: Option<f64>,
-    prior_beta: Option<f64>,
-) -> Result<JsValue, JsValue> {
-    if lats.len() != lons.len()
-        || lats.len() != times.len()
-        || lats.len() != successes.len()
-        || lats.len() != trials.len()
-    {
-        return Err(coded_err(
-            "lats, lons, times, successes, and trials must all have the same length",
-            "mismatched_arrays",
-        ));
-    }
-    let coords = st_build_geo_coords(lats, lons, times)?;
-    let vg = st_parse_spacetime_variogram_all(
-        family,
-        spatial_type,
-        spatial_nugget,
-        spatial_sill,
-        spatial_range,
-        spatial_shape,
-        temporal_type,
-        temporal_nugget,
-        temporal_sill,
-        temporal_range,
-        temporal_shape,
-        k1,
-        k2,
-        k3,
-    )?;
-    let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
-    let residuals = k_fold_cv(
-        &SpacetimeBinomialPredictor {
-            metric: GeoMetric,
-            coords: &coords,
-            successes,
-            trials,
-            variogram: vg,
-            prior,
-        },
-        k,
-    )
-    .map_err(kriging_err_to_js)?;
-    binomial_cv_result_to_js(residuals)
-}
-
-// ---------------------------------------------------------------------------
-// Space–time conditional simulation
-// ---------------------------------------------------------------------------
-
-/// Sequential Gaussian simulation over space-time ordinary kriging on geographic
-/// coordinates. Returns a `Float64Array` of sampled values in input target order.
-#[wasm_bindgen(js_name = conditionalSimulateSpaceTime)]
-pub fn wasm_conditional_simulate_spacetime(
-    conditioning_lats: &[f64],
-    conditioning_lons: &[f64],
-    conditioning_times: &[f64],
-    conditioning_values: &[f64],
-    target_lats: &[f64],
-    target_lons: &[f64],
-    target_times: &[f64],
-    family: &str,
-    spatial_type: &str,
-    spatial_nugget: f64,
-    spatial_sill: f64,
-    spatial_range: f64,
-    spatial_shape: Option<f64>,
-    temporal_type: &str,
-    temporal_nugget: f64,
-    temporal_sill: f64,
-    temporal_range: f64,
-    temporal_shape: Option<f64>,
-    k1: Option<f64>,
-    k2: Option<f64>,
-    k3: Option<f64>,
-    seed: u64,
-    target_order: Option<Vec<u32>>,
-) -> Result<JsValue, JsValue> {
-    if conditioning_values.len() != conditioning_lats.len() {
-        return Err(coded_err(
-            "conditioningValues must match conditioning lats/lons/times length",
-            "mismatched_arrays",
-        ));
-    }
-    let cond_coords =
-        st_build_geo_coords(conditioning_lats, conditioning_lons, conditioning_times)?;
-    let cond_values: Vec<Real> = conditioning_values.iter().map(|v| *v as Real).collect();
-    let targets = st_build_geo_coords(target_lats, target_lons, target_times)?;
-    let vg = st_parse_spacetime_variogram_all(
-        family,
-        spatial_type,
-        spatial_nugget,
-        spatial_sill,
-        spatial_range,
-        spatial_shape,
-        temporal_type,
-        temporal_nugget,
-        temporal_sill,
-        temporal_range,
-        temporal_shape,
-        k1,
-        k2,
-        k3,
-    )?;
-    let options = parse_simulation_options(seed, target_order);
-    let samples = sequential_gaussian_simulate(
-        SpacetimeOrdinarySimulator::new(GeoMetric, &cond_coords, &cond_values, vg)
-            .map_err(kriging_err_to_js)?,
-        &targets,
-        options,
-    )
-    .map_err(kriging_err_to_js)?;
-    let samples_f64: Vec<f64> = samples.iter().map(|v| *v as f64).collect();
-    Ok(Float64Array::from(samples_f64.as_slice()).into())
-}
-
-/// SGS using space-time simple kriging with a known `mean`.
-#[wasm_bindgen(js_name = conditionalSimulateSpaceTimeSimple)]
-pub fn wasm_conditional_simulate_spacetime_simple(
-    conditioning_lats: &[f64],
-    conditioning_lons: &[f64],
-    conditioning_times: &[f64],
-    conditioning_values: &[f64],
-    target_lats: &[f64],
-    target_lons: &[f64],
-    target_times: &[f64],
-    mean: f64,
-    family: &str,
-    spatial_type: &str,
-    spatial_nugget: f64,
-    spatial_sill: f64,
-    spatial_range: f64,
-    spatial_shape: Option<f64>,
-    temporal_type: &str,
-    temporal_nugget: f64,
-    temporal_sill: f64,
-    temporal_range: f64,
-    temporal_shape: Option<f64>,
-    k1: Option<f64>,
-    k2: Option<f64>,
-    k3: Option<f64>,
-    seed: u64,
-    target_order: Option<Vec<u32>>,
-) -> Result<JsValue, JsValue> {
-    if conditioning_values.len() != conditioning_lats.len() {
-        return Err(coded_err(
-            "conditioningValues must match conditioning lats/lons/times length",
-            "mismatched_arrays",
-        ));
-    }
-    let cond_coords =
-        st_build_geo_coords(conditioning_lats, conditioning_lons, conditioning_times)?;
-    let cond_values: Vec<Real> = conditioning_values.iter().map(|v| *v as Real).collect();
-    let targets = st_build_geo_coords(target_lats, target_lons, target_times)?;
-    let vg = st_parse_spacetime_variogram_all(
-        family,
-        spatial_type,
-        spatial_nugget,
-        spatial_sill,
-        spatial_range,
-        spatial_shape,
-        temporal_type,
-        temporal_nugget,
-        temporal_sill,
-        temporal_range,
-        temporal_shape,
-        k1,
-        k2,
-        k3,
-    )?;
-    let options = parse_simulation_options(seed, target_order);
-    let samples = sequential_gaussian_simulate(
-        SpacetimeSimpleSimulator::new(GeoMetric, &cond_coords, &cond_values, vg, mean as Real)
-            .map_err(kriging_err_to_js)?,
-        &targets,
-        options,
-    )
-    .map_err(kriging_err_to_js)?;
-    let samples_f64: Vec<f64> = samples.iter().map(|v| *v as f64).collect();
-    Ok(Float64Array::from(samples_f64.as_slice()).into())
-}
-
-/// SGS using space-time universal kriging with a named polynomial `trend`.
-#[wasm_bindgen(js_name = conditionalSimulateSpaceTimeUniversal)]
-pub fn wasm_conditional_simulate_spacetime_universal(
-    conditioning_lats: &[f64],
-    conditioning_lons: &[f64],
-    conditioning_times: &[f64],
-    conditioning_values: &[f64],
-    target_lats: &[f64],
-    target_lons: &[f64],
-    target_times: &[f64],
-    trend: &str,
-    family: &str,
-    spatial_type: &str,
-    spatial_nugget: f64,
-    spatial_sill: f64,
-    spatial_range: f64,
-    spatial_shape: Option<f64>,
-    temporal_type: &str,
-    temporal_nugget: f64,
-    temporal_sill: f64,
-    temporal_range: f64,
-    temporal_shape: Option<f64>,
-    k1: Option<f64>,
-    k2: Option<f64>,
-    k3: Option<f64>,
-    seed: u64,
-    target_order: Option<Vec<u32>>,
-) -> Result<JsValue, JsValue> {
-    if conditioning_values.len() != conditioning_lats.len() {
-        return Err(coded_err(
-            "conditioningValues must match conditioning lats/lons/times length",
-            "mismatched_arrays",
-        ));
-    }
-    let cond_coords =
-        st_build_geo_coords(conditioning_lats, conditioning_lons, conditioning_times)?;
-    let cond_values: Vec<Real> = conditioning_values.iter().map(|v| *v as Real).collect();
-    let targets = st_build_geo_coords(target_lats, target_lons, target_times)?;
-    let vg = st_parse_spacetime_variogram_all(
-        family,
-        spatial_type,
-        spatial_nugget,
-        spatial_sill,
-        spatial_range,
-        spatial_shape,
-        temporal_type,
-        temporal_nugget,
-        temporal_sill,
-        temporal_range,
-        temporal_shape,
-        k1,
-        k2,
-        k3,
-    )?;
-    let trend = parse_universal_trend(trend)?;
-    let options = parse_simulation_options(seed, target_order);
-    let samples = sequential_gaussian_simulate(
-        SpacetimeUniversalSimulator::new(GeoMetric, &cond_coords, &cond_values, vg, trend)
-            .map_err(kriging_err_to_js)?,
-        &targets,
-        options,
-    )
-    .map_err(kriging_err_to_js)?;
-    let samples_f64: Vec<f64> = samples.iter().map(|v| *v as f64).collect();
-    Ok(Float64Array::from(samples_f64.as_slice()).into())
-}
-
-/// SGS for space-time binomial kriging. Returns an object with `logitSamples` and
-/// `prevalenceSamples` typed arrays in input target order.
-#[wasm_bindgen(js_name = conditionalSimulateSpaceTimeBinomial)]
-pub fn wasm_conditional_simulate_spacetime_binomial(
-    conditioning_lats: &[f64],
-    conditioning_lons: &[f64],
-    conditioning_times: &[f64],
-    successes: &[u32],
-    trials: &[u32],
-    target_lats: &[f64],
-    target_lons: &[f64],
-    target_times: &[f64],
-    family: &str,
-    spatial_type: &str,
-    spatial_nugget: f64,
-    spatial_sill: f64,
-    spatial_range: f64,
-    spatial_shape: Option<f64>,
-    temporal_type: &str,
-    temporal_nugget: f64,
-    temporal_sill: f64,
-    temporal_range: f64,
-    temporal_shape: Option<f64>,
-    k1: Option<f64>,
-    k2: Option<f64>,
-    k3: Option<f64>,
-    prior_alpha: Option<f64>,
-    prior_beta: Option<f64>,
-    seed: u64,
-    target_order: Option<Vec<u32>>,
-) -> Result<JsValue, JsValue> {
-    if conditioning_lats.len() != conditioning_lons.len()
-        || conditioning_lats.len() != conditioning_times.len()
-        || conditioning_lats.len() != successes.len()
-        || conditioning_lats.len() != trials.len()
-    {
-        return Err(coded_err(
-            "conditioning arrays (lats, lons, times, successes, trials) must have the same length",
-            "mismatched_arrays",
-        ));
-    }
-    let cond_coords =
-        st_build_geo_coords(conditioning_lats, conditioning_lons, conditioning_times)?;
-    let targets = st_build_geo_coords(target_lats, target_lons, target_times)?;
-    let vg = st_parse_spacetime_variogram_all(
-        family,
-        spatial_type,
-        spatial_nugget,
-        spatial_sill,
-        spatial_range,
-        spatial_shape,
-        temporal_type,
-        temporal_nugget,
-        temporal_sill,
-        temporal_range,
-        temporal_shape,
-        k1,
-        k2,
-        k3,
-    )?;
-    let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
-    let options = parse_simulation_options(seed, target_order);
-    let result = sequential_binomial_simulate(
-        SpacetimeBinomialSimulator::new(GeoMetric, &cond_coords, successes, trials, vg, prior)
-            .map_err(kriging_err_to_js)?,
-        &targets,
-        options,
-    )
-    .map_err(kriging_err_to_js)?;
-    binomial_simulation_to_js(result)
-}
-
-/// Multi-realization SGS over space-time ordinary kriging on geographic coordinates.
-/// Returns a flat row-major `Float64Array` of length `nRealizations * nTargets`. Row `k`
-/// matches a single-call `conditionalSimulateSpaceTime(seed = baseSeed + k, …)`.
-#[wasm_bindgen(js_name = conditionalSimulateSpaceTimeMany)]
-#[allow(clippy::too_many_arguments)]
-pub fn wasm_conditional_simulate_spacetime_many(
-    conditioning_lats: &[f64],
-    conditioning_lons: &[f64],
-    conditioning_times: &[f64],
-    conditioning_values: &[f64],
-    target_lats: &[f64],
-    target_lons: &[f64],
-    target_times: &[f64],
-    family: &str,
-    spatial_type: &str,
-    spatial_nugget: f64,
-    spatial_sill: f64,
-    spatial_range: f64,
-    spatial_shape: Option<f64>,
-    temporal_type: &str,
-    temporal_nugget: f64,
-    temporal_sill: f64,
-    temporal_range: f64,
-    temporal_shape: Option<f64>,
-    k1: Option<f64>,
-    k2: Option<f64>,
-    k3: Option<f64>,
-    n_realizations: u32,
-    base_seed: u64,
-    target_order: Option<Vec<u32>>,
-) -> Result<JsValue, JsValue> {
-    if conditioning_values.len() != conditioning_lats.len() {
-        return Err(coded_err(
-            "conditioningValues must match conditioning lats/lons/times length",
-            "mismatched_arrays",
-        ));
-    }
-    let cond_coords =
-        st_build_geo_coords(conditioning_lats, conditioning_lons, conditioning_times)?;
-    let cond_values: Vec<Real> = conditioning_values.iter().map(|v| *v as Real).collect();
-    let targets = st_build_geo_coords(target_lats, target_lons, target_times)?;
-    let vg = st_parse_spacetime_variogram_all(
-        family,
-        spatial_type,
-        spatial_nugget,
-        spatial_sill,
-        spatial_range,
-        spatial_shape,
-        temporal_type,
-        temporal_nugget,
-        temporal_sill,
-        temporal_range,
-        temporal_shape,
-        k1,
-        k2,
-        k3,
-    )?;
-    let order = target_order.map(|v| v.into_iter().map(|x| x as usize).collect());
-    let samples = sequential_gaussian_simulate_many(
-        SpacetimeOrdinarySimulator::new(GeoMetric, &cond_coords, &cond_values, vg)
-            .map_err(kriging_err_to_js)?,
-        &targets,
-        n_realizations as usize,
-        base_seed,
-        order,
-    )
-    .map_err(kriging_err_to_js)?;
-    let samples_f64: Vec<f64> = samples.iter().map(|v| *v as f64).collect();
-    Ok(Float64Array::from(samples_f64.as_slice()).into())
-}
-
-/// Multi-realization SGS for space-time binomial kriging. Returns an object with
-/// `nRealizations`, `nTargets`, and flat row-major `logitSamples` / `prevalenceSamples`
-/// `Float64Array`s. Row `k` matches a single-call
-/// `conditionalSimulateSpaceTimeBinomial(seed = baseSeed + k, …)`.
-#[wasm_bindgen(js_name = conditionalSimulateSpaceTimeManyBinomial)]
-#[allow(clippy::too_many_arguments)]
-pub fn wasm_conditional_simulate_spacetime_many_binomial(
-    conditioning_lats: &[f64],
-    conditioning_lons: &[f64],
-    conditioning_times: &[f64],
-    successes: &[u32],
-    trials: &[u32],
-    target_lats: &[f64],
-    target_lons: &[f64],
-    target_times: &[f64],
-    family: &str,
-    spatial_type: &str,
-    spatial_nugget: f64,
-    spatial_sill: f64,
-    spatial_range: f64,
-    spatial_shape: Option<f64>,
-    temporal_type: &str,
-    temporal_nugget: f64,
-    temporal_sill: f64,
-    temporal_range: f64,
-    temporal_shape: Option<f64>,
-    k1: Option<f64>,
-    k2: Option<f64>,
-    k3: Option<f64>,
-    prior_alpha: Option<f64>,
-    prior_beta: Option<f64>,
-    n_realizations: u32,
-    base_seed: u64,
-    target_order: Option<Vec<u32>>,
-) -> Result<JsValue, JsValue> {
-    if conditioning_lats.len() != conditioning_lons.len()
-        || conditioning_lats.len() != conditioning_times.len()
-        || conditioning_lats.len() != successes.len()
-        || conditioning_lats.len() != trials.len()
-    {
-        return Err(coded_err(
-            "conditioning arrays (lats, lons, times, successes, trials) must have the same length",
-            "mismatched_arrays",
-        ));
-    }
-    let cond_coords =
-        st_build_geo_coords(conditioning_lats, conditioning_lons, conditioning_times)?;
-    let targets = st_build_geo_coords(target_lats, target_lons, target_times)?;
-    let vg = st_parse_spacetime_variogram_all(
-        family,
-        spatial_type,
-        spatial_nugget,
-        spatial_sill,
-        spatial_range,
-        spatial_shape,
-        temporal_type,
-        temporal_nugget,
-        temporal_sill,
-        temporal_range,
-        temporal_shape,
-        k1,
-        k2,
-        k3,
-    )?;
-    let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
-    let order = target_order.map(|v| v.into_iter().map(|x| x as usize).collect());
-    let result = sequential_binomial_simulate_many(
-        SpacetimeBinomialSimulator::new(GeoMetric, &cond_coords, successes, trials, vg, prior)
-            .map_err(kriging_err_to_js)?,
-        &targets,
-        n_realizations as usize,
-        base_seed,
-        order,
-    )
-    .map_err(kriging_err_to_js)?;
-    binomial_many_simulation_to_js(result)
 }

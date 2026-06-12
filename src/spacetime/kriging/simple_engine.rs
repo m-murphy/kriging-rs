@@ -45,6 +45,10 @@ impl<M: SpatialMetric> SpaceTimeSimpleKrigingEngine<M> {
         self.mean
     }
 
+    pub fn variogram(&self) -> SpaceTimeVariogram {
+        self.variogram
+    }
+
     pub fn fit_with_extra_diagonal(
         metric: M,
         coords: Vec<SpaceTimeCoord<M::Coord>>,

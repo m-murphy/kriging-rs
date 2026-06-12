@@ -105,6 +105,27 @@ impl UniversalKrigingModel {
         self.trend
     }
 
+    pub fn coords(&self) -> &[GeoCoord] {
+        match &self.inner {
+            UniversalKrigingInner::Constant(engine) => engine.coords(),
+            UniversalKrigingInner::Drift(engine) => engine.coords(),
+        }
+    }
+
+    pub fn values(&self) -> &[Real] {
+        match &self.inner {
+            UniversalKrigingInner::Constant(engine) => engine.values(),
+            UniversalKrigingInner::Drift(engine) => engine.values(),
+        }
+    }
+
+    pub fn variogram(&self) -> VariogramModel {
+        match &self.inner {
+            UniversalKrigingInner::Constant(engine) => engine.variogram(),
+            UniversalKrigingInner::Drift(engine) => engine.variogram(),
+        }
+    }
+
     pub fn predict(&self, coord: GeoCoord) -> Result<Prediction, KrigingError> {
         match &self.inner {
             UniversalKrigingInner::Constant(engine) => engine

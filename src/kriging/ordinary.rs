@@ -154,6 +154,14 @@ impl OrdinaryKrigingModel {
         self.engine.variogram()
     }
 
+    pub fn coords(&self) -> &[GeoCoord] {
+        self.engine.coords()
+    }
+
+    pub fn values(&self) -> &[Real] {
+        self.engine.values()
+    }
+
     /// Number of training stations.
     pub fn len(&self) -> usize {
         self.engine.len()

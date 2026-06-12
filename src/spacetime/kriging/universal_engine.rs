@@ -101,6 +101,10 @@ impl<M: SpatialBasis> SpaceTimeUniversalKrigingEngine<M> {
         })
     }
 
+    pub fn variogram(&self) -> SpaceTimeVariogram {
+        self.variogram
+    }
+
     pub fn predict(
         &self,
         targets: &[SpaceTimeCoord<M::Coord>],

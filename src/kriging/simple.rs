@@ -46,6 +46,18 @@ impl SimpleKrigingModel {
         self.engine.mean()
     }
 
+    pub fn coords(&self) -> &[GeoCoord] {
+        self.engine.coords()
+    }
+
+    pub fn values(&self) -> Vec<Real> {
+        self.engine.observed_values()
+    }
+
+    pub fn variogram(&self) -> VariogramModel {
+        self.engine.variogram()
+    }
+
     /// Predict at a single target.
     pub fn predict(&self, coord: GeoCoord) -> Result<Prediction, KrigingError> {
         self.engine

@@ -338,6 +338,14 @@ impl ProjectedKrigingModel {
         self.engine.metric().anisotropy
     }
 
+    pub fn coords(&self) -> &[ProjectedCoord] {
+        self.engine.coords()
+    }
+
+    pub fn values(&self) -> &[Real] {
+        self.engine.values()
+    }
+
     pub fn variogram(&self) -> VariogramModel {
         self.engine.variogram()
     }

@@ -37,6 +37,11 @@ impl<M: SpatialMetric> SpaceTimeSimpleKrigingModel<M> {
         self.engine.mean()
     }
 
+    /// Space–time variogram used by the model.
+    pub fn variogram(&self) -> SpaceTimeVariogram {
+        self.engine.variogram()
+    }
+
     pub fn predict(&self, target: SpaceTimeCoord<M::Coord>) -> Result<Prediction, KrigingError> {
         self.engine
             .predict(&[target])

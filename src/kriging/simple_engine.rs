@@ -43,6 +43,15 @@ impl<M: SpatialMetric> SimpleKrigingEngine<M> {
         self.mean
     }
 
+    pub fn variogram(&self) -> VariogramModel {
+        self.variogram
+    }
+
+    /// Original observations (not mean-centered residuals).
+    pub fn observed_values(&self) -> Vec<Real> {
+        self.residuals.iter().map(|&r| r + self.mean).collect()
+    }
+
     pub fn fit_with_extra_diagonal(
         metric: M,
         coords: Vec<M::Coord>,
