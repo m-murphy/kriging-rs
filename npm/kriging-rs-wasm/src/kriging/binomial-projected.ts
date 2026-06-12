@@ -290,6 +290,10 @@ export class BinomialProjectedKriging {
     );
   }
 
+  /**
+   * Leave-one-out CV on **this fitted model** (same training data and variogram).
+   * Prefer {@link leaveOneOut} when validating from raw arrays before building a model.
+   */
   leaveOneOut(): BinomialCvResult {
     return binomialLeaveOneOut(
       requireBinomialHandle(this.inner, PROJECTED_BINOMIAL_FREED),
@@ -297,6 +301,10 @@ export class BinomialProjectedKriging {
     );
   }
 
+  /**
+   * K-fold CV on **this fitted model** (deterministic round-robin folds).
+   * Prefer {@link kFold} when validating from raw arrays before building a model.
+   */
   kFold(k: number): BinomialCvResult {
     return binomialKFold(
       requireBinomialHandle(this.inner, PROJECTED_BINOMIAL_FREED),

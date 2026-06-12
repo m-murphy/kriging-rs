@@ -1,6 +1,11 @@
 /**
  * Binomial kriging: prevalence / proportion surfaces from count data (successes/trials).
  *
+ * Use {@link BinomialKriging} for global lat/lon (Haversine). Use
+ * {@link BinomialProjectedKriging} when data are already in a planar projection with
+ * known anisotropy. Reserve {@link BinomialTangentPlaneKriging} for small regional
+ * windows where equirectangular km + anisotropy is preferable to full-sphere Haversine.
+ *
  * @module
  */
 
@@ -316,6 +321,10 @@ export class BinomialKriging {
     );
   }
 
+  /**
+   * Leave-one-out CV on **this fitted model** (same training data and variogram).
+   * Prefer {@link leaveOneOut} when validating from raw arrays before building a model.
+   */
   leaveOneOut(): BinomialCvResult {
     return binomialLeaveOneOut(
       requireBinomialHandle(this.inner, BINOMIAL_FREED),
@@ -323,6 +332,10 @@ export class BinomialKriging {
     );
   }
 
+  /**
+   * K-fold CV on **this fitted model** (deterministic round-robin folds).
+   * Prefer {@link kFold} when validating from raw arrays before building a model.
+   */
   kFold(k: number): BinomialCvResult {
     return binomialKFold(
       requireBinomialHandle(this.inner, BINOMIAL_FREED),

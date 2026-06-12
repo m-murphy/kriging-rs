@@ -124,10 +124,18 @@ export class SpaceTimeUniversalKriging {
     return mapOrdinaryBatchArrayOutput(out);
   }
 
+  /**
+   * Leave-one-out CV on **this fitted model** (same training data and variogram).
+   * Prefer {@link leaveOneOut} when validating from raw arrays before building a model.
+   */
   leaveOneOut(): CvResult {
     return modelLeaveOneOut(this.requireInner(), "universal") as CvResult;
   }
 
+  /**
+   * K-fold CV on **this fitted model** (deterministic round-robin folds).
+   * Prefer {@link kFold} when validating from raw arrays before building a model.
+   */
   kFold(k: number): CvResult {
     return modelKFold(this.requireInner(), k, "universal") as CvResult;
   }

@@ -457,6 +457,10 @@ export class SpaceTimeBinomialKriging {
     return this.predictGridAtTime({ ...options, time });
   }
 
+  /**
+   * Leave-one-out CV on **this fitted model** (same training data and variogram).
+   * Prefer {@link leaveOneOut} when validating from raw arrays before building a model.
+   */
   leaveOneOut(): BinomialCvResult {
     return binomialLeaveOneOut(
       requireBinomialHandle(this.inner, FREED),
@@ -464,6 +468,10 @@ export class SpaceTimeBinomialKriging {
     );
   }
 
+  /**
+   * K-fold CV on **this fitted model** (deterministic round-robin folds).
+   * Prefer {@link kFold} when validating from raw arrays before building a model.
+   */
   kFold(k: number): BinomialCvResult {
     return binomialKFold(requireBinomialHandle(this.inner, FREED), FREED, k);
   }

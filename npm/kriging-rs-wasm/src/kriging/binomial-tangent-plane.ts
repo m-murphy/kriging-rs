@@ -2,6 +2,11 @@
  * Geographic binomial kriging on a **local tangent plane** (equirectangular km coordinates)
  * with optional 2-D geometric anisotropy.
  *
+ * **Advanced / regional use only.** Prefer {@link BinomialKriging} (global Haversine) or
+ * {@link BinomialProjectedKriging} (user-supplied planar coordinates). Reach for this
+ * class when your study area is small enough that a tangent-plane approximation plus
+ * anisotropy is more appropriate than Haversine, but you still want to pass lat/lon inputs.
+ *
  * @module
  */
 
@@ -190,10 +195,18 @@ export class BinomialTangentPlaneKriging {
     );
   }
 
+  /**
+   * Leave-one-out CV on **this fitted model** (same training data and variogram).
+   * Prefer {@link leaveOneOut} when validating from raw arrays before building a model.
+   */
   leaveOneOut(): BinomialCvResult {
     return binomialLeaveOneOut(requireBinomialHandle(this.inner, FREED), FREED);
   }
 
+  /**
+   * K-fold CV on **this fitted model** (deterministic round-robin folds).
+   * Prefer {@link kFold} when validating from raw arrays before building a model.
+   */
   kFold(k: number): BinomialCvResult {
     return binomialKFold(requireBinomialHandle(this.inner, FREED), FREED, k);
   }
