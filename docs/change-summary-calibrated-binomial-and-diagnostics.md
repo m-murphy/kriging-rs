@@ -93,7 +93,7 @@ The work clusters into five themes:
 ### 3.11 Minor
 
 - **`src/matrix.rs`** — tiny related fix (e.g. conditioning / numerical edge).
-- **`CHANGELOG.md`** — **0.5.0** entry: dual SPD, predictor/simulator API, migration notes.
+- **`CHANGELOG.md`** — **0.4.0** entry: dual SPD, predictor/simulator API, migration notes.
 
 ---
 
