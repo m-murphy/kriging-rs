@@ -131,7 +131,6 @@ export type {
   InterpolateBinomialToGridOptions,
   InterpolateBinomialToGridResult,
   InterpolateOrdinaryToGridOptions,
-  KFoldOptions,
   KrigingErrorCode,
   KrigingFamily,
   KrigingGeometry,
