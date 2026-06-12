@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Size-independent diagonal jitter** — `kriging_diagonal_jitter` / `spacetime_diagonal_jitter` no longer
+  scale with `√n`, so incremental Cholesky extend/downdate and LOO CV stay consistent when the
+  conditioning set grows or shrinks by one station.
+- **Fast LOO CV (ordinary / simple / ST ordinary)** — `leave_one_out_predictions` on the dual-SPD
+  engines deletes one station from the fitted Cholesky factor per hold-out via O(n²) rank-one
+  downdate (Krause & Igel 2015) instead of refitting each fold from scratch. Constant-trend
+  universal CV delegates to the ordinary fast path.
+
 ## [0.5.0] - 2026-06-12
 
 ### Added
