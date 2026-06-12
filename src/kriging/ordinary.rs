@@ -1,13 +1,13 @@
-use std::sync::Arc;
-
-use nalgebra::{DMatrix, DVector, Dyn, linalg::LU};
+use nalgebra::{DMatrix, DVector};
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 use crate::Real;
-use crate::distance::{GeoCoord, PreparedGeoCoord, haversine_distance_prepared, prepare_geo_coord};
+use crate::distance::{GeoCoord, haversine_distance_prepared, prepare_geo_coord};
 use crate::error::KrigingError;
 use crate::geo_dataset::GeoDataset;
+use crate::kriging::engine::OrdinaryKrigingEngine;
+use crate::spacetime::metric::GeoMetric;
 use crate::variogram::models::{VariogramModel, VariogramType};
 
 /// Result of a single kriging prediction: the interpolated value and the kriging variance.
@@ -74,39 +74,10 @@ impl Neighborhood {
 ///
 /// For per-station observation noise in addition to the nugget and numerical jitter, use
 /// [`new_with_extra_diagonal`](Self::new_with_extra_diagonal).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OrdinaryKrigingModel {
-    coords: Vec<GeoCoord>,
-    prepared_coords: Vec<PreparedGeoCoord>,
-    values: Vec<Real>,
-    variogram: VariogramModel,
-    /// Non-negative extra variance per station, added to the main diagonal of the
-    /// covariance (same units as the `sill`). Empty means homoscedastic: no extra
-    /// diagonal. When set, the slice length must equal the number of stations.
-    observation_diagonal: Vec<Real>,
-    cov_at_zero: Real,
-    system: DMatrix<Real>,
-    /// Shared LU factorization. Wrapped in `Arc` so `Clone` is `O(1)` instead of
-    /// re-running the factorization (which is `O(n³)` and the dominant cost at
-    /// construction time).
-    system_lu: Arc<LU<Real, Dyn, Dyn>>,
+    engine: OrdinaryKrigingEngine<GeoMetric>,
     neighborhood: Option<Neighborhood>,
-}
-
-impl Clone for OrdinaryKrigingModel {
-    fn clone(&self) -> Self {
-        Self {
-            coords: self.coords.clone(),
-            prepared_coords: self.prepared_coords.clone(),
-            values: self.values.clone(),
-            variogram: self.variogram,
-            cov_at_zero: self.cov_at_zero,
-            observation_diagonal: self.observation_diagonal.clone(),
-            system: self.system.clone(),
-            system_lu: Arc::clone(&self.system_lu),
-            neighborhood: self.neighborhood,
-        }
-    }
 }
 
 impl OrdinaryKrigingModel {
@@ -139,9 +110,7 @@ impl OrdinaryKrigingModel {
                 ));
             }
         }
-        let mut s = Self::new_with_extra_diagonal_internal(dataset, variogram, &extra)?;
-        s.observation_diagonal = extra;
-        Ok(s)
+        Self::new_with_extra_diagonal_internal(dataset, variogram, &extra)
     }
 
     fn new_with_extra_diagonal_internal(
@@ -150,38 +119,11 @@ impl OrdinaryKrigingModel {
         extra: &[Real],
     ) -> Result<Self, KrigingError> {
         let (coords, values) = dataset.into_parts();
-        let n = coords.len();
-        if !extra.is_empty() && extra.len() != n {
-            return Err(KrigingError::InvalidInput(
-                "internal: extra length mismatch for ordinary kriging".to_string(),
-            ));
-        }
-        debug_assert!(extra.is_empty() || extra.len() == n);
-        let prepared_coords = coords
-            .iter()
-            .copied()
-            .map(prepare_geo_coord)
-            .collect::<Vec<_>>();
-
-        let system = build_ordinary_system(&prepared_coords, variogram, extra);
-        let system_lu = Arc::new(system.clone().lu());
-        // Validate solvability up front so prediction failures are not deferred.
-        let mut probe_rhs = DVector::from_element(coords.len() + 1, 0.0);
-        probe_rhs[coords.len()] = 1.0;
-        if system_lu.solve(&probe_rhs).is_none() {
-            return Err(KrigingError::MatrixError(
-                "could not factorize ordinary kriging system".to_string(),
-            ));
-        }
+        let engine = OrdinaryKrigingEngine::fit_with_extra_diagonal(
+            GeoMetric, coords, values, variogram, extra,
+        )?;
         Ok(Self {
-            coords,
-            prepared_coords,
-            values,
-            variogram,
-            observation_diagonal: Vec::new(),
-            cov_at_zero: variogram.covariance(0.0),
-            system,
-            system_lu,
+            engine,
             neighborhood: None,
         })
     }
@@ -207,12 +149,27 @@ impl OrdinaryKrigingModel {
         self.neighborhood
     }
 
+    /// Variogram used when fitting this model.
+    pub fn variogram(&self) -> VariogramModel {
+        self.engine.variogram()
+    }
+
+    /// Number of training stations.
+    pub fn len(&self) -> usize {
+        self.engine.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn predict(&self, coord: GeoCoord) -> Result<Prediction, KrigingError> {
         if self.neighborhood.is_some() {
             return self.predict_local(coord);
         }
-        let mut rhs = DVector::from_element(self.coords.len() + 1, 0.0);
-        self.predict_with_rhs(coord, &mut rhs)
+        self.engine
+            .predict(&[coord])
+            .map(|mut v| v.pop().expect("single prediction"))
     }
 
     pub fn predict_batch(&self, coords: &[GeoCoord]) -> Result<Vec<Prediction>, KrigingError> {
@@ -233,29 +190,7 @@ impl OrdinaryKrigingModel {
                 return Ok(out);
             }
         }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let n = self.coords.len();
-            // `map_init` gives each rayon worker its own RHS buffer that's reused across
-            // the targets it processes, avoiding per-prediction `DVector` allocations.
-            coords
-                .par_iter()
-                .map_init(
-                    || DVector::<Real>::from_element(n + 1, 0.0),
-                    |rhs, coord| self.predict_with_rhs(*coord, rhs),
-                )
-                .collect()
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            let mut rhs = DVector::from_element(self.coords.len() + 1, 0.0);
-            let mut out = Vec::with_capacity(coords.len());
-            for &coord in coords {
-                out.push(self.predict_with_rhs(coord, &mut rhs)?);
-            }
-            Ok(out)
-        }
+        self.engine.predict(coords)
     }
 
     /// GPU-accelerated batch prediction. Returns [`KrigingError::BackendUnavailable`] if the GPU
@@ -266,10 +201,13 @@ impl OrdinaryKrigingModel {
         &self,
         coords: &[GeoCoord],
     ) -> Result<Vec<Prediction>, KrigingError> {
-        let covariances =
-            crate::gpu::build_rhs_covariances_gpu(&self.coords, coords, self.variogram)
-                .await
-                .map_err(KrigingError::BackendUnavailable)?;
+        let covariances = crate::gpu::build_rhs_covariances_gpu(
+            self.engine.coords(),
+            coords,
+            self.engine.variogram(),
+        )
+        .await
+        .map_err(KrigingError::BackendUnavailable)?;
         self.predict_batch_with_covariances(coords, &covariances)
     }
 
@@ -281,7 +219,13 @@ impl OrdinaryKrigingModel {
         &self,
         coords: &[GeoCoord],
     ) -> Result<Vec<Prediction>, KrigingError> {
-        match crate::gpu::build_rhs_covariances_gpu(&self.coords, coords, self.variogram).await {
+        match crate::gpu::build_rhs_covariances_gpu(
+            self.engine.coords(),
+            coords,
+            self.engine.variogram(),
+        )
+        .await
+        {
             Ok(covariances) => self.predict_batch_with_covariances(coords, &covariances),
             Err(_) => self.predict_batch(coords),
         }
@@ -294,9 +238,12 @@ impl OrdinaryKrigingModel {
         &self,
         coords: &[GeoCoord],
     ) -> Result<Vec<Prediction>, KrigingError> {
-        let covariances =
-            crate::gpu::build_rhs_covariances_gpu_blocking(&self.coords, coords, self.variogram)
-                .map_err(KrigingError::BackendUnavailable)?;
+        let covariances = crate::gpu::build_rhs_covariances_gpu_blocking(
+            self.engine.coords(),
+            coords,
+            self.engine.variogram(),
+        )
+        .map_err(KrigingError::BackendUnavailable)?;
         self.predict_batch_with_covariances(coords, &covariances)
     }
 
@@ -307,7 +254,11 @@ impl OrdinaryKrigingModel {
         &self,
         coords: &[GeoCoord],
     ) -> Result<Vec<Prediction>, KrigingError> {
-        match crate::gpu::build_rhs_covariances_gpu_blocking(&self.coords, coords, self.variogram) {
+        match crate::gpu::build_rhs_covariances_gpu_blocking(
+            self.engine.coords(),
+            coords,
+            self.engine.variogram(),
+        ) {
             Ok(covariances) => self.predict_batch_with_covariances(coords, &covariances),
             Err(_) => self.predict_batch(coords),
         }
@@ -318,16 +269,12 @@ impl OrdinaryKrigingModel {
             .neighborhood
             .expect("predict_local requires neighborhood");
         let prepared_coord = prepare_geo_coord(coord);
-        let n_total = self.prepared_coords.len();
+        let prepared = self.engine.prepared();
+        let n_total = prepared.len();
 
         // Distance from target to every station.
         let mut indexed: Vec<(usize, Real)> = (0..n_total)
-            .map(|i| {
-                (
-                    i,
-                    haversine_distance_prepared(self.prepared_coords[i], prepared_coord),
-                )
-            })
+            .map(|i| (i, haversine_distance_prepared(prepared[i], prepared_coord)))
             .collect();
 
         if let Some(r) = neighborhood.max_radius {
@@ -350,19 +297,19 @@ impl OrdinaryKrigingModel {
         }
 
         // Build the local kriging system on the selected stations.
-        let diag_eps = kriging_diagonal_jitter(k, self.variogram);
+        let variogram = self.engine.variogram();
+        let diag_eps = kriging_diagonal_jitter(k, variogram);
+        let obs_diag = self.engine.observation_diagonal();
         let mut a = DMatrix::from_element(k + 1, k + 1, 0.0);
         for i in 0..k {
             let (si, _) = indexed[i];
             for j in i..k {
                 let (sj, _) = indexed[j];
-                let mut cov = self.variogram.covariance(haversine_distance_prepared(
-                    self.prepared_coords[si],
-                    self.prepared_coords[sj],
-                ));
+                let mut cov =
+                    variogram.covariance(haversine_distance_prepared(prepared[si], prepared[sj]));
                 if i == j {
                     cov += diag_eps;
-                    if let Some(&d) = self.observation_diagonal.get(si) {
+                    if let Some(&d) = obs_diag.get(si) {
                         cov += d;
                     }
                 }
@@ -375,7 +322,7 @@ impl OrdinaryKrigingModel {
 
         let mut rhs = DVector::from_element(k + 1, 0.0);
         for i in 0..k {
-            rhs[i] = self.variogram.covariance(indexed[i].1);
+            rhs[i] = variogram.covariance(indexed[i].1);
         }
         rhs[k] = 1.0;
 
@@ -384,44 +331,17 @@ impl OrdinaryKrigingModel {
                 "could not solve local (neighborhood) kriging system".to_string(),
             )
         })?;
+        let values = self.engine.values();
+        let cov_at_zero = self.engine.cov_at_zero();
         let mut value: Real = 0.0;
         let mut cov_dot: Real = 0.0;
         for i in 0..k {
             let (si, _) = indexed[i];
-            value += sol[i] * self.values[si];
+            value += sol[i] * values[si];
             cov_dot += sol[i] * rhs[i];
         }
         let mu = sol[k];
-        let variance = (self.cov_at_zero - cov_dot - mu).max(0.0);
-        Ok(Prediction { value, variance })
-    }
-
-    fn predict_with_rhs(
-        &self,
-        coord: GeoCoord,
-        rhs: &mut DVector<Real>,
-    ) -> Result<Prediction, KrigingError> {
-        let n = self.coords.len();
-        let prepared_coord = prepare_geo_coord(coord);
-        for i in 0..n {
-            rhs[i] = self.variogram.covariance(haversine_distance_prepared(
-                self.prepared_coords[i],
-                prepared_coord,
-            ));
-        }
-        rhs[n] = 1.0;
-
-        let sol = self.system_lu.solve(rhs).ok_or_else(|| {
-            KrigingError::MatrixError("could not solve ordinary kriging system".to_string())
-        })?;
-        let mut value = 0.0;
-        let mut cov_dot = 0.0;
-        for i in 0..n {
-            value += sol[i] * self.values[i];
-            cov_dot += sol[i] * rhs[i];
-        }
-        let mu = sol[n];
-        let variance = (self.cov_at_zero - cov_dot - mu).max(0.0);
+        let variance = (cov_at_zero - cov_dot - mu).max(0.0);
         Ok(Prediction { value, variance })
     }
 
@@ -431,7 +351,7 @@ impl OrdinaryKrigingModel {
         coords: &[GeoCoord],
         covariances: &[Real],
     ) -> Result<Vec<Prediction>, KrigingError> {
-        let n = self.coords.len();
+        let n = self.engine.len();
         let expected = n.checked_mul(coords.len()).ok_or_else(|| {
             KrigingError::MatrixError("covariance dimensions overflowed".to_string())
         })?;
@@ -442,25 +362,10 @@ impl OrdinaryKrigingModel {
                 covariances.len()
             )));
         }
-        let mut rhs = DVector::from_element(n + 1, 0.0);
         let mut out = Vec::with_capacity(coords.len());
         for pred_idx in 0..coords.len() {
-            for i in 0..n {
-                rhs[i] = covariances[pred_idx * n + i];
-            }
-            rhs[n] = 1.0;
-            let sol = self.system_lu.solve(&rhs).ok_or_else(|| {
-                KrigingError::MatrixError("could not solve ordinary kriging system".to_string())
-            })?;
-            let mut value = 0.0;
-            let mut cov_dot = 0.0;
-            for i in 0..n {
-                value += sol[i] * self.values[i];
-                cov_dot += sol[i] * rhs[i];
-            }
-            let mu = sol[n];
-            let variance = (self.cov_at_zero - cov_dot - mu).max(0.0);
-            out.push(Prediction { value, variance });
+            let c0 = DVector::from_iterator(n, (0..n).map(|i| covariances[pred_idx * n + i]));
+            out.push(self.engine.predict_from_cross_cov(c0)?);
         }
         Ok(out)
     }
@@ -491,56 +396,6 @@ pub fn kriging_diagonal_jitter(n_stations: usize, variogram: VariogramModel) -> 
         VariogramType::Cubic => (1e-4 * sill * scale).max(nugget_floor),
         _ => (1e-8 * sill).max(nugget_floor),
     }
-}
-
-fn build_ordinary_system(
-    coords: &[PreparedGeoCoord],
-    variogram: VariogramModel,
-    obs_extra: &[Real],
-) -> DMatrix<Real> {
-    let n = coords.len();
-    let diag_eps = kriging_diagonal_jitter(n, variogram);
-    if !obs_extra.is_empty() {
-        debug_assert_eq!(obs_extra.len(), n);
-    }
-
-    // Compute only the upper triangle of covariances as a flat buffer indexed by
-    // `row_upper_triangle_index(i, j) = i * n - i*(i+1)/2 + j` for i <= j. This halves the
-    // work and plays well with parallelism because rows are independent. Native builds use
-    // rayon; WASM falls back to sequential.
-    let upper_len = n * (n + 1) / 2;
-    let fill_row = |i: usize| -> Vec<Real> {
-        let mut row = Vec::with_capacity(n - i);
-        for j in i..n {
-            let mut cov = variogram.covariance(haversine_distance_prepared(coords[i], coords[j]));
-            if i == j {
-                cov += diag_eps;
-                if let Some(&d) = obs_extra.get(i) {
-                    cov += d;
-                }
-            }
-            row.push(cov);
-        }
-        row
-    };
-    #[cfg(not(target_arch = "wasm32"))]
-    let rows: Vec<Vec<Real>> = (0..n).into_par_iter().map(fill_row).collect();
-    #[cfg(target_arch = "wasm32")]
-    let rows: Vec<Vec<Real>> = (0..n).map(fill_row).collect();
-    debug_assert_eq!(rows.iter().map(|r| r.len()).sum::<usize>(), upper_len);
-
-    let mut m = DMatrix::from_element(n + 1, n + 1, 0.0);
-    for (i, row) in rows.into_iter().enumerate() {
-        for (off, cov) in row.into_iter().enumerate() {
-            let j = i + off;
-            m[(i, j)] = cov;
-            m[(j, i)] = cov;
-        }
-        m[(i, n)] = 1.0;
-        m[(n, i)] = 1.0;
-    }
-    m[(n, n)] = 0.0;
-    m
 }
 
 #[cfg(test)]

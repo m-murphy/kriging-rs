@@ -8,14 +8,15 @@ use crate::Real;
 use crate::error::KrigingError;
 use crate::kriging::binomial::{
     BINOMIAL_CALIBRATION_VERSION, BinomialBuildNotes, BinomialCalibratedResult, BinomialPrediction,
-    BinomialPrior, HeteroskedasticBinomialConfig, logit_observation_variance_empirical_bayes,
+    BinomialPrior, HeteroskedasticBinomialConfig, binomial_prediction_from_ordinary,
+    build_calibrated_logit_ordinary, finish_binomial_notes,
 };
 use crate::spacetime::SpaceTimeCoord;
 use crate::spacetime::dataset::SpaceTimeDataset;
 use crate::spacetime::kriging::ordinary::SpaceTimeOrdinaryKrigingModel;
 use crate::spacetime::metric::SpatialMetric;
 use crate::spacetime::variogram::SpaceTimeVariogram;
-use crate::utils::{Probability, logistic, logit};
+use crate::utils::{Probability, logit};
 
 /// A binomial observation at a space–time location: number of successes and trials.
 #[derive(Debug, Clone, Copy)]
@@ -97,8 +98,15 @@ impl<M: SpatialMetric> SpaceTimeBinomialKrigingModel<M> {
         metric: M,
         observations: Vec<SpaceTimeBinomialObservation<M::Coord>>,
         variogram: SpaceTimeVariogram,
+        hetero_config: HeteroskedasticBinomialConfig,
     ) -> Result<BinomialCalibratedResult<SpaceTimeBinomialKrigingModel<M>>, KrigingError> {
-        Self::new_with_prior(metric, observations, variogram, BinomialPrior::default())
+        Self::new_with_prior(
+            metric,
+            observations,
+            variogram,
+            BinomialPrior::default(),
+            hetero_config,
+        )
     }
 
     /// Calibrated build with an explicit Beta prior and per-station logit observation variance.
@@ -107,12 +115,12 @@ impl<M: SpatialMetric> SpaceTimeBinomialKrigingModel<M> {
         observations: Vec<SpaceTimeBinomialObservation<M::Coord>>,
         variogram: SpaceTimeVariogram,
         prior: BinomialPrior,
+        hetero_config: HeteroskedasticBinomialConfig,
     ) -> Result<BinomialCalibratedResult<SpaceTimeBinomialKrigingModel<M>>, KrigingError> {
         if observations.len() < 2 {
             return Err(KrigingError::InsufficientData(2));
         }
-        let config = HeteroskedasticBinomialConfig::default();
-        let n_tries = config.max_build_attempts.max(1);
+        let config = hetero_config;
         let coords: Vec<SpaceTimeCoord<M::Coord>> =
             observations.iter().map(|o| o.coord()).collect();
         let logits: Vec<Real> = observations
@@ -121,42 +129,27 @@ impl<M: SpatialMetric> SpaceTimeBinomialKrigingModel<M> {
             .collect();
         let base: Vec<Real> = observations
             .iter()
-            .map(|o| logit_observation_variance_empirical_bayes(prior, o.successes(), o.trials()))
-            .map(|v| v.max(config.min_logit_observation_variance))
+            .map(|o| {
+                config
+                    .raw_logit_observation_variance_binomial_site(prior, o.successes(), o.trials())
+                    .max(config.min_logit_observation_variance)
+            })
             .collect();
-        let mut last_err: Option<KrigingError> = None;
-        let mut inflation = 1.0 as Real;
-        for attempt in 0..n_tries {
-            let extra: Vec<Real> = base
-                .iter()
-                .map(|&v| (v * inflation).max(config.min_logit_observation_variance))
-                .collect();
-            let dataset = SpaceTimeDataset::new(coords.clone(), logits.clone())?;
-            match SpaceTimeOrdinaryKrigingModel::new_with_extra_diagonal(
-                metric, dataset, variogram, extra,
-            ) {
-                Ok(inner) => {
-                    return Ok(BinomialCalibratedResult {
-                        model: Self { inner },
-                        notes: BinomialBuildNotes {
-                            calibration_version: BINOMIAL_CALIBRATION_VERSION,
-                            logit_inflation: inflation,
-                            n_build_attempts: attempt + 1,
-                            prior,
-                            zero_trial_dropped_indices: Vec::new(),
-                            from_precomputed_logits_only: false,
-                        },
-                    });
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                }
-            }
-            inflation *= 2.0 as Real;
-        }
-        Err(last_err.unwrap_or_else(|| {
-            KrigingError::MatrixError("space-time binomial kriging build failed".to_string())
-        }))
+        build_calibrated_logit_ordinary(
+            base,
+            &config,
+            prior,
+            &[],
+            false,
+            "space-time binomial kriging build failed",
+            |extra| {
+                let dataset = SpaceTimeDataset::new(coords.clone(), logits.clone())?;
+                SpaceTimeOrdinaryKrigingModel::new_with_extra_diagonal(
+                    metric, dataset, variogram, extra,
+                )
+                .map(|inner| Self { inner })
+            },
+        )
     }
 
     /// Pre-computed logits without per-trial data (no observation variances on the diagonal).
@@ -175,14 +168,18 @@ impl<M: SpatialMetric> SpaceTimeBinomialKrigingModel<M> {
         let inner = SpaceTimeOrdinaryKrigingModel::new(metric, dataset, variogram)?;
         Ok(BinomialCalibratedResult {
             model: Self { inner },
-            notes: BinomialBuildNotes {
+            notes: finish_binomial_notes(BinomialBuildNotes {
                 calibration_version: BINOMIAL_CALIBRATION_VERSION,
                 logit_inflation: 1.0,
                 n_build_attempts: 1,
                 prior: BinomialPrior::default(),
                 zero_trial_dropped_indices: Vec::new(),
                 from_precomputed_logits_only: true,
-            },
+                warnings: Vec::new(),
+                condition_number: None,
+                effective_dof: None,
+                last_msdr: None,
+            }),
         })
     }
 
@@ -211,47 +208,33 @@ impl<M: SpatialMetric> SpaceTimeBinomialKrigingModel<M> {
                 "logits must all be finite (no NaN/inf)".to_string(),
             ));
         }
-        for &v in &base_logit_observation_variance {
-            if !v.is_finite() || v < 0.0 {
-                return Err(KrigingError::InvalidInput(
-                    "logit observation variances must be finite and non-negative".to_string(),
-                ));
-            }
-        }
-        let n_tries = config.max_build_attempts.max(1);
-        let mut last_err: Option<KrigingError> = None;
-        let mut inflation = 1.0 as Real;
-        for attempt in 0..n_tries {
-            let extra: Vec<Real> = base_logit_observation_variance
-                .iter()
-                .map(|&v| (v * inflation).max(config.min_logit_observation_variance))
-                .collect();
-            let dataset = SpaceTimeDataset::new(coords.clone(), logits.clone())?;
-            match SpaceTimeOrdinaryKrigingModel::new_with_extra_diagonal(
-                metric, dataset, variogram, extra,
-            ) {
-                Ok(inner) => {
-                    return Ok(BinomialCalibratedResult {
-                        model: Self { inner },
-                        notes: BinomialBuildNotes {
-                            calibration_version: BINOMIAL_CALIBRATION_VERSION,
-                            logit_inflation: inflation,
-                            n_build_attempts: attempt + 1,
-                            prior: prior_for_notes,
-                            zero_trial_dropped_indices: Vec::new(),
-                            from_precomputed_logits_only: false,
-                        },
-                    });
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                }
-            }
-            inflation *= 2.0 as Real;
-        }
-        Err(last_err.unwrap_or_else(|| {
-            KrigingError::MatrixError("space-time from_precomputed: build failed".to_string())
-        }))
+        build_calibrated_logit_ordinary(
+            base_logit_observation_variance,
+            &config,
+            prior_for_notes,
+            &[],
+            false,
+            "space-time from_precomputed: build failed",
+            |extra| {
+                let dataset = SpaceTimeDataset::new(coords.clone(), logits.clone())?;
+                SpaceTimeOrdinaryKrigingModel::new_with_extra_diagonal(
+                    metric, dataset, variogram, extra,
+                )
+                .map(|inner| Self { inner })
+            },
+        )
+    }
+
+    pub fn variogram(&self) -> SpaceTimeVariogram {
+        self.inner.variogram()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn predict(
@@ -259,7 +242,7 @@ impl<M: SpatialMetric> SpaceTimeBinomialKrigingModel<M> {
         target: SpaceTimeCoord<M::Coord>,
     ) -> Result<BinomialPrediction, KrigingError> {
         let pred = self.inner.predict(target)?;
-        Ok(to_binomial(pred))
+        Ok(binomial_prediction_from_ordinary(pred))
     }
 
     pub fn predict_batch(
@@ -267,18 +250,10 @@ impl<M: SpatialMetric> SpaceTimeBinomialKrigingModel<M> {
         targets: &[SpaceTimeCoord<M::Coord>],
     ) -> Result<Vec<BinomialPrediction>, KrigingError> {
         let inner = self.inner.predict_batch(targets)?;
-        Ok(inner.into_iter().map(to_binomial).collect())
-    }
-}
-
-fn to_binomial(p: crate::kriging::ordinary::Prediction) -> BinomialPrediction {
-    let prevalence = logistic(p.value);
-    let factor = prevalence * (1.0 - prevalence);
-    BinomialPrediction {
-        prevalence,
-        logit_value: p.value,
-        variance: p.variance,
-        prevalence_variance: factor * factor * p.variance.max(0.0),
+        Ok(inner
+            .into_iter()
+            .map(binomial_prediction_from_ordinary)
+            .collect())
     }
 }
 
@@ -287,6 +262,7 @@ mod tests {
     use super::*;
     use crate::distance::GeoCoord;
     use crate::spacetime::metric::GeoMetric;
+    use crate::utils::logistic;
     use crate::variogram::models::{VariogramModel, VariogramType};
 
     fn variogram() -> SpaceTimeVariogram {
@@ -339,18 +315,23 @@ mod tests {
             )
             .unwrap(),
         ];
-        let model = SpaceTimeBinomialKrigingModel::new(GeoMetric, obs, variogram())
-            .unwrap()
-            .model;
+        let model = SpaceTimeBinomialKrigingModel::new(
+            GeoMetric,
+            obs,
+            variogram(),
+            HeteroskedasticBinomialConfig::default(),
+        )
+        .unwrap()
+        .model;
         let pred = model
             .predict(SpaceTimeCoord::new(
                 GeoCoord::try_new(0.5, 0.5).unwrap(),
                 1.0,
             ))
             .unwrap();
-        assert!(pred.prevalence > 0.0 && pred.prevalence < 1.0);
+        assert!(pred.prevalence_median > 0.0 && pred.prevalence_median < 1.0);
         assert!(pred.prevalence_variance >= 0.0);
-        assert!(pred.variance >= 0.0);
+        assert!(pred.logit_variance >= 0.0);
     }
 
     #[test]
@@ -406,8 +387,8 @@ mod tests {
         let target = SpaceTimeCoord::new(GeoCoord::try_new(0.5, 0.5).unwrap(), 1.5);
         let bp = bin.predict(target).unwrap();
         let op = ord.predict(target).unwrap();
-        assert!((bp.logit_value - op.value).abs() < 1e-6);
-        assert!((bp.variance - op.variance).abs() < 1e-6);
-        assert!((bp.prevalence - logistic(op.value)).abs() < 1e-6);
+        assert!((bp.logit - op.value).abs() < 1e-6);
+        assert!((bp.logit_variance - op.variance).abs() < 1e-6);
+        assert!((bp.prevalence_median - logistic(op.value)).abs() < 1e-6);
     }
 }

@@ -9,6 +9,9 @@
 //!
 //! which is symmetric but **indefinite**, so Cholesky is not applicable. We therefore
 //! rely on a partial-pivoted LU factorization.
+//!
+//! SPD-only maintenance (rank-1 updates and bordered extensions for covariance-only blocks)
+//! lives in [`crate::cholesky_update`].
 
 use nalgebra::{DMatrix, DVector};
 

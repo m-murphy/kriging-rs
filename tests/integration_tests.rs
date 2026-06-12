@@ -81,7 +81,7 @@ fn binomial_pipeline_with_variogram_fit_runs_end_to_end() {
         .predict_batch(&[coord(0.5, 0.5)])
         .expect("binomial batch predict");
     assert_eq!(out.len(), 1);
-    assert!((0.0..=1.0).contains(&out[0].prevalence));
+    assert!((0.0..=1.0).contains(&out[0].prevalence_median));
 }
 
 #[test]
@@ -156,7 +156,7 @@ fn binomial_prior_changes_prevalence_with_fitted_model() {
         .expect("heavy prior prediction");
     assert_eq!(out_default.len(), 1);
     assert_eq!(out_heavy.len(), 1);
-    assert!((out_default[0].prevalence - out_heavy[0].prevalence).abs() > 1e-6);
+    assert!((out_default[0].prevalence_median - out_heavy[0].prevalence_median).abs() > 1e-6);
 }
 
 #[test]
@@ -180,8 +180,8 @@ fn binomial_predict_batch_matches_repeated_predict() {
         .collect::<Vec<_>>();
     assert_eq!(batch.len(), singles.len());
     for (batch_pred, single_pred) in batch.iter().zip(singles.iter()) {
-        assert!((batch_pred.prevalence - single_pred.prevalence).abs() < 1e-12);
-        assert!((batch_pred.logit_value - single_pred.logit_value).abs() < 1e-12);
-        assert!((batch_pred.variance - single_pred.variance).abs() < 1e-12);
+        assert!((batch_pred.prevalence_median - single_pred.prevalence_median).abs() < 1e-12);
+        assert!((batch_pred.logit - single_pred.logit).abs() < 1e-12);
+        assert!((batch_pred.logit_variance - single_pred.logit_variance).abs() < 1e-12);
     }
 }

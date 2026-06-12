@@ -98,6 +98,8 @@ compile_error!(
 );
 
 pub mod aggregate;
+/// SPD Cholesky rank-1 / bordered extensions for covariance-only systems (see module docs).
+pub(crate) mod cholesky_update;
 pub mod cv;
 pub mod distance;
 pub mod error;
@@ -109,6 +111,7 @@ pub mod kriging;
 /// public API — use the higher-level `*KrigingModel` types to predict values; direct solver
 /// access is a crate-internal detail that may be removed in a future release.
 pub(crate) mod matrix;
+pub mod predictor;
 pub mod projected;
 pub mod simulation;
 pub mod spacetime;
@@ -126,18 +129,24 @@ pub use geo_dataset::GeoDataset;
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuBackend, GpuSupport, build_rhs_covariances_gpu, detect_gpu_support, gpu_square};
 pub use kriging::binomial::{
-    BINOMIAL_CALIBRATION_VERSION, BinomialBuildNotes, BinomialCalibratedResult, BinomialFit,
+    BINOMIAL_CALIBRATION_VERSION, BINOMIAL_CALIBRATION_VERSION_ONE_STEP_LAPLACE_OBS_VAR,
+    BinomialBuildNotes, BinomialCalibratedResult, BinomialDiagnostics, BinomialFit,
     BinomialKrigingModel, BinomialObservation, BinomialPrediction, BinomialPrior,
-    HeteroskedasticBinomialConfig, build_binomial_observations_dropping_zero_trials,
-    indices_of_zero_trials, logit_observation_variance_empirical_bayes,
+    BinomialStability, HeteroskedasticBinomialConfig,
+    build_binomial_observations_dropping_zero_trials, estimate_binomial_prior_from_counts,
+    fit_binomial_variogram, indices_of_zero_trials, logit_observation_variance_empirical_bayes,
+    logit_observation_variance_laplace_binomial,
+    logit_observation_variance_one_step_laplace_binomial,
 };
 pub use kriging::ordinary::{Neighborhood, OrdinaryKrigingModel, Prediction};
 pub use kriging::simple::SimpleKrigingModel;
 pub use kriging::universal::{UniversalKrigingModel, UniversalTrend};
 pub use projected::{
-    Anisotropy2D, BinomialProjectedKrigingModel, DirectionalConfig, ProjectedBinomialFit,
-    ProjectedBinomialObservation, ProjectedCoord, ProjectedDataset, ProjectedKrigingModel,
+    Anisotropy2D, BinomialProjectedKrigingModel, BinomialTangentPlaneKrigingModel,
+    DirectionalConfig, ProjectedBinomialFit, ProjectedBinomialObservation, ProjectedCoord,
+    ProjectedDataset, ProjectedKrigingModel, TangentPlaneBinomialFit,
     compute_directional_empirical_variogram, euclidean_distance, euclidean_distance_squared,
+    tangent_plane_reference_centroid,
 };
 pub use variogram::fitting::{FitResult, fit_variogram};
 pub use variogram::models::{VariogramModel, VariogramType};

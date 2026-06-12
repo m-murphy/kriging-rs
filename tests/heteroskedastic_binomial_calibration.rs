@@ -2,8 +2,9 @@
 //! logit observation variance, build diagnostics, and k-fold logit **MSDR** (mean
 //! squared deviation ratio) on mixed trial counts.
 
-use kriging_rs::cv::k_fold_binomial;
-use kriging_rs::cv::{BinomialCvSummary, CvSummary, k_fold};
+use kriging_rs::cv::{
+    BinomialCvSummary, BinomialGeoPredictor, CvSummary, OrdinaryGeoPredictor, k_fold_cv,
+};
 use kriging_rs::{
     BinomialKrigingModel, BinomialObservation, BinomialPrior, GeoCoord,
     HeteroskedasticBinomialConfig, Real, VariogramModel, VariogramType, logit_clamped,
@@ -60,7 +61,7 @@ fn hetero_build_succeeds_with_mixed_and_reports_inflation() {
         .model
         .predict(GeoCoord::try_new(40.5, -74.2).unwrap())
         .expect("p");
-    assert!(x.prevalence.is_finite() && x.logit_value.is_finite());
+    assert!(x.prevalence_median.is_finite() && x.logit.is_finite());
 }
 
 #[test]
@@ -69,7 +70,17 @@ fn mixed_trials_kfold_msdar_hetero_and_homo_sane() {
     let v = VariogramModel::new(0.05, 2.0, 0.25, VariogramType::Exponential).unwrap();
     let (coords, successes, trials) = mixed_40();
     // Homoskedastic binomial CV
-    let h_res = k_fold_binomial(&coords, &successes, &trials, v, prior, 5).expect("h cv");
+    let h_res = k_fold_cv(
+        &BinomialGeoPredictor {
+            coords: &coords,
+            successes: &successes,
+            trials: &trials,
+            variogram: v,
+            prior,
+        },
+        5,
+    )
+    .expect("h cv");
     let h = BinomialCvSummary::from_residuals(&h_res);
     if h.n_evaluated > 0 {
         let d_homo = (h.logit.msdr - 1.0).abs();
@@ -101,7 +112,7 @@ fn mixed_trials_kfold_msdar_hetero_and_homo_sane() {
         .expect("fold het model");
         for &i in &te {
             let p = m.predict(coords[i]).expect("pred");
-            if !p.variance.is_finite() || p.variance <= 0.0 {
+            if !p.logit_variance.is_finite() || p.logit_variance <= 0.0 {
                 continue;
             }
             let t = trials[i];
@@ -110,8 +121,8 @@ fn mixed_trials_kfold_msdar_hetero_and_homo_sane() {
             }
             let p_hat = successes[i] as f64 / t as f64;
             let obs = real_to_f64(logit_clamped(p_hat as Real));
-            let e = obs - real_to_f64(p.logit_value);
-            rat += (e * e) / real_to_f64(p.variance);
+            let e = obs - real_to_f64(p.logit);
+            rat += (e * e) / real_to_f64(p.logit_variance);
             msd_n += 1;
         }
     }
@@ -134,7 +145,15 @@ fn homo_logit_kfold_msdr_finite() {
             o.smoothed_logit_with_prior(prior)
         })
         .collect();
-    let r = k_fold(&coords, &logits, v, 5).expect("homo logit kfold");
+    let r = k_fold_cv(
+        &OrdinaryGeoPredictor {
+            coords: &coords,
+            values: &logits,
+            variogram: v,
+        },
+        5,
+    )
+    .expect("homo logit kfold");
     let s = CvSummary::from_residuals(&r);
     assert!(s.n > 0);
     assert!(s.msdr.is_finite());

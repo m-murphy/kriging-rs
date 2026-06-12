@@ -4,50 +4,19 @@
 //! known, constant mean. The weights solve `C · w = c0` (no Lagrangian row), and the
 //! predictor is `m + Σ_i w_i (z_i − m)`.
 
-use std::sync::Arc;
-
-use nalgebra::{DMatrix, DVector, Dyn, linalg::LU};
-#[cfg(not(target_arch = "wasm32"))]
-use rayon::prelude::*;
-
 use crate::Real;
 use crate::error::KrigingError;
 use crate::kriging::ordinary::Prediction;
-use crate::spacetime::coord::{SpaceTimeCoord, temporal_distance};
+use crate::spacetime::coord::SpaceTimeCoord;
 use crate::spacetime::dataset::SpaceTimeDataset;
-use crate::spacetime::kriging::ordinary::spacetime_diagonal_jitter;
+use crate::spacetime::kriging::simple_engine::SpaceTimeSimpleKrigingEngine;
 use crate::spacetime::metric::SpatialMetric;
 use crate::spacetime::variogram::SpaceTimeVariogram;
 
 /// Fitted simple space–time kriging model.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SpaceTimeSimpleKrigingModel<M: SpatialMetric> {
-    metric: M,
-    prepared_spatial: Vec<M::Prepared>,
-    times: Vec<Real>,
-    residuals: Vec<Real>,
-    mean: Real,
-    variogram: SpaceTimeVariogram,
-    c_at_zero: Real,
-    system_lu: Arc<LU<Real, Dyn, Dyn>>,
-}
-
-impl<M: SpatialMetric> Clone for SpaceTimeSimpleKrigingModel<M>
-where
-    M::Prepared: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            metric: self.metric,
-            prepared_spatial: self.prepared_spatial.clone(),
-            times: self.times.clone(),
-            residuals: self.residuals.clone(),
-            mean: self.mean,
-            variogram: self.variogram,
-            c_at_zero: self.c_at_zero,
-            system_lu: Arc::clone(&self.system_lu),
-        }
-    }
+    engine: SpaceTimeSimpleKrigingEngine<M>,
 }
 
 impl<M: SpatialMetric> SpaceTimeSimpleKrigingModel<M> {
@@ -58,128 +27,28 @@ impl<M: SpatialMetric> SpaceTimeSimpleKrigingModel<M> {
         variogram: SpaceTimeVariogram,
         mean: Real,
     ) -> Result<Self, KrigingError> {
-        if !mean.is_finite() {
-            return Err(KrigingError::InvalidInput(
-                "mean must be finite".to_string(),
-            ));
-        }
         let (coords, values) = dataset.into_parts();
-        let prepared_spatial: Vec<M::Prepared> =
-            coords.iter().map(|c| metric.prepare(c.spatial)).collect();
-        let times: Vec<Real> = coords.iter().map(|c| c.time).collect();
-        let residuals: Vec<Real> = values.iter().map(|v| *v - mean).collect();
-
-        let system = build_system(&metric, &prepared_spatial, &times, variogram);
-        let system_lu = Arc::new(system.lu());
-        let probe = DVector::from_element(coords.len(), 1.0);
-        if system_lu.solve(&probe).is_none() {
-            return Err(KrigingError::MatrixError(
-                "could not factorize space-time simple kriging system".to_string(),
-            ));
-        }
-        Ok(Self {
-            metric,
-            prepared_spatial,
-            times,
-            residuals,
-            mean,
-            variogram,
-            c_at_zero: variogram.c_at_zero(),
-            system_lu,
-        })
+        let engine = SpaceTimeSimpleKrigingEngine::fit(metric, coords, values, variogram, mean)?;
+        Ok(Self { engine })
     }
 
     /// Known mean used by the predictor.
     pub fn mean(&self) -> Real {
-        self.mean
+        self.engine.mean()
     }
 
     pub fn predict(&self, target: SpaceTimeCoord<M::Coord>) -> Result<Prediction, KrigingError> {
-        let mut rhs = DVector::from_element(self.times.len(), 0.0);
-        self.predict_with_rhs(target, &mut rhs)
+        self.engine
+            .predict(&[target])
+            .map(|mut v| v.pop().expect("single prediction"))
     }
 
     pub fn predict_batch(
         &self,
         targets: &[SpaceTimeCoord<M::Coord>],
     ) -> Result<Vec<Prediction>, KrigingError> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let n = self.times.len();
-            targets
-                .par_iter()
-                .map_init(
-                    || DVector::<Real>::from_element(n, 0.0),
-                    |rhs, t| self.predict_with_rhs(*t, rhs),
-                )
-                .collect()
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            let mut rhs = DVector::from_element(self.times.len(), 0.0);
-            let mut out = Vec::with_capacity(targets.len());
-            for &t in targets {
-                out.push(self.predict_with_rhs(t, &mut rhs)?);
-            }
-            Ok(out)
-        }
+        self.engine.predict(targets)
     }
-
-    fn predict_with_rhs(
-        &self,
-        target: SpaceTimeCoord<M::Coord>,
-        rhs: &mut DVector<Real>,
-    ) -> Result<Prediction, KrigingError> {
-        let n = self.times.len();
-        let prepared_target = self.metric.prepare(target.spatial);
-        for i in 0..n {
-            let hs = self
-                .metric
-                .distance(self.prepared_spatial[i], prepared_target);
-            let ht = temporal_distance(self.times[i], target.time);
-            rhs[i] = self.variogram.covariance(hs, ht);
-        }
-        let w = self.system_lu.solve(rhs).ok_or_else(|| {
-            KrigingError::MatrixError(
-                "could not solve space-time simple kriging system".to_string(),
-            )
-        })?;
-        let mut residual_pred: Real = 0.0;
-        let mut cov_dot: Real = 0.0;
-        for i in 0..n {
-            residual_pred += w[i] * self.residuals[i];
-            cov_dot += w[i] * rhs[i];
-        }
-        let variance = (self.c_at_zero - cov_dot).max(0.0);
-        Ok(Prediction {
-            value: self.mean + residual_pred,
-            variance,
-        })
-    }
-}
-
-fn build_system<M: SpatialMetric>(
-    metric: &M,
-    prepared: &[M::Prepared],
-    times: &[Real],
-    variogram: SpaceTimeVariogram,
-) -> DMatrix<Real> {
-    let n = prepared.len();
-    let diag_eps = spacetime_diagonal_jitter(n, variogram);
-    let mut m = DMatrix::from_element(n, n, 0.0);
-    for i in 0..n {
-        for j in i..n {
-            let hs = metric.distance(prepared[i], prepared[j]);
-            let ht = temporal_distance(times[i], times[j]);
-            let mut cov = variogram.covariance(hs, ht);
-            if i == j {
-                cov += diag_eps;
-            }
-            m[(i, j)] = cov;
-            m[(j, i)] = cov;
-        }
-    }
-    m
 }
 
 #[cfg(test)]
@@ -229,7 +98,6 @@ mod tests {
         let cs = coords();
         let values = vec![10.0, 12.0, 14.0, 16.0];
         let mean = 50.0;
-        // Short ranges so the target is effectively uncorrelated with any observation.
         let spatial_short =
             VariogramModel::new(0.01, 1.0, 2.0, VariogramType::Exponential).unwrap();
         let temporal_short =

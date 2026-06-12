@@ -15,10 +15,9 @@ use wasm_bindgen::prelude::*;
 
 use crate::aggregate::{PolygonAggregationSummary, polygon_weighted_summaries_batch};
 use crate::cv::{
-    BinomialCvResidual, BinomialCvSummary, k_fold, k_fold_binomial, k_fold_binomial_projected,
-    k_fold_projected, k_fold_simple, k_fold_universal, leave_one_out, leave_one_out_binomial,
-    leave_one_out_binomial_projected, leave_one_out_projected, leave_one_out_simple,
-    leave_one_out_universal,
+    BinomialCvResidual, BinomialCvSummary, BinomialGeoPredictor, BinomialProjectedPredictor,
+    OrdinaryGeoPredictor, ProjectedOrdinaryPredictor, SimpleGeoPredictor, UniversalGeoPredictor,
+    k_fold_cv, leave_one_out_cv,
 };
 use crate::distance::GeoCoord;
 use crate::geo_dataset::GeoDataset;
@@ -26,22 +25,25 @@ use crate::geo_dataset::GeoDataset;
 use crate::gpu::detect_gpu_support;
 use crate::kriging::binomial::{
     BinomialBuildNotes, BinomialKrigingModel, BinomialObservation, BinomialPrior,
-    HeteroskedasticBinomialConfig, build_binomial_observations_dropping_zero_trials,
+    BinomialStability, HeteroskedasticBinomialConfig,
+    build_binomial_observations_dropping_zero_trials, estimate_binomial_prior_from_counts,
+    fit_binomial_variogram,
 };
 use crate::kriging::ordinary::{Neighborhood, OrdinaryKrigingModel};
 use crate::kriging::simple::SimpleKrigingModel;
 use crate::kriging::universal::{UniversalKrigingModel, UniversalTrend};
 use crate::projected::{
-    Anisotropy2D, BinomialProjectedKrigingModel, DirectionalConfig, ProjectedBinomialObservation,
-    ProjectedCoord, ProjectedDataset, ProjectedKrigingModel,
-    compute_directional_empirical_variogram,
+    Anisotropy2D, BinomialProjectedKrigingModel, BinomialTangentPlaneKrigingModel,
+    DirectionalConfig, ProjectedBinomialObservation, ProjectedCoord, ProjectedDataset,
+    ProjectedKrigingModel, compute_directional_empirical_variogram,
+    tangent_plane_reference_centroid,
 };
 use crate::simulation::{
-    BinomialSimulationManyResult, BinomialSimulationResult, SimulationOptions,
-    conditional_simulate, conditional_simulate_binomial, conditional_simulate_binomial_projected,
-    conditional_simulate_many, conditional_simulate_many_binomial,
-    conditional_simulate_many_binomial_projected, conditional_simulate_projected,
-    conditional_simulate_simple, conditional_simulate_universal,
+    BinomialGeoSimulator, BinomialProjectedSimulator, BinomialSimulationManyResult,
+    BinomialSimulationResult, OrdinaryGeoSimulator, ProjectedOrdinarySimulator, SimpleGeoSimulator,
+    SimulationOptions, UniversalGeoSimulator, sequential_binomial_simulate,
+    sequential_binomial_simulate_many, sequential_gaussian_simulate,
+    sequential_gaussian_simulate_many,
 };
 use crate::variogram::empirical::{EmpiricalEstimator, PositiveReal, VariogramConfig};
 use crate::variogram::fitting::fit_variogram;
@@ -154,6 +156,45 @@ fn build_grid_coords(
     Ok(coords)
 }
 
+/// Row-major grid of [`ProjectedCoord`] over `[x_min, x_max] × [y_min, y_max]` (planar meters
+/// or other projected units). Outer index is **y** (row, low to high `y`), inner is **x**
+/// (column, low to high `x`), matching the geographic grid row-major layout (`yCells` × `xCells`).
+fn build_projected_grid_coords(
+    x_min: f64,
+    x_max: f64,
+    y_min: f64,
+    y_max: f64,
+    x_cells: usize,
+    y_cells: usize,
+) -> Result<Vec<ProjectedCoord>, JsValue> {
+    if x_cells == 0 || y_cells == 0 {
+        return Err(coded_err(
+            "xCells and yCells must both be positive",
+            "invalid_input",
+        ));
+    }
+    if !(x_min.is_finite() && x_max.is_finite() && y_min.is_finite() && y_max.is_finite()) {
+        return Err(coded_err("grid bounds must all be finite", "invalid_input"));
+    }
+    if x_max <= x_min || y_max <= y_min {
+        return Err(coded_err(
+            "xMax must exceed xMin and yMax must exceed yMin",
+            "invalid_input",
+        ));
+    }
+    let dx = (x_max - x_min) / x_cells as f64;
+    let dy = (y_max - y_min) / y_cells as f64;
+    let mut coords = Vec::with_capacity(x_cells * y_cells);
+    for r in 0..y_cells {
+        let y = y_min + (r as f64 + 0.5) * dy;
+        for c in 0..x_cells {
+            let x = x_min + (c as f64 + 0.5) * dx;
+            coords.push(ProjectedCoord::new(x as Real, y as Real));
+        }
+    }
+    Ok(coords)
+}
+
 pub(super) fn to_coords(lats: &[f64], lons: &[f64]) -> Result<Vec<GeoCoord>, JsValue> {
     if lats.len() != lons.len() {
         return Err(coded_err(
@@ -254,11 +295,14 @@ struct JsFittedVariogram {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct JsBinomialPrediction {
-    pub prevalence: f64,
-    pub logit_value: f64,
-    pub variance: f64,
+    pub prevalence_median: f64,
+    pub prevalence_mean: f64,
+    pub logit: f64,
+    pub logit_variance: f64,
     pub prevalence_variance: f64,
 }
+
+type SplitBinomialArrays = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>);
 
 fn variogram_type_name(variogram_type: VariogramType) -> &'static str {
     match variogram_type {
@@ -271,6 +315,200 @@ fn variogram_type_name(variogram_type: VariogramType) -> &'static str {
         VariogramType::Power => "power",
         VariogramType::HoleEffect => "holeeffect",
     }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsVariogramParams {
+    variogram_type: String,
+    nugget: f64,
+    sill: f64,
+    range: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shape: Option<f64>,
+}
+
+fn variogram_to_js_params(vm: VariogramModel) -> JsVariogramParams {
+    let vt = vm.variogram_type();
+    let (nugget, sill, range) = vm.params();
+    JsVariogramParams {
+        variogram_type: variogram_type_name(vt).to_string(),
+        nugget: nugget as f64,
+        sill: sill as f64,
+        range: range as f64,
+        shape: vm.shape().map(|s| s as f64),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinomialDiagnosticsLooGeo {
+    lats: Vec<f64>,
+    lons: Vec<f64>,
+    successes: Vec<u32>,
+    trials: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinomialDiagnosticsLooProjected {
+    xs: Vec<f64>,
+    ys: Vec<f64>,
+    successes: Vec<u32>,
+    trials: Vec<u32>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsBinomialDiagnosticsOut {
+    variogram: JsVariogramParams,
+    build_notes: BinomialBuildNotes,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logit_loo_msdr: Option<f64>,
+}
+
+fn binomial_diagnostics_geo_js(
+    inner: &BinomialKrigingModel,
+    build_notes: &BinomialBuildNotes,
+    options: JsValue,
+) -> Result<JsValue, JsValue> {
+    let vm = inner.variogram();
+    let variogram = variogram_to_js_params(vm);
+    let logit_loo_msdr = if options.is_undefined() || options.is_null() {
+        None
+    } else {
+        let inp: BinomialDiagnosticsLooGeo =
+            serde_wasm_bindgen::from_value(options).map_err(err_to_js)?;
+        let n = inner.len();
+        if inp.lats.len() != n
+            || inp.lons.len() != n
+            || inp.successes.len() != n
+            || inp.trials.len() != n
+        {
+            return Err(coded_err(
+                "loo arrays must match model station count",
+                "mismatched_arrays",
+            ));
+        }
+        let coords = to_coords(&inp.lats, &inp.lons)?;
+        let residuals = leave_one_out_cv(&BinomialGeoPredictor {
+            coords: &coords,
+            successes: &inp.successes,
+            trials: &inp.trials,
+            variogram: vm,
+            prior: build_notes.prior,
+        })
+        .map_err(kriging_err_to_js)?;
+        let summary = BinomialCvSummary::from_residuals(&residuals);
+        Some(summary.logit.msdr as f64)
+    };
+    serde_wasm_bindgen::to_value(&JsBinomialDiagnosticsOut {
+        variogram,
+        build_notes: build_notes.clone(),
+        logit_loo_msdr,
+    })
+    .map_err(err_to_js)
+}
+
+fn binomial_diagnostics_projected_js(
+    inner: &BinomialProjectedKrigingModel,
+    build_notes: &BinomialBuildNotes,
+    options: JsValue,
+) -> Result<JsValue, JsValue> {
+    let vm = inner.variogram();
+    let variogram = variogram_to_js_params(vm);
+    let ani = inner.anisotropy();
+    let logit_loo_msdr = if options.is_undefined() || options.is_null() {
+        None
+    } else {
+        let inp: BinomialDiagnosticsLooProjected =
+            serde_wasm_bindgen::from_value(options).map_err(err_to_js)?;
+        let n = inner.len();
+        if inp.xs.len() != n
+            || inp.ys.len() != n
+            || inp.successes.len() != n
+            || inp.trials.len() != n
+        {
+            return Err(coded_err(
+                "loo arrays must match model station count",
+                "mismatched_arrays",
+            ));
+        }
+        let coords: Vec<ProjectedCoord> = inp
+            .xs
+            .iter()
+            .zip(inp.ys.iter())
+            .map(|(&x, &y)| ProjectedCoord::new(x as Real, y as Real))
+            .collect();
+        let residuals = leave_one_out_cv(&BinomialProjectedPredictor {
+            coords: &coords,
+            successes: &inp.successes,
+            trials: &inp.trials,
+            variogram: vm,
+            anisotropy: ani,
+            prior: build_notes.prior,
+        })
+        .map_err(kriging_err_to_js)?;
+        let summary = BinomialCvSummary::from_residuals(&residuals);
+        Some(summary.logit.msdr as f64)
+    };
+    serde_wasm_bindgen::to_value(&JsBinomialDiagnosticsOut {
+        variogram,
+        build_notes: build_notes.clone(),
+        logit_loo_msdr,
+    })
+    .map_err(err_to_js)
+}
+
+fn binomial_diagnostics_tangent_geo_js(
+    inner: &BinomialTangentPlaneKrigingModel,
+    build_notes: &BinomialBuildNotes,
+    options: JsValue,
+) -> Result<JsValue, JsValue> {
+    let vm = inner.variogram();
+    let variogram = variogram_to_js_params(vm);
+    let ani = inner.anisotropy();
+    let reference = inner.reference();
+    let logit_loo_msdr = if options.is_undefined() || options.is_null() {
+        None
+    } else {
+        let inp: BinomialDiagnosticsLooGeo =
+            serde_wasm_bindgen::from_value(options).map_err(err_to_js)?;
+        let n = inner.len();
+        if inp.lats.len() != n
+            || inp.lons.len() != n
+            || inp.successes.len() != n
+            || inp.trials.len() != n
+        {
+            return Err(coded_err(
+                "loo arrays must match model station count",
+                "mismatched_arrays",
+            ));
+        }
+        let mut pcs = Vec::with_capacity(n);
+        for i in 0..n {
+            let g = GeoCoord::try_new(inp.lats[i] as Real, inp.lons[i] as Real)
+                .map_err(kriging_err_to_js)?;
+            pcs.push(ProjectedCoord::equirectangular(g, reference));
+        }
+        let residuals = leave_one_out_cv(&BinomialProjectedPredictor {
+            coords: &pcs,
+            successes: &inp.successes,
+            trials: &inp.trials,
+            variogram: vm,
+            anisotropy: ani,
+            prior: build_notes.prior,
+        })
+        .map_err(kriging_err_to_js)?;
+        let summary = BinomialCvSummary::from_residuals(&residuals);
+        Some(summary.logit.msdr as f64)
+    };
+    serde_wasm_bindgen::to_value(&JsBinomialDiagnosticsOut {
+        variogram,
+        build_notes: build_notes.clone(),
+        logit_loo_msdr,
+    })
+    .map_err(err_to_js)
 }
 
 pub(super) fn map_predictions(out: Vec<crate::kriging::ordinary::Prediction>) -> Vec<JsPrediction> {
@@ -299,9 +537,10 @@ pub(super) fn map_binomial_predictions(
 ) -> Vec<JsBinomialPrediction> {
     out.into_iter()
         .map(|p| JsBinomialPrediction {
-            prevalence: p.prevalence as f64,
-            logit_value: p.logit_value as f64,
-            variance: p.variance as f64,
+            prevalence_median: p.prevalence_median as f64,
+            prevalence_mean: p.prevalence_mean as f64,
+            logit: p.logit as f64,
+            logit_variance: p.logit_variance as f64,
             prevalence_variance: p.prevalence_variance as f64,
         })
         .collect::<Vec<_>>()
@@ -309,18 +548,58 @@ pub(super) fn map_binomial_predictions(
 
 pub(super) fn split_binomial_predictions(
     out: Vec<crate::kriging::binomial::BinomialPrediction>,
-) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mut prevalences = Vec::with_capacity(out.len());
-    let mut logit_values = Vec::with_capacity(out.len());
-    let mut variances = Vec::with_capacity(out.len());
+) -> SplitBinomialArrays {
+    let mut prevalence_medians = Vec::with_capacity(out.len());
+    let mut prevalence_means = Vec::with_capacity(out.len());
+    let mut logits = Vec::with_capacity(out.len());
+    let mut logit_variances = Vec::with_capacity(out.len());
     let mut prevalence_variances = Vec::with_capacity(out.len());
     for pred in out {
-        prevalences.push(pred.prevalence as f64);
-        logit_values.push(pred.logit_value as f64);
-        variances.push(pred.variance as f64);
+        prevalence_medians.push(pred.prevalence_median as f64);
+        prevalence_means.push(pred.prevalence_mean as f64);
+        logits.push(pred.logit as f64);
+        logit_variances.push(pred.logit_variance as f64);
         prevalence_variances.push(pred.prevalence_variance as f64);
     }
-    (prevalences, logit_values, variances, prevalence_variances)
+    (
+        prevalence_medians,
+        prevalence_means,
+        logits,
+        logit_variances,
+        prevalence_variances,
+    )
+}
+
+pub(super) fn set_binomial_flat_array_fields(
+    result: &Object,
+    prevalence_medians: &[f64],
+    prevalence_means: &[f64],
+    logits: &[f64],
+    logit_variances: &[f64],
+    prevalence_variances: &[f64],
+) -> Result<(), JsValue> {
+    set_object_field(
+        result,
+        "prevalenceMedians",
+        &Float64Array::from(prevalence_medians).into(),
+    )?;
+    set_object_field(
+        result,
+        "prevalenceMeans",
+        &Float64Array::from(prevalence_means).into(),
+    )?;
+    set_object_field(result, "logitValues", &Float64Array::from(logits).into())?;
+    set_object_field(
+        result,
+        "logitVariances",
+        &Float64Array::from(logit_variances).into(),
+    )?;
+    set_object_field(
+        result,
+        "prevalenceVariances",
+        &Float64Array::from(prevalence_variances).into(),
+    )?;
+    Ok(())
 }
 
 pub(super) fn set_object_field(obj: &Object, key: &str, value: &JsValue) -> Result<(), JsValue> {
@@ -365,6 +644,10 @@ struct BinomialKrigingOptions {
     successes: Vec<u32>,
     trials: Vec<u32>,
     variogram: VariogramParams,
+    #[serde(default)]
+    stability: Option<String>,
+    #[serde(default)]
+    one_step_laplace_observation_variance: Option<bool>,
 }
 
 /// Prior parameters for binomial kriging (Beta(alpha, beta)).
@@ -385,6 +668,52 @@ struct BinomialKrigingWithPriorOptions {
     trials: Vec<u32>,
     variogram: VariogramParams,
     prior: BinomialPriorParams,
+    #[serde(default)]
+    stability: Option<String>,
+    #[serde(default)]
+    one_step_laplace_observation_variance: Option<bool>,
+}
+
+/// Options for tangent-plane geographic binomial kriging (local equirectangular km plane + 2-D anisotropy).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinomialTangentPlaneKrigingOptions {
+    lats: Vec<f64>,
+    lons: Vec<f64>,
+    successes: Vec<u32>,
+    trials: Vec<u32>,
+    variogram: VariogramParams,
+    major_angle_deg: f64,
+    range_ratio: f64,
+    #[serde(default)]
+    tangent_plane_ref_lat: Option<f64>,
+    #[serde(default)]
+    tangent_plane_ref_lon: Option<f64>,
+    #[serde(default)]
+    stability: Option<String>,
+    #[serde(default)]
+    one_step_laplace_observation_variance: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinomialTangentPlaneKrigingWithPriorOptions {
+    lats: Vec<f64>,
+    lons: Vec<f64>,
+    successes: Vec<u32>,
+    trials: Vec<u32>,
+    variogram: VariogramParams,
+    prior: BinomialPriorParams,
+    major_angle_deg: f64,
+    range_ratio: f64,
+    #[serde(default)]
+    tangent_plane_ref_lat: Option<f64>,
+    #[serde(default)]
+    tangent_plane_ref_lon: Option<f64>,
+    #[serde(default)]
+    stability: Option<String>,
+    #[serde(default)]
+    one_step_laplace_observation_variance: Option<bool>,
 }
 
 #[wasm_bindgen]
@@ -607,7 +936,7 @@ impl WasmBinomialKriging {
         if observations.len() < 2 {
             return Err(coded_err(
                 "need at least two non-zero-trial sites after dropping trials==0 rows",
-                "insufficient_data",
+                "too_few_points",
             ));
         }
         let model = parse_variogram(
@@ -617,7 +946,10 @@ impl WasmBinomialKriging {
             opts.variogram.range,
             opts.variogram.shape,
         )?;
-        let hcfg = HeteroskedasticBinomialConfig::default();
+        let hcfg = merge_hetero_with_optional_one_step_laplace(
+            heteroskedastic_config_from_optional_stability_str(opts.stability.as_deref())?,
+            opts.one_step_laplace_observation_variance,
+        );
         let fit = BinomialKrigingModel::new_with_config(
             observations,
             model,
@@ -645,16 +977,21 @@ impl WasmBinomialKriging {
         sill: f64,
         range: f64,
         shape: Option<f64>,
+        stability: Option<String>,
+        one_step_laplace_observation_variance: Option<bool>,
     ) -> Result<WasmBinomialKriging, JsValue> {
         let (observations, zero_trial_drops) = build_observations(lats, lons, successes, trials)?;
         if observations.len() < 2 {
             return Err(coded_err(
                 "need at least two non-zero-trial sites after dropping trials==0 rows",
-                "insufficient_data",
+                "too_few_points",
             ));
         }
         let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
-        let hcfg = HeteroskedasticBinomialConfig::default();
+        let hcfg = merge_hetero_with_optional_one_step_laplace(
+            heteroskedastic_config_from_optional_stability_str(stability.as_deref())?,
+            one_step_laplace_observation_variance,
+        );
         let fit = BinomialKrigingModel::new_with_config(
             observations,
             model,
@@ -700,6 +1037,65 @@ impl WasmBinomialKriging {
         })
     }
 
+    /// Pre-computed logits with a per-site **logit observation variance** on the diagonal
+    /// (same length as coordinates). Optional `prior_alpha` / `prior_beta` (must be supplied
+    /// together) set the prior on build notes; optional `stability` selects the heteroskedastic
+    /// inflation preset (`"default"`, `"strict"`, or `"permissive"`, case-insensitive).
+    #[wasm_bindgen(js_name = fromPrecomputedLogitsWithVariances)]
+    pub fn from_precomputed_logits_with_variances(
+        lats: &[f64],
+        lons: &[f64],
+        logits: &[f64],
+        logit_observation_variance: &[f64],
+        variogram_type: &str,
+        nugget: f64,
+        sill: f64,
+        range: f64,
+        shape: Option<f64>,
+        prior_alpha: Option<f64>,
+        prior_beta: Option<f64>,
+        stability: Option<String>,
+        one_step_laplace_observation_variance: Option<bool>,
+    ) -> Result<WasmBinomialKriging, JsValue> {
+        if logits.len() != lats.len() || logits.len() != lons.len() {
+            return Err(coded_err(
+                "logits must have the same length as lats and lons",
+                "mismatched_arrays",
+            ));
+        }
+        if logit_observation_variance.len() != logits.len() {
+            return Err(coded_err(
+                "logitObservationVariance must have the same length as logits",
+                "mismatched_arrays",
+            ));
+        }
+        let coords = to_coords(lats, lons)?;
+        let logits_real: Vec<Real> = logits.iter().map(|v| *v as Real).collect();
+        let base_var: Vec<Real> = logit_observation_variance
+            .iter()
+            .map(|v| *v as Real)
+            .collect();
+        let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
+        let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
+        let hcfg = merge_hetero_with_optional_one_step_laplace(
+            heteroskedastic_config_from_optional_stability_str(stability.as_deref())?,
+            one_step_laplace_observation_variance,
+        );
+        let fit = BinomialKrigingModel::from_precomputed_logits_with_logit_observation_variances(
+            coords,
+            logits_real,
+            model,
+            base_var,
+            hcfg,
+            prior,
+        )
+        .map_err(kriging_err_to_js)?;
+        Ok(Self {
+            inner: fit.model,
+            build_notes: fit.notes,
+        })
+    }
+
     #[wasm_bindgen(js_name = newWithPrior)]
     pub fn new_with_prior(options: JsValue) -> Result<WasmBinomialKriging, JsValue> {
         let opts: BinomialKrigingWithPriorOptions =
@@ -709,7 +1105,7 @@ impl WasmBinomialKriging {
         if observations.len() < 2 {
             return Err(coded_err(
                 "need at least two non-zero-trial sites after dropping trials==0 rows",
-                "insufficient_data",
+                "too_few_points",
             ));
         }
         let model = parse_variogram(
@@ -721,7 +1117,10 @@ impl WasmBinomialKriging {
         )?;
         let prior = BinomialPrior::new(opts.prior.alpha as Real, opts.prior.beta as Real)
             .map_err(kriging_err_to_js)?;
-        let hcfg = HeteroskedasticBinomialConfig::default();
+        let hcfg = merge_hetero_with_optional_one_step_laplace(
+            heteroskedastic_config_from_optional_stability_str(opts.stability.as_deref())?,
+            opts.one_step_laplace_observation_variance,
+        );
         let fit = BinomialKrigingModel::new_with_config(
             observations,
             model,
@@ -743,13 +1142,24 @@ impl WasmBinomialKriging {
         serde_wasm_bindgen::to_value(&self.build_notes).map_err(err_to_js)
     }
 
+    /// Variogram parameters, [`BinomialBuildNotes`], and optional leave-one-out logit MSDR.
+    ///
+    /// Pass a JS object `{ lats, lons, successes, trials }` (same lengths as the training
+    /// station count) to compute [`BinomialDiagnostics::logit_loo_msdr`]; omit or pass
+    /// `undefined` to skip LOO.
+    #[wasm_bindgen(js_name = getDiagnostics)]
+    pub fn get_diagnostics(&self, options: JsValue) -> Result<JsValue, JsValue> {
+        binomial_diagnostics_geo_js(&self.inner, &self.build_notes, options)
+    }
+
     pub fn predict(&self, lat: f64, lon: f64) -> Result<JsValue, JsValue> {
         let coord = GeoCoord::try_new(lat as Real, lon as Real).map_err(kriging_err_to_js)?;
         let pred = self.inner.predict(coord).map_err(kriging_err_to_js)?;
         serde_wasm_bindgen::to_value(&JsBinomialPrediction {
-            prevalence: pred.prevalence as f64,
-            logit_value: pred.logit_value as f64,
-            variance: pred.variance as f64,
+            prevalence_median: pred.prevalence_median as f64,
+            prevalence_mean: pred.prevalence_mean as f64,
+            logit: pred.logit as f64,
+            logit_variance: pred.logit_variance as f64,
             prevalence_variance: pred.prevalence_variance as f64,
         })
         .map_err(err_to_js)
@@ -772,21 +1182,9 @@ impl WasmBinomialKriging {
             .inner
             .predict_batch(&coords)
             .map_err(kriging_err_to_js)?;
-        let (prevalences, logit_values, variances, prevalence_variances) =
-            split_binomial_predictions(out);
-        let prevalences_array = Float64Array::from(prevalences.as_slice());
-        let logit_values_array = Float64Array::from(logit_values.as_slice());
-        let variances_array = Float64Array::from(variances.as_slice());
-        let prevalence_variances_array = Float64Array::from(prevalence_variances.as_slice());
+        let (pm, pmean, logits, lv, pv) = split_binomial_predictions(out);
         let result = Object::new();
-        set_object_field(&result, "prevalences", &prevalences_array.into())?;
-        set_object_field(&result, "logitValues", &logit_values_array.into())?;
-        set_object_field(&result, "variances", &variances_array.into())?;
-        set_object_field(
-            &result,
-            "prevalenceVariances",
-            &prevalence_variances_array.into(),
-        )?;
+        set_binomial_flat_array_fields(&result, &pm, &pmean, &logits, &lv, &pv)?;
         Ok(result.into())
     }
 
@@ -807,29 +1205,9 @@ impl WasmBinomialKriging {
             .inner
             .predict_batch(&coords)
             .map_err(kriging_err_to_js)?;
-        let (prevalences, logit_values, variances, prevalence_variances) =
-            split_binomial_predictions(out);
+        let (pm, pmean, logits, lv, pv) = split_binomial_predictions(out);
         let result = Object::new();
-        set_object_field(
-            &result,
-            "prevalences",
-            &Float64Array::from(prevalences.as_slice()).into(),
-        )?;
-        set_object_field(
-            &result,
-            "logitValues",
-            &Float64Array::from(logit_values.as_slice()).into(),
-        )?;
-        set_object_field(
-            &result,
-            "variances",
-            &Float64Array::from(variances.as_slice()).into(),
-        )?;
-        set_object_field(
-            &result,
-            "prevalenceVariances",
-            &Float64Array::from(prevalence_variances.as_slice()).into(),
-        )?;
+        set_binomial_flat_array_fields(&result, &pm, &pmean, &logits, &lv, &pv)?;
         set_object_field(&result, "nRows", &JsValue::from_f64(y_cells as f64))?;
         set_object_field(&result, "nCols", &JsValue::from_f64(x_cells as f64))?;
         Ok(result.into())
@@ -861,6 +1239,239 @@ impl WasmBinomialKriging {
             .await
             .map_err(kriging_err_to_js)?;
         serde_wasm_bindgen::to_value(&map_binomial_predictions(out)).map_err(err_to_js)
+    }
+}
+
+fn wasm_build_binomial_tangent_plane_inner(
+    lats: &[f64],
+    lons: &[f64],
+    successes: &[u32],
+    trials: &[u32],
+    variogram: VariogramModel,
+    prior: BinomialPrior,
+    hcfg: HeteroskedasticBinomialConfig,
+    ref_lat: Option<f64>,
+    ref_lon: Option<f64>,
+    major_angle_deg: f64,
+    range_ratio: f64,
+) -> Result<WasmBinomialTangentPlaneKriging, JsValue> {
+    let (observations, zero_trial_drops) = build_observations(lats, lons, successes, trials)?;
+    if observations.len() < 2 {
+        return Err(coded_err(
+            "need at least two non-zero-trial sites after dropping trials==0 rows",
+            "too_few_points",
+        ));
+    }
+    let reference = match (ref_lat, ref_lon) {
+        (Some(lat), Some(lon)) => {
+            GeoCoord::try_new(lat as Real, lon as Real).map_err(kriging_err_to_js)?
+        }
+        (None, None) => {
+            tangent_plane_reference_centroid(&observations).map_err(kriging_err_to_js)?
+        }
+        _ => {
+            return Err(coded_err(
+                "tangentPlaneRefLat and tangentPlaneRefLon must both be set or both omitted",
+                "invalid_input",
+            ));
+        }
+    };
+    let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
+        .map_err(kriging_err_to_js)?;
+    let fit = BinomialTangentPlaneKrigingModel::new_with_prior(
+        observations,
+        variogram,
+        prior,
+        hcfg,
+        &zero_trial_drops,
+        reference,
+        anisotropy,
+    )
+    .map_err(kriging_err_to_js)?;
+    Ok(WasmBinomialTangentPlaneKriging {
+        inner: fit.model,
+        build_notes: fit.notes,
+    })
+}
+
+#[wasm_bindgen]
+pub struct WasmBinomialTangentPlaneKriging {
+    inner: BinomialTangentPlaneKrigingModel,
+    build_notes: BinomialBuildNotes,
+}
+
+#[wasm_bindgen]
+impl WasmBinomialTangentPlaneKriging {
+    #[wasm_bindgen(constructor)]
+    pub fn new(options: JsValue) -> Result<WasmBinomialTangentPlaneKriging, JsValue> {
+        let opts: BinomialTangentPlaneKrigingOptions =
+            serde_wasm_bindgen::from_value(options).map_err(err_to_js)?;
+        let model = parse_variogram(
+            &opts.variogram.variogram_type,
+            opts.variogram.nugget,
+            opts.variogram.sill,
+            opts.variogram.range,
+            opts.variogram.shape,
+        )?;
+        let hcfg = merge_hetero_with_optional_one_step_laplace(
+            heteroskedastic_config_from_optional_stability_str(opts.stability.as_deref())?,
+            opts.one_step_laplace_observation_variance,
+        );
+        wasm_build_binomial_tangent_plane_inner(
+            &opts.lats,
+            &opts.lons,
+            &opts.successes,
+            &opts.trials,
+            model,
+            BinomialPrior::default(),
+            hcfg,
+            opts.tangent_plane_ref_lat,
+            opts.tangent_plane_ref_lon,
+            opts.major_angle_deg,
+            opts.range_ratio,
+        )
+    }
+
+    #[wasm_bindgen(js_name = newWithPrior)]
+    pub fn new_with_prior(options: JsValue) -> Result<WasmBinomialTangentPlaneKriging, JsValue> {
+        let opts: BinomialTangentPlaneKrigingWithPriorOptions =
+            serde_wasm_bindgen::from_value(options).map_err(err_to_js)?;
+        let model = parse_variogram(
+            &opts.variogram.variogram_type,
+            opts.variogram.nugget,
+            opts.variogram.sill,
+            opts.variogram.range,
+            opts.variogram.shape,
+        )?;
+        let prior = BinomialPrior::new(opts.prior.alpha as Real, opts.prior.beta as Real)
+            .map_err(kriging_err_to_js)?;
+        let hcfg = merge_hetero_with_optional_one_step_laplace(
+            heteroskedastic_config_from_optional_stability_str(opts.stability.as_deref())?,
+            opts.one_step_laplace_observation_variance,
+        );
+        wasm_build_binomial_tangent_plane_inner(
+            &opts.lats,
+            &opts.lons,
+            &opts.successes,
+            &opts.trials,
+            model,
+            prior,
+            hcfg,
+            opts.tangent_plane_ref_lat,
+            opts.tangent_plane_ref_lon,
+            opts.major_angle_deg,
+            opts.range_ratio,
+        )
+    }
+
+    #[wasm_bindgen(js_name = fromArrays)]
+    pub fn from_arrays(
+        lats: &[f64],
+        lons: &[f64],
+        successes: &[u32],
+        trials: &[u32],
+        variogram_type: &str,
+        nugget: f64,
+        sill: f64,
+        range: f64,
+        shape: Option<f64>,
+        major_angle_deg: f64,
+        range_ratio: f64,
+        tangent_plane_ref_lat: Option<f64>,
+        tangent_plane_ref_lon: Option<f64>,
+        stability: Option<String>,
+        one_step_laplace_observation_variance: Option<bool>,
+    ) -> Result<WasmBinomialTangentPlaneKriging, JsValue> {
+        let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
+        let hcfg = merge_hetero_with_optional_one_step_laplace(
+            heteroskedastic_config_from_optional_stability_str(stability.as_deref())?,
+            one_step_laplace_observation_variance,
+        );
+        wasm_build_binomial_tangent_plane_inner(
+            lats,
+            lons,
+            successes,
+            trials,
+            model,
+            BinomialPrior::default(),
+            hcfg,
+            tangent_plane_ref_lat,
+            tangent_plane_ref_lon,
+            major_angle_deg,
+            range_ratio,
+        )
+    }
+
+    #[wasm_bindgen(js_name = getBuildNotes)]
+    pub fn get_build_notes(&self) -> Result<JsValue, JsValue> {
+        serde_wasm_bindgen::to_value(&self.build_notes).map_err(err_to_js)
+    }
+
+    /// Same JSON shape as [`WasmBinomialKriging::get_diagnostics`]. LOO uses `{ lats, lons,
+    /// successes, trials }` in degrees; coordinates are mapped to the model tangent plane
+    /// with the same reference as the fit before projected LOO.
+    #[wasm_bindgen(js_name = getDiagnostics)]
+    pub fn get_diagnostics(&self, options: JsValue) -> Result<JsValue, JsValue> {
+        binomial_diagnostics_tangent_geo_js(&self.inner, &self.build_notes, options)
+    }
+
+    pub fn predict(&self, lat: f64, lon: f64) -> Result<JsValue, JsValue> {
+        let coord = GeoCoord::try_new(lat as Real, lon as Real).map_err(kriging_err_to_js)?;
+        let pred = self.inner.predict(coord).map_err(kriging_err_to_js)?;
+        serde_wasm_bindgen::to_value(&JsBinomialPrediction {
+            prevalence_median: pred.prevalence_median as f64,
+            prevalence_mean: pred.prevalence_mean as f64,
+            logit: pred.logit as f64,
+            logit_variance: pred.logit_variance as f64,
+            prevalence_variance: pred.prevalence_variance as f64,
+        })
+        .map_err(err_to_js)
+    }
+
+    #[wasm_bindgen(js_name = predictBatch)]
+    pub fn predict_batch(&self, lats: &[f64], lons: &[f64]) -> Result<JsValue, JsValue> {
+        let coords = to_coords(lats, lons)?;
+        let out = self
+            .inner
+            .predict_batch(&coords)
+            .map_err(kriging_err_to_js)?;
+        serde_wasm_bindgen::to_value(&map_binomial_predictions(out)).map_err(err_to_js)
+    }
+
+    #[wasm_bindgen(js_name = predictBatchArrays)]
+    pub fn predict_batch_arrays(&self, lats: &[f64], lons: &[f64]) -> Result<JsValue, JsValue> {
+        let coords = to_coords(lats, lons)?;
+        let out = self
+            .inner
+            .predict_batch(&coords)
+            .map_err(kriging_err_to_js)?;
+        let (pm, pmean, logits, lv, pv) = split_binomial_predictions(out);
+        let result = Object::new();
+        set_binomial_flat_array_fields(&result, &pm, &pmean, &logits, &lv, &pv)?;
+        Ok(result.into())
+    }
+
+    #[wasm_bindgen(js_name = predictGridArrays)]
+    pub fn predict_grid_arrays(
+        &self,
+        x_min: f64,
+        x_max: f64,
+        y_min: f64,
+        y_max: f64,
+        x_cells: usize,
+        y_cells: usize,
+    ) -> Result<JsValue, JsValue> {
+        let coords = build_grid_coords(x_min, x_max, y_min, y_max, x_cells, y_cells)?;
+        let out = self
+            .inner
+            .predict_batch(&coords)
+            .map_err(kriging_err_to_js)?;
+        let (pm, pmean, logits, lv, pv) = split_binomial_predictions(out);
+        let result = Object::new();
+        set_binomial_flat_array_fields(&result, &pm, &pmean, &logits, &lv, &pv)?;
+        set_object_field(&result, "nRows", &JsValue::from_f64(y_cells as f64))?;
+        set_object_field(&result, "nCols", &JsValue::from_f64(x_cells as f64))?;
+        Ok(result.into())
     }
 }
 
@@ -923,6 +1534,119 @@ pub fn wasm_fit_ordinary_variogram(
         range: range as f64,
         shape: fit.model.shape().map(|s| s as f64),
         residuals: fit.residuals as f64,
+    })
+    .map_err(err_to_js)
+}
+
+/// Fit a parametric variogram to binomial count data using the noise-calibrated empirical
+/// variogram on EB-smoothed logits (same path as the binomial kriger). Requires the classical
+/// empirical estimator (Cressie–Hawkins is not supported for this path).
+#[wasm_bindgen(js_name = fitBinomialVariogram)]
+pub fn wasm_fit_binomial_variogram(
+    sample_lats: &[f64],
+    sample_lons: &[f64],
+    successes: &[u32],
+    trials: &[u32],
+    max_distance: Option<f64>,
+    n_bins: usize,
+    variogram_type: WasmVariogramType,
+    estimator: Option<String>,
+    prior_alpha: Option<f64>,
+    prior_beta: Option<f64>,
+    rel_weight_eps: Option<f64>,
+) -> Result<JsValue, JsValue> {
+    if sample_lats.len() != sample_lons.len()
+        || sample_lats.len() != successes.len()
+        || sample_lats.len() != trials.len()
+    {
+        return Err(coded_err(
+            "lats, lons, successes, and trials must have the same length",
+            "mismatched_arrays",
+        ));
+    }
+    let sample_coords = to_coords(sample_lats, sample_lons)?;
+    let n_bins = NonZeroUsize::new(n_bins)
+        .ok_or_else(|| coded_err("n_bins must be at least 1", "invalid_bins"))?;
+    let max_distance = match max_distance {
+        Some(v) if v > 0.0 && v.is_finite() => {
+            Some(PositiveReal::try_new(v as Real).map_err(kriging_err_to_js)?)
+        }
+        Some(_) => {
+            return Err(coded_err(
+                "max_distance must be finite and positive",
+                "invalid_input",
+            ));
+        }
+        None => None,
+    };
+    let estimator = parse_estimator(estimator.as_deref())?;
+    if !matches!(estimator, EmpiricalEstimator::Classical) {
+        return Err(coded_err(
+            "fitBinomialVariogram requires estimator 'classical' (Cressie-Hawkins is not supported for the calibrated binomial empirical variogram)",
+            "invalid_input",
+        ));
+    }
+    let config = VariogramConfig {
+        max_distance,
+        n_bins,
+        estimator,
+    };
+    let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
+    let eps = match rel_weight_eps {
+        Some(v) if v.is_finite() && v > 0.0 => v as Real,
+        Some(_) => {
+            return Err(coded_err(
+                "rel_weight_eps must be finite and positive",
+                "invalid_input",
+            ));
+        }
+        None => 1e-12 as Real,
+    };
+    let crate_type = VariogramType::from(variogram_type);
+    let fit = fit_binomial_variogram(
+        sample_coords,
+        successes,
+        trials,
+        prior,
+        &config,
+        crate_type,
+        eps,
+    )
+    .map_err(kriging_err_to_js)?;
+    let (nugget, sill, range) = fit.model.params();
+    serde_wasm_bindgen::to_value(&JsFittedVariogram {
+        variogram_type: variogram_type_name(crate_type).to_string(),
+        nugget: nugget as f64,
+        sill: sill as f64,
+        range: range as f64,
+        shape: fit.model.shape().map(|s| s as f64),
+        residuals: fit.residuals as f64,
+    })
+    .map_err(err_to_js)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsEstimatedBinomialPrior {
+    alpha: f64,
+    beta: f64,
+}
+
+/// Heuristic Beta(α, β) from pooled station counts (same rule as `prior: "auto"` on the
+/// binomial variogram fit and one-shot grid interpolation).
+#[wasm_bindgen(js_name = estimateBinomialPrior)]
+pub fn wasm_estimate_binomial_prior(successes: &[u32], trials: &[u32]) -> Result<JsValue, JsValue> {
+    if successes.len() != trials.len() {
+        return Err(coded_err(
+            "successes and trials must have the same length",
+            "mismatched_arrays",
+        ));
+    }
+    let prior =
+        estimate_binomial_prior_from_counts(successes, trials).map_err(kriging_err_to_js)?;
+    serde_wasm_bindgen::to_value(&JsEstimatedBinomialPrior {
+        alpha: prior.alpha() as f64,
+        beta: prior.beta() as f64,
     })
     .map_err(err_to_js)
 }
@@ -1396,20 +2120,33 @@ impl WasmBinomialProjectedKriging {
         shape: Option<f64>,
         major_angle_deg: f64,
         range_ratio: f64,
+        stability: Option<String>,
+        one_step_laplace_observation_variance: Option<bool>,
     ) -> Result<WasmBinomialProjectedKriging, JsValue> {
         let (observations, zero_trial_drops) =
             build_projected_binomial_observations(xs, ys, successes, trials)?;
         if observations.len() < 2 {
             return Err(coded_err(
                 "need at least two non-zero-trial sites after dropping trials==0 rows",
-                "insufficient_data",
+                "too_few_points",
             ));
         }
         let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
         let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
             .map_err(kriging_err_to_js)?;
-        let fit = BinomialProjectedKrigingModel::new(observations, model, anisotropy)
-            .map_err(kriging_err_to_js)?;
+        let prior = BinomialPrior::default();
+        let hcfg = merge_hetero_with_optional_one_step_laplace(
+            heteroskedastic_config_from_optional_stability_str(stability.as_deref())?,
+            one_step_laplace_observation_variance,
+        );
+        let fit = BinomialProjectedKrigingModel::new_with_prior(
+            observations,
+            model,
+            anisotropy,
+            prior,
+            hcfg,
+        )
+        .map_err(kriging_err_to_js)?;
         let mut build_notes = fit.notes;
         build_notes.zero_trial_dropped_indices = zero_trial_drops;
         build_notes.zero_trial_dropped_indices.sort_unstable();
@@ -1435,13 +2172,15 @@ impl WasmBinomialProjectedKriging {
         range_ratio: f64,
         prior_alpha: f64,
         prior_beta: f64,
+        stability: Option<String>,
+        one_step_laplace_observation_variance: Option<bool>,
     ) -> Result<WasmBinomialProjectedKriging, JsValue> {
         let (observations, zero_trial_drops) =
             build_projected_binomial_observations(xs, ys, successes, trials)?;
         if observations.len() < 2 {
             return Err(coded_err(
                 "need at least two non-zero-trial sites after dropping trials==0 rows",
-                "insufficient_data",
+                "too_few_points",
             ));
         }
         let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
@@ -1449,9 +2188,18 @@ impl WasmBinomialProjectedKriging {
             .map_err(kriging_err_to_js)?;
         let prior = BinomialPrior::new(prior_alpha as Real, prior_beta as Real)
             .map_err(kriging_err_to_js)?;
-        let fit =
-            BinomialProjectedKrigingModel::new_with_prior(observations, model, anisotropy, prior)
-                .map_err(kriging_err_to_js)?;
+        let hcfg = merge_hetero_with_optional_one_step_laplace(
+            heteroskedastic_config_from_optional_stability_str(stability.as_deref())?,
+            one_step_laplace_observation_variance,
+        );
+        let fit = BinomialProjectedKrigingModel::new_with_prior(
+            observations,
+            model,
+            anisotropy,
+            prior,
+            hcfg,
+        )
+        .map_err(kriging_err_to_js)?;
         let mut build_notes = fit.notes;
         build_notes.zero_trial_dropped_indices = zero_trial_drops;
         build_notes.zero_trial_dropped_indices.sort_unstable();
@@ -1504,6 +2252,73 @@ impl WasmBinomialProjectedKriging {
         })
     }
 
+    /// Like [`Self::from_precomputed_logits`], with per-site logit observation variances on the
+    /// diagonal (same length as `xs`). Optional `prior_alpha` / `prior_beta` must be supplied
+    /// together for build notes.
+    #[wasm_bindgen(js_name = fromPrecomputedLogitsWithVariances)]
+    pub fn from_precomputed_logits_with_variances(
+        xs: &[f64],
+        ys: &[f64],
+        logits: &[f64],
+        logit_observation_variance: &[f64],
+        variogram_type: &str,
+        nugget: f64,
+        sill: f64,
+        range: f64,
+        shape: Option<f64>,
+        major_angle_deg: f64,
+        range_ratio: f64,
+        prior_alpha: Option<f64>,
+        prior_beta: Option<f64>,
+        stability: Option<String>,
+        one_step_laplace_observation_variance: Option<bool>,
+    ) -> Result<WasmBinomialProjectedKriging, JsValue> {
+        if xs.len() != ys.len() || xs.len() != logits.len() {
+            return Err(coded_err(
+                "xs, ys and logits must have the same length",
+                "mismatched_arrays",
+            ));
+        }
+        if logit_observation_variance.len() != logits.len() {
+            return Err(coded_err(
+                "logitObservationVariance must have the same length as logits",
+                "mismatched_arrays",
+            ));
+        }
+        let coords: Vec<ProjectedCoord> = xs
+            .iter()
+            .zip(ys.iter())
+            .map(|(&x, &y)| ProjectedCoord::new(x as Real, y as Real))
+            .collect();
+        let logits_real: Vec<Real> = logits.iter().map(|v| *v as Real).collect();
+        let base_var: Vec<Real> = logit_observation_variance
+            .iter()
+            .map(|v| *v as Real)
+            .collect();
+        let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
+        let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
+            .map_err(kriging_err_to_js)?;
+        let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
+        let hcfg = merge_hetero_with_optional_one_step_laplace(
+            heteroskedastic_config_from_optional_stability_str(stability.as_deref())?,
+            one_step_laplace_observation_variance,
+        );
+        let fit = BinomialProjectedKrigingModel::from_precomputed_logits_with_logit_observation_variances(
+            coords,
+            logits_real,
+            model,
+            anisotropy,
+            base_var,
+            hcfg,
+            prior,
+        )
+        .map_err(kriging_err_to_js)?;
+        Ok(Self {
+            inner: fit.model,
+            build_notes: fit.notes,
+        })
+    }
+
     /// Build / conditioning diagnostics for the projected binomial model. See
     /// [`BinomialBuildNotes`].
     #[wasm_bindgen(js_name = getBuildNotes)]
@@ -1511,13 +2326,21 @@ impl WasmBinomialProjectedKriging {
         serde_wasm_bindgen::to_value(&self.build_notes).map_err(err_to_js)
     }
 
+    /// Same JSON shape as [`WasmBinomialKriging::get_diagnostics`]. LOO uses `{ xs, ys,
+    /// successes, trials }` in the same planar units as the fit.
+    #[wasm_bindgen(js_name = getDiagnostics)]
+    pub fn get_diagnostics(&self, options: JsValue) -> Result<JsValue, JsValue> {
+        binomial_diagnostics_projected_js(&self.inner, &self.build_notes, options)
+    }
+
     pub fn predict(&self, x: f64, y: f64) -> Result<JsValue, JsValue> {
         let coord = ProjectedCoord::new(x as Real, y as Real);
         let pred = self.inner.predict(coord).map_err(kriging_err_to_js)?;
         serde_wasm_bindgen::to_value(&JsBinomialPrediction {
-            prevalence: pred.prevalence as f64,
-            logit_value: pred.logit_value as f64,
-            variance: pred.variance as f64,
+            prevalence_median: pred.prevalence_median as f64,
+            prevalence_mean: pred.prevalence_mean as f64,
+            logit: pred.logit as f64,
+            logit_variance: pred.logit_variance as f64,
             prevalence_variance: pred.prevalence_variance as f64,
         })
         .map_err(err_to_js)
@@ -1560,29 +2383,34 @@ impl WasmBinomialProjectedKriging {
             .inner
             .predict_batch(&coords)
             .map_err(kriging_err_to_js)?;
-        let (prevalences, logit_values, variances, prevalence_variances) =
-            split_binomial_predictions(out);
+        let (pm, pmean, logits, lv, pv) = split_binomial_predictions(out);
         let result = Object::new();
-        set_object_field(
-            &result,
-            "prevalences",
-            &Float64Array::from(prevalences.as_slice()).into(),
-        )?;
-        set_object_field(
-            &result,
-            "logitValues",
-            &Float64Array::from(logit_values.as_slice()).into(),
-        )?;
-        set_object_field(
-            &result,
-            "variances",
-            &Float64Array::from(variances.as_slice()).into(),
-        )?;
-        set_object_field(
-            &result,
-            "prevalenceVariances",
-            &Float64Array::from(prevalence_variances.as_slice()).into(),
-        )?;
+        set_binomial_flat_array_fields(&result, &pm, &pmean, &logits, &lv, &pv)?;
+        Ok(result.into())
+    }
+
+    /// Predict a regular `(x, y)` grid in one call; returns flat `Float64Array`s in row-major
+    /// order (`y` outer, `x` inner), same layout as geo `WasmBinomialKriging::predict_grid_arrays`.
+    #[wasm_bindgen(js_name = predictGridArrays)]
+    pub fn predict_grid_arrays(
+        &self,
+        x_min: f64,
+        x_max: f64,
+        y_min: f64,
+        y_max: f64,
+        x_cells: usize,
+        y_cells: usize,
+    ) -> Result<JsValue, JsValue> {
+        let coords = build_projected_grid_coords(x_min, x_max, y_min, y_max, x_cells, y_cells)?;
+        let out = self
+            .inner
+            .predict_batch(&coords)
+            .map_err(kriging_err_to_js)?;
+        let (pm, pmean, logits, lv, pv) = split_binomial_predictions(out);
+        let result = Object::new();
+        set_binomial_flat_array_fields(&result, &pm, &pmean, &logits, &lv, &pv)?;
+        set_object_field(&result, "nRows", &JsValue::from_f64(y_cells as f64))?;
+        set_object_field(&result, "nCols", &JsValue::from_f64(x_cells as f64))?;
         Ok(result.into())
     }
 }
@@ -1668,7 +2496,12 @@ pub fn wasm_leave_one_out(
     let coords = to_coords(lats, lons)?;
     let values_real: Vec<Real> = values.iter().map(|v| *v as Real).collect();
     let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
-    let residuals = leave_one_out(&coords, &values_real, model).map_err(kriging_err_to_js)?;
+    let residuals = leave_one_out_cv(&OrdinaryGeoPredictor {
+        coords: &coords,
+        values: &values_real,
+        variogram: model,
+    })
+    .map_err(kriging_err_to_js)?;
     cv_result_to_js(residuals)
 }
 
@@ -1695,7 +2528,15 @@ pub fn wasm_k_fold(
     let coords = to_coords(lats, lons)?;
     let values_real: Vec<Real> = values.iter().map(|v| *v as Real).collect();
     let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
-    let residuals = k_fold(&coords, &values_real, model, k).map_err(kriging_err_to_js)?;
+    let residuals = k_fold_cv(
+        &OrdinaryGeoPredictor {
+            coords: &coords,
+            values: &values_real,
+            variogram: model,
+        },
+        k,
+    )
+    .map_err(kriging_err_to_js)?;
     cv_result_to_js(residuals)
 }
 
@@ -1724,8 +2565,13 @@ pub fn wasm_leave_one_out_simple(
     }
     let values_real: Vec<Real> = values.iter().map(|v| *v as Real).collect();
     let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
-    let residuals = leave_one_out_simple(&coords, &values_real, model, mean as Real)
-        .map_err(kriging_err_to_js)?;
+    let residuals = leave_one_out_cv(&SimpleGeoPredictor {
+        coords: &coords,
+        values: &values_real,
+        variogram: model,
+        mean: mean as Real,
+    })
+    .map_err(kriging_err_to_js)?;
     cv_result_to_js(residuals)
 }
 
@@ -1752,8 +2598,16 @@ pub fn wasm_k_fold_simple(
     }
     let values_real: Vec<Real> = values.iter().map(|v| *v as Real).collect();
     let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
-    let residuals =
-        k_fold_simple(&coords, &values_real, model, mean as Real, k).map_err(kriging_err_to_js)?;
+    let residuals = k_fold_cv(
+        &SimpleGeoPredictor {
+            coords: &coords,
+            values: &values_real,
+            variogram: model,
+            mean: mean as Real,
+        },
+        k,
+    )
+    .map_err(kriging_err_to_js)?;
     cv_result_to_js(residuals)
 }
 
@@ -1783,8 +2637,13 @@ pub fn wasm_leave_one_out_universal(
     let values_real: Vec<Real> = values.iter().map(|v| *v as Real).collect();
     let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
     let trend_enum = parse_trend(trend)?;
-    let residuals = leave_one_out_universal(&coords, &values_real, model, trend_enum)
-        .map_err(kriging_err_to_js)?;
+    let residuals = leave_one_out_cv(&UniversalGeoPredictor {
+        coords: &coords,
+        values: &values_real,
+        variogram: model,
+        trend: trend_enum,
+    })
+    .map_err(kriging_err_to_js)?;
     cv_result_to_js(residuals)
 }
 
@@ -1812,8 +2671,16 @@ pub fn wasm_k_fold_universal(
     let values_real: Vec<Real> = values.iter().map(|v| *v as Real).collect();
     let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
     let trend_enum = parse_trend(trend)?;
-    let residuals =
-        k_fold_universal(&coords, &values_real, model, trend_enum, k).map_err(kriging_err_to_js)?;
+    let residuals = k_fold_cv(
+        &UniversalGeoPredictor {
+            coords: &coords,
+            values: &values_real,
+            variogram: model,
+            trend: trend_enum,
+        },
+        k,
+    )
+    .map_err(kriging_err_to_js)?;
     cv_result_to_js(residuals)
 }
 
@@ -1850,8 +2717,13 @@ pub fn wasm_leave_one_out_projected(
     let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
     let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
         .map_err(kriging_err_to_js)?;
-    let residuals = leave_one_out_projected(&coords, &values_real, model, anisotropy)
-        .map_err(kriging_err_to_js)?;
+    let residuals = leave_one_out_cv(&ProjectedOrdinaryPredictor {
+        coords: &coords,
+        values: &values_real,
+        variogram: model,
+        anisotropy,
+    })
+    .map_err(kriging_err_to_js)?;
     cv_result_to_js(residuals)
 }
 
@@ -1885,8 +2757,16 @@ pub fn wasm_k_fold_projected(
     let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
     let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
         .map_err(kriging_err_to_js)?;
-    let residuals =
-        k_fold_projected(&coords, &values_real, model, anisotropy, k).map_err(kriging_err_to_js)?;
+    let residuals = k_fold_cv(
+        &ProjectedOrdinaryPredictor {
+            coords: &coords,
+            values: &values_real,
+            variogram: model,
+            anisotropy,
+        },
+        k,
+    )
+    .map_err(kriging_err_to_js)?;
     cv_result_to_js(residuals)
 }
 
@@ -1982,6 +2862,22 @@ pub(super) fn binomial_cv_result_to_js(
             rmse: summary.prevalence.rmse as f64,
             msdr: summary.prevalence.msdr as f64,
         },
+        brier: summary.brier as f64,
+        log_score_per_trial: summary.log_score_per_trial as f64,
+        calibration_bins: summary
+            .calibration_bins
+            .iter()
+            .map(|b| JsPrevalenceCalibrationBin {
+                bin_index: b.bin_index,
+                predicted_lo: b.predicted_lo as f64,
+                predicted_hi: b.predicted_hi as f64,
+                n_stations: b.n_stations,
+                sum_trials: b.sum_trials,
+                sum_successes: b.sum_successes,
+                mean_predicted: b.mean_predicted as f64,
+                pooled_observed_prevalence: b.pooled_observed_prevalence as f64,
+            })
+            .collect(),
     })
     .map_err(err_to_js)?;
     set_object_field(&result, "summary", &summary_js)?;
@@ -2000,6 +2896,37 @@ pub(super) fn parse_binomial_prior(
             "invalid_input",
         )),
     }
+}
+
+/// Optional `stability` preset (`"default"` / `"strict"` / `"permissive"`) → heteroskedastic
+/// build config. Empty or omitted string uses the default preset.
+pub(super) fn heteroskedastic_config_from_optional_stability_str(
+    stability: Option<&str>,
+) -> Result<HeteroskedasticBinomialConfig, JsValue> {
+    let s = stability.map(str::trim).filter(|s| !s.is_empty());
+    let preset = match s {
+        None => BinomialStability::Default,
+        Some(x) if x.eq_ignore_ascii_case("default") => BinomialStability::Default,
+        Some(x) if x.eq_ignore_ascii_case("strict") => BinomialStability::Strict,
+        Some(x) if x.eq_ignore_ascii_case("permissive") => BinomialStability::Permissive,
+        Some(other) => {
+            return Err(coded_err(
+                &format!("stability must be 'default', 'strict', or 'permissive' (got {other:?})"),
+                "invalid_input",
+            ));
+        }
+    };
+    Ok(preset.to_heteroskedastic_config())
+}
+
+pub(super) fn merge_hetero_with_optional_one_step_laplace(
+    mut hcfg: HeteroskedasticBinomialConfig,
+    one_step: Option<bool>,
+) -> HeteroskedasticBinomialConfig {
+    if one_step == Some(true) {
+        hcfg.one_step_laplace_observation_variance = true;
+    }
+    hcfg
 }
 
 /// Leave-one-out CV over binomial kriging. Returns both logit- and prevalence-scale
@@ -2029,8 +2956,14 @@ pub fn wasm_leave_one_out_binomial(
     let coords = to_coords(lats, lons)?;
     let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
     let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
-    let residuals = leave_one_out_binomial(&coords, successes, trials, model, prior)
-        .map_err(kriging_err_to_js)?;
+    let residuals = leave_one_out_cv(&BinomialGeoPredictor {
+        coords: &coords,
+        successes,
+        trials,
+        variogram: model,
+        prior,
+    })
+    .map_err(kriging_err_to_js)?;
     binomial_cv_result_to_js(residuals)
 }
 
@@ -2059,8 +2992,17 @@ pub fn wasm_k_fold_binomial(
     let coords = to_coords(lats, lons)?;
     let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
     let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
-    let residuals =
-        k_fold_binomial(&coords, successes, trials, model, prior, k).map_err(kriging_err_to_js)?;
+    let residuals = k_fold_cv(
+        &BinomialGeoPredictor {
+            coords: &coords,
+            successes,
+            trials,
+            variogram: model,
+            prior,
+        },
+        k,
+    )
+    .map_err(kriging_err_to_js)?;
     binomial_cv_result_to_js(residuals)
 }
 
@@ -2099,9 +3041,15 @@ pub fn wasm_leave_one_out_binomial_projected(
     let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
         .map_err(kriging_err_to_js)?;
     let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
-    let residuals =
-        leave_one_out_binomial_projected(&coords, successes, trials, model, anisotropy, prior)
-            .map_err(kriging_err_to_js)?;
+    let residuals = leave_one_out_cv(&BinomialProjectedPredictor {
+        coords: &coords,
+        successes,
+        trials,
+        variogram: model,
+        anisotropy,
+        prior,
+    })
+    .map_err(kriging_err_to_js)?;
     binomial_cv_result_to_js(residuals)
 }
 
@@ -2138,10 +3086,32 @@ pub fn wasm_k_fold_binomial_projected(
     let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
         .map_err(kriging_err_to_js)?;
     let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
-    let residuals =
-        k_fold_binomial_projected(&coords, successes, trials, model, anisotropy, prior, k)
-            .map_err(kriging_err_to_js)?;
+    let residuals = k_fold_cv(
+        &BinomialProjectedPredictor {
+            coords: &coords,
+            successes,
+            trials,
+            variogram: model,
+            anisotropy,
+            prior,
+        },
+        k,
+    )
+    .map_err(kriging_err_to_js)?;
     binomial_cv_result_to_js(residuals)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsPrevalenceCalibrationBin {
+    bin_index: usize,
+    predicted_lo: f64,
+    predicted_hi: f64,
+    n_stations: usize,
+    sum_trials: u64,
+    sum_successes: u64,
+    mean_predicted: f64,
+    pooled_observed_prevalence: f64,
 }
 
 #[derive(Serialize)]
@@ -2151,6 +3121,9 @@ struct JsBinomialCvSummary {
     n_evaluated: usize,
     logit: JsCvSummary,
     prevalence: JsCvSummary,
+    brier: f64,
+    log_score_per_trial: f64,
+    calibration_bins: Vec<JsPrevalenceCalibrationBin>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2196,8 +3169,12 @@ pub fn wasm_conditional_simulate(
         seed,
         target_order: target_order.map(|v| v.into_iter().map(|x| x as usize).collect()),
     };
-    let samples = conditional_simulate(&cond_coords, &cond_values, &targets, model, options)
-        .map_err(kriging_err_to_js)?;
+    let samples = sequential_gaussian_simulate(
+        OrdinaryGeoSimulator::new(&cond_coords, &cond_values, model).map_err(kriging_err_to_js)?,
+        &targets,
+        options,
+    )
+    .map_err(kriging_err_to_js)?;
     let samples_f64: Vec<f64> = samples.into_iter().map(|v| v as f64).collect();
     Ok(Float64Array::from(samples_f64.as_slice()).into())
 }
@@ -2241,12 +3218,10 @@ pub fn wasm_conditional_simulate_simple(
     let targets = to_coords(target_lats, target_lons)?;
     let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
     let options = parse_simulation_options(seed, target_order);
-    let samples = conditional_simulate_simple(
-        &cond_coords,
-        &cond_values,
+    let samples = sequential_gaussian_simulate(
+        SimpleGeoSimulator::new(&cond_coords, &cond_values, model, mean as Real)
+            .map_err(kriging_err_to_js)?,
         &targets,
-        model,
-        mean as Real,
         options,
     )
     .map_err(kriging_err_to_js)?;
@@ -2285,12 +3260,10 @@ pub fn wasm_conditional_simulate_universal(
     let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
     let trend_enum = parse_trend(trend)?;
     let options = parse_simulation_options(seed, target_order);
-    let samples = conditional_simulate_universal(
-        &cond_coords,
-        &cond_values,
+    let samples = sequential_gaussian_simulate(
+        UniversalGeoSimulator::new(&cond_coords, &cond_values, model, trend_enum)
+            .map_err(kriging_err_to_js)?,
         &targets,
-        model,
-        trend_enum,
         options,
     )
     .map_err(kriging_err_to_js)?;
@@ -2347,12 +3320,10 @@ pub fn wasm_conditional_simulate_projected(
     let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
         .map_err(kriging_err_to_js)?;
     let options = parse_simulation_options(seed, target_order);
-    let samples = conditional_simulate_projected(
-        &cond_coords,
-        &cond_values,
+    let samples = sequential_gaussian_simulate(
+        ProjectedOrdinarySimulator::new(&cond_coords, &cond_values, model, anisotropy)
+            .map_err(kriging_err_to_js)?,
         &targets,
-        model,
-        anisotropy,
         options,
     )
     .map_err(kriging_err_to_js)?;
@@ -2418,13 +3389,10 @@ pub fn wasm_conditional_simulate_binomial(
     let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
     let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
     let options = parse_simulation_options(seed, target_order);
-    let result = conditional_simulate_binomial(
-        &cond_coords,
-        successes,
-        trials,
+    let result = sequential_binomial_simulate(
+        BinomialGeoSimulator::new(&cond_coords, successes, trials, model, prior)
+            .map_err(kriging_err_to_js)?,
         &targets,
-        model,
-        prior,
         options,
     )
     .map_err(kriging_err_to_js)?;
@@ -2495,11 +3463,9 @@ pub fn wasm_conditional_simulate_many(
     let targets = to_coords(target_lats, target_lons)?;
     let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
     let order = target_order.map(|v| v.into_iter().map(|x| x as usize).collect());
-    let samples = conditional_simulate_many(
-        &cond_coords,
-        &cond_values,
+    let samples = sequential_gaussian_simulate_many(
+        OrdinaryGeoSimulator::new(&cond_coords, &cond_values, model).map_err(kriging_err_to_js)?,
         &targets,
-        model,
         n_realizations as usize,
         base_seed,
         order,
@@ -2547,13 +3513,10 @@ pub fn wasm_conditional_simulate_many_binomial(
     let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
     let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
     let order = target_order.map(|v| v.into_iter().map(|x| x as usize).collect());
-    let result = conditional_simulate_many_binomial(
-        &cond_coords,
-        successes,
-        trials,
+    let result = sequential_binomial_simulate_many(
+        BinomialGeoSimulator::new(&cond_coords, successes, trials, model, prior)
+            .map_err(kriging_err_to_js)?,
         &targets,
-        model,
-        prior,
         n_realizations as usize,
         base_seed,
         order,
@@ -2617,14 +3580,10 @@ pub fn wasm_conditional_simulate_binomial_projected(
         .map_err(kriging_err_to_js)?;
     let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
     let options = parse_simulation_options(seed, target_order);
-    let result = conditional_simulate_binomial_projected(
-        &cond_coords,
-        successes,
-        trials,
+    let result = sequential_binomial_simulate(
+        BinomialProjectedSimulator::new(&cond_coords, successes, trials, model, anisotropy, prior)
+            .map_err(kriging_err_to_js)?,
         &targets,
-        model,
-        anisotropy,
-        prior,
         options,
     )
     .map_err(kriging_err_to_js)?;
@@ -2686,14 +3645,10 @@ pub fn wasm_conditional_simulate_many_binomial_projected(
         .map_err(kriging_err_to_js)?;
     let prior = parse_binomial_prior(prior_alpha, prior_beta)?;
     let order = target_order.map(|v| v.into_iter().map(|x| x as usize).collect());
-    let result = conditional_simulate_many_binomial_projected(
-        &cond_coords,
-        successes,
-        trials,
+    let result = sequential_binomial_simulate_many(
+        BinomialProjectedSimulator::new(&cond_coords, successes, trials, model, anisotropy, prior)
+            .map_err(kriging_err_to_js)?,
         &targets,
-        model,
-        anisotropy,
-        prior,
         n_realizations as usize,
         base_seed,
         order,

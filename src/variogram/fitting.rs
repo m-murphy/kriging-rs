@@ -30,10 +30,12 @@ fn model_from_params(
 /// arrays (e.g. from [`compute_empirical_variogram`](crate::compute_empirical_variogram)). Returns
 /// [`KrigingError::FittingError`] if these preconditions are violated.
 ///
-/// The grid spans plausible scales around data-derived guesses (sill, range, nugget). Accuracy is
-/// limited by grid resolution: the best point may be 20–40% away from the continuous optimum in
-/// sill/range. For typical empirical variograms (noisy, few bins) this is usually acceptable; for
-/// noiseless synthetic data the grid can pick a different local minimum than the true parameters.
+/// The grid spans plausible scales around data-derived guesses (sill, range, nugget). For
+/// [`VariogramType::Stable`], [`VariogramType::Matern`], and [`VariogramType::Power`], the grid
+/// also samples a small discrete set of shape parameters; that discrete choice is then relaxed
+/// with a bounded **coordinate hill-climb** on shape. Finally, **Nelder–Mead** refines `(nugget,
+/// sill, range)` (shape fixed during each NM pass); a second NM pass runs only when hill-climb
+/// improved the objective.
 pub fn fit_variogram(
     empirical: &EmpiricalVariogram,
     model_type: VariogramType,
@@ -94,10 +96,74 @@ pub fn fit_variogram(
         }
     }
     let best = best.expect("grid has at least one iteration");
-    // Refine the grid minimum with a few Nelder–Mead iterations over (nugget, sill, range)
-    // (shape stays fixed at whatever the grid picked). This typically recovers the continuous
-    // optimum from a nearby grid point while staying numerically cheap.
-    Ok(refine_nelder_mead(empirical, model_type, best))
+    let after_nm = refine_nelder_mead(empirical, model_type, best);
+    let nm_residuals = after_nm.residuals;
+    let after_shape = refine_shape_hill_climb(empirical, model_type, after_nm);
+    let improved_shape = after_shape.residuals < nm_residuals - (1e-9 as Real);
+    let out = if improved_shape {
+        refine_nelder_mead(empirical, model_type, after_shape)
+    } else {
+        after_shape
+    };
+    Ok(out)
+}
+
+/// Bounded coordinate hill-climb on the shape parameter (Stable α, Matérn ν, Power exponent)
+/// while holding `(nugget, sill, range)` fixed. Complements the discrete shape samples in the
+/// initial grid and the Nelder–Mead pass, which does not move shape.
+fn refine_shape_hill_climb(
+    empirical: &EmpiricalVariogram,
+    model_type: VariogramType,
+    start: FitResult,
+) -> FitResult {
+    let Some(mut shape) = start.model.shape() else {
+        return start;
+    };
+    let (lo, hi) = match model_type {
+        VariogramType::Stable => (1e-4 as Real, 2.0 as Real),
+        VariogramType::Matern => (1e-4 as Real, 10.0 as Real),
+        VariogramType::Power => (1e-4 as Real, 2.0 as Real - 1e-4 as Real),
+        _ => return start,
+    };
+    let (n, sill, range) = start.model.params();
+    let eval_at = |sh: Real| -> Option<(VariogramModel, Real)> {
+        let m = VariogramModel::new_with_shape(n, sill, range, model_type, sh).ok()?;
+        let r = weighted_residuals(empirical, m);
+        Some((m, r))
+    };
+    let Some((mut best_m, mut best_r)) = eval_at(shape) else {
+        return start;
+    };
+    let span = (hi - lo).max(1e-12 as Real);
+    let mut step = (span * 0.15 as Real).max(1e-8 as Real);
+    let min_step = (span * 1e-5 as Real).max(1e-10 as Real);
+    let mut guard = 0usize;
+    while step >= min_step && guard < 120 {
+        guard += 1;
+        let mut improved = false;
+        for sign in [-1.0 as Real, 1.0 as Real] {
+            let cand = (shape + sign * step).clamp(lo, hi);
+            if let Some((m, r)) = eval_at(cand)
+                && r < best_r
+            {
+                best_r = r;
+                best_m = m;
+                shape = cand;
+                improved = true;
+            }
+        }
+        if !improved {
+            step *= 0.5 as Real;
+        }
+    }
+    if best_r < start.residuals {
+        FitResult {
+            model: best_m,
+            residuals: best_r,
+        }
+    } else {
+        start
+    }
 }
 
 /// A light Nelder–Mead simplex over `(nugget, sill, range)` starting from an existing fit.
@@ -372,5 +438,34 @@ mod tests {
                 assert!(shape > 0.0);
             }
         }
+    }
+
+    #[test]
+    fn matern_shape_refinement_moves_nu_toward_synthetic_truth() {
+        // True ν lies strictly between the discrete grid knots {0.5, 1.0, 2.0, 3.0}; shape
+        // hill-climb should land closer than a pure discrete-shape fit.
+        let true_nu = 1.35;
+        let true_model =
+            VariogramModel::new_with_shape(0.08, 1.9, 22.0, VariogramType::Matern, true_nu)
+                .unwrap();
+        let distances: Vec<Real> = (1..=24).map(|i| i as Real * 1.5).collect();
+        let semivariances: Vec<Real> = distances
+            .iter()
+            .map(|&d| true_model.semivariance(d))
+            .collect();
+        let n_pairs = vec![16usize; distances.len()];
+        let empirical = EmpiricalVariogram {
+            distances,
+            semivariances,
+            n_pairs,
+        };
+        let fit = fit_variogram(&empirical, VariogramType::Matern).expect("fit");
+        let nu_fit = fit.model.shape().expect("matern has nu");
+        assert!(
+            (nu_fit - true_nu).abs() < 0.5,
+            "fitted nu {} should be near truth {}",
+            nu_fit,
+            true_nu
+        );
     }
 }

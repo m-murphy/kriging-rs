@@ -11,22 +11,21 @@
 //! optionally with an anisotropy. Geographic data can be converted to projected data with
 //! [`ProjectedCoord::equirectangular`] for small-area work.
 
-use nalgebra::{DMatrix, DVector, Dyn, linalg::LU};
-#[cfg(not(target_arch = "wasm32"))]
-use rayon::prelude::*;
-
 use std::num::NonZeroUsize;
 
 use crate::Real;
 use crate::distance::GeoCoord;
 use crate::error::KrigingError;
 use crate::kriging::binomial::{
-    BINOMIAL_CALIBRATION_VERSION, BinomialBuildNotes, BinomialCalibratedResult, BinomialPrediction,
-    BinomialPrior, HeteroskedasticBinomialConfig, logit_observation_variance_empirical_bayes,
+    BINOMIAL_CALIBRATION_VERSION, BinomialBuildNotes, BinomialCalibratedResult,
+    BinomialObservation, BinomialPrediction, BinomialPrior, HeteroskedasticBinomialConfig,
+    binomial_prediction_from_ordinary, build_calibrated_logit_ordinary, finish_binomial_notes,
 };
 
-use crate::kriging::ordinary::{Prediction, kriging_diagonal_jitter};
-use crate::utils::{Probability, logistic, logit};
+use crate::kriging::engine::OrdinaryKrigingEngine;
+use crate::kriging::ordinary::Prediction;
+use crate::spacetime::metric::ProjectedMetric;
+use crate::utils::{Probability, logit};
 use crate::variogram::empirical::{EmpiricalVariogram, PositiveReal};
 use crate::variogram::models::VariogramModel;
 
@@ -277,31 +276,9 @@ impl ProjectedDataset {
 /// Ordinary kriging on projected (planar) coordinates with optional 2-D geometric
 /// anisotropy. The variogram's range must be expressed in the same linear units as the
 /// coordinates (e.g. km, m).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProjectedKrigingModel {
-    coords: Vec<ProjectedCoord>,
-    values: Vec<Real>,
-    variogram: VariogramModel,
-    anisotropy: Anisotropy2D,
-    cov_at_zero: Real,
-    system: DMatrix<Real>,
-    system_lu: LU<Real, Dyn, Dyn>,
-}
-
-impl Clone for ProjectedKrigingModel {
-    fn clone(&self) -> Self {
-        let system = self.system.clone();
-        let system_lu = system.clone().lu();
-        Self {
-            coords: self.coords.clone(),
-            values: self.values.clone(),
-            variogram: self.variogram,
-            anisotropy: self.anisotropy,
-            cov_at_zero: self.cov_at_zero,
-            system,
-            system_lu,
-        }
-    }
+    engine: OrdinaryKrigingEngine<ProjectedMetric>,
 }
 
 impl ProjectedKrigingModel {
@@ -347,110 +324,43 @@ impl ProjectedKrigingModel {
     ) -> Result<Self, KrigingError> {
         let coords = dataset.coords;
         let values = dataset.values;
-        let n = coords.len();
-        if !extra.is_empty() && extra.len() != n {
-            return Err(KrigingError::InvalidInput(
-                "internal: extra length mismatch for projected kriging".to_string(),
-            ));
-        }
-        let mut system = DMatrix::from_element(n + 1, n + 1, 0.0);
-        let diag_eps = kriging_diagonal_jitter(n, variogram);
-        for i in 0..n {
-            for j in i..n {
-                let d = anisotropy.distance(coords[i], coords[j]);
-                let mut cov = variogram.covariance(d);
-                if i == j {
-                    cov += diag_eps;
-                    if let Some(&dextra) = extra.get(i) {
-                        cov += dextra;
-                    }
-                }
-                system[(i, j)] = cov;
-                system[(j, i)] = cov;
-            }
-            system[(i, n)] = 1.0;
-            system[(n, i)] = 1.0;
-        }
-        system[(n, n)] = 0.0;
-
-        let system_lu = system.clone().lu();
-        let mut probe = DVector::from_element(n + 1, 0.0);
-        probe[n] = 1.0;
-        if system_lu.solve(&probe).is_none() {
-            return Err(KrigingError::MatrixError(
-                "could not factorize projected kriging system".to_string(),
-            ));
-        }
-
-        Ok(Self {
+        let engine = OrdinaryKrigingEngine::fit_with_extra_diagonal(
+            ProjectedMetric::with_anisotropy(anisotropy),
             coords,
             values,
             variogram,
-            anisotropy,
-            cov_at_zero: variogram.covariance(0.0),
-            system,
-            system_lu,
-        })
+            extra,
+        )?;
+        Ok(Self { engine })
     }
 
     pub fn anisotropy(&self) -> Anisotropy2D {
-        self.anisotropy
+        self.engine.metric().anisotropy
+    }
+
+    pub fn variogram(&self) -> VariogramModel {
+        self.engine.variogram()
+    }
+
+    pub fn len(&self) -> usize {
+        self.engine.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn predict(&self, coord: ProjectedCoord) -> Result<Prediction, KrigingError> {
-        let mut rhs = DVector::from_element(self.coords.len() + 1, 0.0);
-        self.predict_with_rhs(coord, &mut rhs)
+        self.engine
+            .predict(&[coord])
+            .map(|mut v| v.pop().expect("single prediction"))
     }
 
     pub fn predict_batch(
         &self,
         coords: &[ProjectedCoord],
     ) -> Result<Vec<Prediction>, KrigingError> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let n = self.coords.len();
-            coords
-                .par_iter()
-                .map(|c| {
-                    let mut rhs = DVector::from_element(n + 1, 0.0);
-                    self.predict_with_rhs(*c, &mut rhs)
-                })
-                .collect()
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            let mut rhs = DVector::from_element(self.coords.len() + 1, 0.0);
-            let mut out = Vec::with_capacity(coords.len());
-            for &c in coords {
-                out.push(self.predict_with_rhs(c, &mut rhs)?);
-            }
-            Ok(out)
-        }
-    }
-
-    fn predict_with_rhs(
-        &self,
-        coord: ProjectedCoord,
-        rhs: &mut DVector<Real>,
-    ) -> Result<Prediction, KrigingError> {
-        let n = self.coords.len();
-        for i in 0..n {
-            let d = self.anisotropy.distance(self.coords[i], coord);
-            rhs[i] = self.variogram.covariance(d);
-        }
-        rhs[n] = 1.0;
-        let sol = self.system_lu.solve(rhs).ok_or_else(|| {
-            KrigingError::MatrixError("could not solve projected kriging system".to_string())
-        })?;
-        let mut value: Real = 0.0;
-        let mut cov_dot: Real = 0.0;
-        for i in 0..n {
-            value += sol[i] * self.values[i];
-            cov_dot += sol[i] * rhs[i];
-        }
-        let mu = sol[n];
-        let variance = (self.cov_at_zero - cov_dot - mu).max(0.0);
-        Ok(Prediction { value, variance })
+        self.engine.predict(coords)
     }
 }
 
@@ -517,22 +427,6 @@ impl ProjectedBinomialObservation {
     }
 }
 
-#[inline]
-fn delta_prevalence_variance(prevalence: Real, logit_variance: Real) -> Real {
-    let factor = prevalence * (1.0 - prevalence);
-    factor * factor * logit_variance.max(0.0)
-}
-
-fn binomial_prediction_from(pred: Prediction) -> BinomialPrediction {
-    let prevalence = logistic(pred.value);
-    BinomialPrediction {
-        prevalence,
-        logit_value: pred.value,
-        variance: pred.variance,
-        prevalence_variance: delta_prevalence_variance(prevalence, pred.variance),
-    }
-}
-
 /// Binomial kriging on projected (planar) coordinates with optional 2-D
 /// geometric anisotropy.
 ///
@@ -563,6 +457,7 @@ impl BinomialProjectedKrigingModel {
             variogram,
             anisotropy,
             BinomialPrior::default(),
+            HeteroskedasticBinomialConfig::default(),
         )
     }
 
@@ -572,6 +467,7 @@ impl BinomialProjectedKrigingModel {
         variogram: VariogramModel,
         anisotropy: Anisotropy2D,
         prior: BinomialPrior,
+        hetero_config: HeteroskedasticBinomialConfig,
     ) -> Result<ProjectedBinomialFit, KrigingError> {
         if observations.len() < 2 {
             return Err(KrigingError::InsufficientData(2));
@@ -583,46 +479,27 @@ impl BinomialProjectedKrigingModel {
             .collect();
         let base: Vec<Real> = observations
             .iter()
-            .map(|o| logit_observation_variance_empirical_bayes(prior, o.successes(), o.trials()))
-            .map(|v| v.max(HeteroskedasticBinomialConfig::default().min_logit_observation_variance))
+            .map(|o| {
+                hetero_config
+                    .raw_logit_observation_variance_binomial_site(prior, o.successes(), o.trials())
+                    .max(hetero_config.min_logit_observation_variance)
+            })
             .collect();
-        let n_tries = HeteroskedasticBinomialConfig::default()
-            .max_build_attempts
-            .max(1);
-        let config = HeteroskedasticBinomialConfig::default();
-        let mut last_err: Option<KrigingError> = None;
-        let mut inflation = 1.0 as Real;
-        for attempt in 0..n_tries {
-            let extra: Vec<Real> = base
-                .iter()
-                .map(|&v| (v * inflation).max(config.min_logit_observation_variance))
-                .collect();
-            let dataset = ProjectedDataset::new(coords.clone(), logits.clone())?;
-            match ProjectedKrigingModel::new_with_extra_diagonal(
-                dataset, variogram, anisotropy, extra,
-            ) {
-                Ok(inner) => {
-                    return Ok(BinomialCalibratedResult {
-                        model: Self { inner },
-                        notes: BinomialBuildNotes {
-                            calibration_version: BINOMIAL_CALIBRATION_VERSION,
-                            logit_inflation: inflation,
-                            n_build_attempts: attempt + 1,
-                            prior,
-                            zero_trial_dropped_indices: Vec::new(),
-                            from_precomputed_logits_only: false,
-                        },
-                    });
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                }
-            }
-            inflation *= 2.0 as Real;
-        }
-        Err(last_err.unwrap_or_else(|| {
-            KrigingError::MatrixError("binomial projected kriging build failed".to_string())
-        }))
+        build_calibrated_logit_ordinary(
+            base,
+            &hetero_config,
+            prior,
+            &[],
+            false,
+            "binomial projected kriging build failed",
+            |extra| {
+                let dataset = ProjectedDataset::new(coords.clone(), logits.clone())?;
+                ProjectedKrigingModel::new_with_extra_diagonal(
+                    dataset, variogram, anisotropy, extra,
+                )
+                .map(|inner| Self { inner })
+            },
+        )
     }
 
     /// Pre-computed logits with no per-trial data (no observation variance on the diagonal
@@ -642,14 +519,18 @@ impl BinomialProjectedKrigingModel {
         let inner = ProjectedKrigingModel::new(dataset, variogram, anisotropy)?;
         Ok(BinomialCalibratedResult {
             model: Self { inner },
-            notes: BinomialBuildNotes {
+            notes: finish_binomial_notes(BinomialBuildNotes {
                 calibration_version: BINOMIAL_CALIBRATION_VERSION,
                 logit_inflation: 1.0,
                 n_build_attempts: 1,
                 prior: BinomialPrior::default(),
                 zero_trial_dropped_indices: Vec::new(),
                 from_precomputed_logits_only: true,
-            },
+                warnings: Vec::new(),
+                condition_number: None,
+                effective_dof: None,
+                last_msdr: None,
+            }),
         })
     }
 
@@ -678,58 +559,42 @@ impl BinomialProjectedKrigingModel {
                 "logits must all be finite (no NaN/inf)".to_string(),
             ));
         }
-        for &v in &base_logit_observation_variance {
-            if !v.is_finite() || v < 0.0 {
-                return Err(KrigingError::InvalidInput(
-                    "logit observation variances must be finite and non-negative".to_string(),
-                ));
-            }
-        }
-        let n_tries = config.max_build_attempts.max(1);
-        let mut last_err: Option<KrigingError> = None;
-        let mut inflation = 1.0 as Real;
-        for attempt in 0..n_tries {
-            let extra: Vec<Real> = base_logit_observation_variance
-                .iter()
-                .map(|&v| (v * inflation).max(config.min_logit_observation_variance))
-                .collect();
-            let dataset = ProjectedDataset::new(coords.clone(), logits.clone())?;
-            match ProjectedKrigingModel::new_with_extra_diagonal(
-                dataset, variogram, anisotropy, extra,
-            ) {
-                Ok(inner) => {
-                    return Ok(BinomialCalibratedResult {
-                        model: Self { inner },
-                        notes: BinomialBuildNotes {
-                            calibration_version: BINOMIAL_CALIBRATION_VERSION,
-                            logit_inflation: inflation,
-                            n_build_attempts: attempt + 1,
-                            prior: prior_for_notes,
-                            zero_trial_dropped_indices: Vec::new(),
-                            from_precomputed_logits_only: false,
-                        },
-                    });
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                }
-            }
-            inflation *= 2.0 as Real;
-        }
-        Err(last_err.unwrap_or_else(|| {
-            KrigingError::MatrixError(
-                "from_precomputed (projected) with observation variances: build failed".to_string(),
-            )
-        }))
+        build_calibrated_logit_ordinary(
+            base_logit_observation_variance,
+            &config,
+            prior_for_notes,
+            &[],
+            false,
+            "from_precomputed (projected) with observation variances: build failed",
+            |extra| {
+                let dataset = ProjectedDataset::new(coords.clone(), logits.clone())?;
+                ProjectedKrigingModel::new_with_extra_diagonal(
+                    dataset, variogram, anisotropy, extra,
+                )
+                .map(|inner| Self { inner })
+            },
+        )
     }
 
     pub fn anisotropy(&self) -> Anisotropy2D {
         self.inner.anisotropy()
     }
 
+    pub fn variogram(&self) -> VariogramModel {
+        self.inner.variogram()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn predict(&self, coord: ProjectedCoord) -> Result<BinomialPrediction, KrigingError> {
         let pred = self.inner.predict(coord)?;
-        Ok(binomial_prediction_from(pred))
+        Ok(binomial_prediction_from_ordinary(pred))
     }
 
     pub fn predict_batch(
@@ -737,7 +602,150 @@ impl BinomialProjectedKrigingModel {
         coords: &[ProjectedCoord],
     ) -> Result<Vec<BinomialPrediction>, KrigingError> {
         let preds = self.inner.predict_batch(coords)?;
-        Ok(preds.into_iter().map(binomial_prediction_from).collect())
+        Ok(preds
+            .into_iter()
+            .map(binomial_prediction_from_ordinary)
+            .collect())
+    }
+}
+
+/// Simple mean latitude / longitude of sample sites (degrees), for choosing a local tangent
+/// plane origin. Intended for **small** study areas where the arithmetic mean is adequate.
+pub fn tangent_plane_reference_centroid(
+    obs: &[BinomialObservation],
+) -> Result<GeoCoord, KrigingError> {
+    if obs.is_empty() {
+        return Err(KrigingError::InsufficientData(2));
+    }
+    let mut slat = 0.0 as Real;
+    let mut slon = 0.0 as Real;
+    for o in obs {
+        slat += o.coord().lat();
+        slon += o.coord().lon();
+    }
+    let n = obs.len() as Real;
+    GeoCoord::try_new(slat / n, slon / n)
+}
+
+/// Geographic binomial kriging on a **local tangent plane**: stations are mapped with
+/// [`ProjectedCoord::equirectangular`] about a reference [`GeoCoord`], then the usual
+/// [`BinomialProjectedKrigingModel`] (Euclidean distance, optional 2-D anisotropy) is applied on
+/// the logit scale.
+///
+/// Variogram ranges are in **kilometers**, matching the equirectangular `(x, y)` units from
+/// [`ProjectedCoord::equirectangular`]. This path is appropriate only when the domain is small
+/// enough that planar distortion is negligible; a build note warning is always appended.
+#[derive(Debug, Clone)]
+pub struct BinomialTangentPlaneKrigingModel {
+    reference: GeoCoord,
+    inner: BinomialProjectedKrigingModel,
+}
+
+/// Tangent-plane geographic binomial fit: model + [`BinomialBuildNotes`].
+pub type TangentPlaneBinomialFit = BinomialCalibratedResult<BinomialTangentPlaneKrigingModel>;
+
+impl BinomialTangentPlaneKrigingModel {
+    /// Calibrated build with default `Beta(1, 1)` prior and default heteroskedastic config.
+    pub fn new(
+        observations: Vec<BinomialObservation>,
+        variogram: VariogramModel,
+        reference: GeoCoord,
+        anisotropy: Anisotropy2D,
+    ) -> Result<TangentPlaneBinomialFit, KrigingError> {
+        Self::new_with_prior(
+            observations,
+            variogram,
+            BinomialPrior::default(),
+            HeteroskedasticBinomialConfig::default(),
+            &[],
+            reference,
+            anisotropy,
+        )
+    }
+
+    /// Calibrated build with an explicit Beta prior.
+    pub fn new_with_prior(
+        observations: Vec<BinomialObservation>,
+        variogram: VariogramModel,
+        prior: BinomialPrior,
+        config: HeteroskedasticBinomialConfig,
+        extra_zero_trial_drops: &[usize],
+        reference: GeoCoord,
+        anisotropy: Anisotropy2D,
+    ) -> Result<TangentPlaneBinomialFit, KrigingError> {
+        if observations.len() < 2 {
+            return Err(KrigingError::InsufficientData(2));
+        }
+        let projected: Vec<ProjectedBinomialObservation> = observations
+            .into_iter()
+            .map(|o| {
+                let pc = ProjectedCoord::equirectangular(o.coord(), reference);
+                ProjectedBinomialObservation::new(pc, o.successes(), o.trials())
+            })
+            .collect::<Result<Vec<_>, KrigingError>>()?;
+        let mut fit = BinomialProjectedKrigingModel::new_with_prior(
+            projected, variogram, anisotropy, prior, config,
+        )?;
+        fit.notes
+            .zero_trial_dropped_indices
+            .extend_from_slice(extra_zero_trial_drops);
+        fit.notes.zero_trial_dropped_indices.sort_unstable();
+        if !fit
+            .notes
+            .warnings
+            .iter()
+            .any(|w| w == "tangent_plane_equirectangular_small_area")
+        {
+            fit.notes
+                .warnings
+                .push("tangent_plane_equirectangular_small_area".to_string());
+        }
+        Ok(BinomialCalibratedResult {
+            model: Self {
+                reference,
+                inner: fit.model,
+            },
+            notes: fit.notes,
+        })
+    }
+
+    #[inline]
+    pub fn reference(&self) -> GeoCoord {
+        self.reference
+    }
+
+    #[inline]
+    pub fn anisotropy(&self) -> Anisotropy2D {
+        self.inner.anisotropy()
+    }
+
+    pub fn variogram(&self) -> VariogramModel {
+        self.inner.variogram()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn predict(&self, coord: GeoCoord) -> Result<BinomialPrediction, KrigingError> {
+        let pc = ProjectedCoord::equirectangular(coord, self.reference);
+        self.inner.predict(pc)
+    }
+
+    pub fn predict_batch(
+        &self,
+        coords: &[GeoCoord],
+    ) -> Result<Vec<BinomialPrediction>, KrigingError> {
+        let planar: Vec<ProjectedCoord> = coords
+            .iter()
+            .copied()
+            .map(|g| ProjectedCoord::equirectangular(g, self.reference))
+            .collect();
+        self.inner.predict_batch(&planar)
     }
 }
 
@@ -903,18 +911,16 @@ mod tests {
             variogram,
             Anisotropy2D::isotropic(),
             prior,
+            HeteroskedasticBinomialConfig::default(),
         )
         .unwrap()
         .model;
         let pred = model.predict(obs[0].coord()).unwrap();
         let expected_logit = obs[0].smoothed_logit_with_prior(prior);
         // Per-site logit observation noise: collocated prediction need not match local EB logit.
-        assert!(
-            (pred.logit_value - expected_logit).abs() < 0.35,
-            "logit err"
-        );
-        assert!(pred.prevalence > 0.0 && pred.prevalence < 1.0);
-        assert!(pred.variance >= 0.0);
+        assert!((pred.logit - expected_logit).abs() < 0.35, "logit err");
+        assert!(pred.prevalence_median > 0.0 && pred.prevalence_median < 1.0);
+        assert!(pred.logit_variance >= 0.0);
         assert!(pred.prevalence_variance >= 0.0);
     }
 
@@ -943,7 +949,7 @@ mod tests {
         let iso_pred = iso.predict(target).unwrap();
         let aniso_pred = aniso.predict(target).unwrap();
         // Anisotropy weights x-axis (low prevalence) more heavily.
-        assert!(aniso_pred.prevalence < iso_pred.prevalence);
+        assert!(aniso_pred.prevalence_median < iso_pred.prevalence_median);
     }
 
     #[test]
@@ -953,5 +959,90 @@ mod tests {
         let variogram = VariogramModel::new(0.01, 1.0, 10.0, VariogramType::Exponential).unwrap();
         let r = BinomialProjectedKrigingModel::new(one, variogram, Anisotropy2D::isotropic());
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn tangent_plane_reference_centroid_is_mean_geo() {
+        use crate::kriging::binomial::BinomialObservation;
+        let obs = vec![
+            BinomialObservation::new(GeoCoord::try_new(0.0, 0.0).unwrap(), 1, 5).unwrap(),
+            BinomialObservation::new(GeoCoord::try_new(2.0, 4.0).unwrap(), 1, 5).unwrap(),
+        ];
+        let c = tangent_plane_reference_centroid(&obs).unwrap();
+        assert!((c.lat() - 1.0).abs() < 1e-6);
+        assert!((c.lon() - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tangent_plane_binomial_matches_manual_projected_path() {
+        use crate::kriging::binomial::BinomialObservation;
+        let refc = GeoCoord::try_new(40.0, -80.0).unwrap();
+        let obs = vec![
+            BinomialObservation::new(refc, 2, 8).unwrap(),
+            BinomialObservation::new(GeoCoord::try_new(40.02, -80.0).unwrap(), 5, 8).unwrap(),
+            BinomialObservation::new(GeoCoord::try_new(40.0, -79.98).unwrap(), 4, 8).unwrap(),
+        ];
+        let v = VariogramModel::new(0.04, 1.0, 50.0, VariogramType::Exponential).unwrap();
+        let prior = BinomialPrior::default();
+        let iso = Anisotropy2D::isotropic();
+        let cfg = HeteroskedasticBinomialConfig::default();
+        let proj_obs: Vec<ProjectedBinomialObservation> = obs
+            .iter()
+            .map(|o| {
+                let pc = ProjectedCoord::equirectangular(o.coord(), refc);
+                ProjectedBinomialObservation::new(pc, o.successes(), o.trials()).unwrap()
+            })
+            .collect();
+        let direct = BinomialProjectedKrigingModel::new_with_prior(proj_obs, v, iso, prior, cfg)
+            .unwrap()
+            .model;
+        let tangent = BinomialTangentPlaneKrigingModel::new_with_prior(
+            obs.clone(),
+            v,
+            prior,
+            cfg,
+            &[],
+            refc,
+            iso,
+        )
+        .unwrap()
+        .model;
+
+        let q = GeoCoord::try_new(40.01, -79.99).unwrap();
+        let pt = ProjectedCoord::equirectangular(q, refc);
+        let a = tangent.predict(q).unwrap();
+        let b = direct.predict(pt).unwrap();
+        assert!(
+            (a.logit - b.logit).abs() < 1e-5,
+            "logit a={} b={}",
+            a.logit,
+            b.logit
+        );
+        assert!(
+            (a.prevalence_median - b.prevalence_median).abs() < 1e-5,
+            "prev a={} b={}",
+            a.prevalence_median,
+            b.prevalence_median
+        );
+    }
+
+    #[test]
+    fn tangent_plane_build_appends_small_area_warning() {
+        use crate::kriging::binomial::BinomialObservation;
+        let refc = GeoCoord::try_new(40.0, -80.0).unwrap();
+        let obs = vec![
+            BinomialObservation::new(refc, 2, 8).unwrap(),
+            BinomialObservation::new(GeoCoord::try_new(40.02, -80.0).unwrap(), 5, 8).unwrap(),
+            BinomialObservation::new(GeoCoord::try_new(40.0, -79.98).unwrap(), 4, 8).unwrap(),
+        ];
+        let v = VariogramModel::new(0.04, 1.0, 50.0, VariogramType::Exponential).unwrap();
+        let fit =
+            BinomialTangentPlaneKrigingModel::new(obs, v, refc, Anisotropy2D::isotropic()).unwrap();
+        assert!(
+            fit.notes
+                .warnings
+                .iter()
+                .any(|w| w == "tangent_plane_equirectangular_small_area")
+        );
     }
 }

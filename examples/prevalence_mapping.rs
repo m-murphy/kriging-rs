@@ -27,8 +27,8 @@
 use std::num::NonZeroUsize;
 
 use kriging_rs::aggregate::polygon_weighted_summary;
-use kriging_rs::cv::{BinomialCvSummary, k_fold_binomial};
-use kriging_rs::simulation::conditional_simulate_many_binomial;
+use kriging_rs::cv::{BinomialCvSummary, BinomialGeoPredictor, k_fold_cv};
+use kriging_rs::simulation::{BinomialGeoSimulator, sequential_binomial_simulate_many};
 use kriging_rs::variogram::fitting::fit_variogram;
 use kriging_rs::{
     BinomialKrigingModel, BinomialObservation, BinomialPrior, EmpiricalEstimator, GeoCoord,
@@ -104,7 +104,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. K-fold CV on both scales. A logit-scale MSDR ≈ 1 indicates the
     //    nugget/sill split is calibrated to the held-out residuals.
     // ---------------------------------------------------------------------
-    let residuals = k_fold_binomial(&coords, &successes, &trials, variogram, prior, 4)?;
+    let residuals = k_fold_cv(
+        &BinomialGeoPredictor {
+            coords: &coords,
+            successes: &successes,
+            trials: &trials,
+            variogram,
+            prior,
+        },
+        4,
+    )?;
     let cv = BinomialCvSummary::from_residuals(&residuals);
     println!(
         "CV (k=4): n={} evaluated={} logit_rmse={:.4} prevalence_rmse={:.4} logit_msdr={:.3}",
@@ -139,7 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut grid_prevalence = vec![0.0 as Real; targets.len()];
     for (k, target) in targets.iter().enumerate() {
         let pred = model.predict(*target)?;
-        grid_prevalence[k] = pred.prevalence;
+        grid_prevalence[k] = pred.prevalence_median;
     }
     let pred_min = grid_prevalence
         .iter()
@@ -177,13 +186,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    aggregation (district means, exceedance maps, ...).
     // ---------------------------------------------------------------------
     let n_realizations = 50usize;
-    let ensemble = conditional_simulate_many_binomial(
-        &coords,
-        &successes,
-        &trials,
+    let ensemble = sequential_binomial_simulate_many(
+        BinomialGeoSimulator::new(&coords, &successes, &trials, variogram, prior)?,
         &targets,
-        variogram,
-        prior,
         n_realizations,
         /* base_seed = */ 42,
         /* target_order = */ None,

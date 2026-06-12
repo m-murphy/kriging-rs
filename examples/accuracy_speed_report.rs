@@ -123,7 +123,7 @@ fn mae_rmse(m: &BinomialKrigingModel, test: &[(Real, Real, GeoCoord)]) -> (f64, 
     let mut sum_sq = 0.0;
     for (x, y, c) in test {
         let t0 = real_to_f64(true_p(*x, *y));
-        let p = real_to_f64(m.predict(*c).expect("pred").prevalence);
+        let p = real_to_f64(m.predict(*c).expect("pred").prevalence_median);
         let e = p - t0;
         sum_abs += e.abs();
         sum_sq += e * e;
