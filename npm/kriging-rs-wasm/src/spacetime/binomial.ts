@@ -6,17 +6,22 @@
  */
 
 import { KrigingError, wrapThrown } from "../errors.js";
+import {
+  binomialKFold,
+  binomialLeaveOneOut,
+  freeBinomialHandle,
+  getBinomialBuildNotes,
+  requireBinomialHandle,
+} from "../internal/binomial-model-shared.js";
 import { toFloat64Array, toUint32Array } from "../internal/convert.js";
 import { buildGridLatsLons, reshapeFlatToGrid } from "../internal/grid.js";
 import {
   mapBinomialBatchArrayOutput,
-  mapBinomialBuildNotes,
   mapBinomialPrediction,
   mapBinomialPredictionArray,
   mapSpaceTimeBinomialDiagnostics,
 } from "../internal/mappers.js";
 import { requireLoadedModule } from "../internal/module.js";
-import { modelKFold, modelLeaveOneOut } from "../internal/model-cv.js";
 import {
   fittedToSpaceTimeVariogramParams,
   packSpaceTimeVariogram,
@@ -275,9 +280,7 @@ export class SpaceTimeBinomialKriging {
   }
 
   free(): void {
-    if (this.inner === null) return;
-    if (typeof this.inner.free === "function") this.inner.free();
-    this.inner = null;
+    this.inner = freeBinomialHandle(this.inner);
   }
 
   /** Explicit-resource-management disposer; calls {@link free}. */
@@ -287,11 +290,10 @@ export class SpaceTimeBinomialKriging {
 
   /** Build-time diagnostics (prior, dropped rows, logit inflation, warnings, …). */
   get buildNotes(): BinomialBuildNotes {
-    try {
-      return mapBinomialBuildNotes(this.requireInner().getBuildNotes());
-    } catch (e) {
-      throw wrapThrown(e);
-    }
+    return getBinomialBuildNotes(
+      requireBinomialHandle(this.inner, FREED),
+      FREED
+    );
   }
 
   /**
@@ -324,7 +326,11 @@ export class SpaceTimeBinomialKriging {
               successes: toUint32Array(counts.successes),
               trials: toUint32Array(counts.trials),
             };
-      return mapSpaceTimeBinomialDiagnostics(getDiagnostics.call(inner, opts));
+      return mapSpaceTimeBinomialDiagnostics(
+        opts === undefined
+          ? getDiagnostics.call(inner)
+          : getDiagnostics.call(inner, opts)
+      );
     } catch (e) {
       throw wrapThrown(e);
     }
@@ -452,11 +458,14 @@ export class SpaceTimeBinomialKriging {
   }
 
   leaveOneOut(): BinomialCvResult {
-    return modelLeaveOneOut(this.requireInner(), "binomial") as BinomialCvResult;
+    return binomialLeaveOneOut(
+      requireBinomialHandle(this.inner, FREED),
+      FREED
+    );
   }
 
   kFold(k: number): BinomialCvResult {
-    return modelKFold(this.requireInner(), k, "binomial") as BinomialCvResult;
+    return binomialKFold(requireBinomialHandle(this.inner, FREED), FREED, k);
   }
 }
 

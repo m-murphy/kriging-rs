@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`BinomialCounts`** — geometry-free `(successes, trials)` retained on count-based
+  calibrated binomial fits for instance CV and diagnostics without re-packing tensors.
+- **`binomial_logit_loo_msdr`** — shared Rust helper for logit-scale LOO MSDR on any
+  binomial [`KrigingPredictor`](src/predictor/cv.rs).
+- **`SpaceTimeBinomialDiagnostics`** export from the `spacetime` module.
+- **Tangent-plane binomial instance CV** — `leaveOneOut` / `kFold` on
+  `BinomialTangentPlaneKriging` (npm) and `WasmKrigingModel` handles (WASM).
+- **`BinomialAdapterRef`** — WASM dispatch for binomial build notes, diagnostics, and
+  instance CV across geo, projected, tangent-plane, and spacetime adapters.
+
+### Changed
+
+- **Binomial `diagnostics()`** (Rust and npm) — count-based builds compute LOO logit MSDR
+  from retained training counts and model coordinates; explicit count tensors are only
+  required for precomputed-logit builds.
+- **WASM binomial adapters** hold full calibrated fits instead of split model/notes/CV
+  buffers; diagnostics and instance CV read stored training counts.
+- **npm binomial quartet** — shared `binomial-model-shared` helpers for lifecycle,
+  diagnostics, CV, and batch/grid prediction across geo, projected, tangent-plane, and
+  spacetime classes.
+
 ## [0.4.0] - 2026-06-12
 
 Large release after 0.3.0: calibrated binomial kriging, dual-SPD engines, generic

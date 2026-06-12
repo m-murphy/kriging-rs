@@ -430,10 +430,10 @@ describe("Binomial kriging", () => {
       expect(d0.variogram.sill).toBeCloseTo(sill, 5);
       expect(d0.variogram.range).toBeCloseTo(range, 5);
       expect(d0.buildNotes.logitInflation).toBe(model.buildNotes.logitInflation);
-      expect(d0.logitLooMsdr).toBeUndefined();
+      expect(typeof d0.logitLooMsdr).toBe("number");
+      expect(Number.isFinite(d0.logitLooMsdr!)).toBe(true);
       const d1 = model.diagnostics({ lats, lons, successes, trials });
-      expect(typeof d1.logitLooMsdr).toBe("number");
-      expect(Number.isFinite(d1.logitLooMsdr!)).toBe(true);
+      expect(d1.logitLooMsdr!).toBeCloseTo(d0.logitLooMsdr!, 5);
     } finally {
       model.free();
     }
@@ -509,10 +509,33 @@ describe("Binomial kriging", () => {
       const d0 = model.diagnostics();
       expect(d0.variogram.variogramType).toBe("exponential");
       expect(d0.buildNotes.logitInflation).toBe(model.buildNotes.logitInflation);
-      expect(d0.logitLooMsdr).toBeUndefined();
+      expect(typeof d0.logitLooMsdr).toBe("number");
+      expect(Number.isFinite(d0.logitLooMsdr!)).toBe(true);
       const d1 = model.diagnostics({ lats, lons, successes, trials });
-      expect(typeof d1.logitLooMsdr).toBe("number");
-      expect(Number.isFinite(d1.logitLooMsdr!)).toBe(true);
+      expect(d1.logitLooMsdr!).toBeCloseTo(d0.logitLooMsdr!, 5);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("BinomialTangentPlaneKriging.leaveOneOut and kFold cover every training station", () => {
+    const model = new BinomialTangentPlaneKriging({
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram: { variogramType, nugget, sill, range },
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+    });
+    try {
+      const loo = model.leaveOneOut();
+      expect(loo.residuals.length).toBe(lats.length);
+      for (const r of loo.residuals) {
+        expect(Number.isFinite(r.predictedLogit)).toBe(true);
+      }
+      const kf = model.kFold(2);
+      expect(kf.residuals.length).toBe(lats.length);
     } finally {
       model.free();
     }
@@ -1111,10 +1134,10 @@ describe("Projected binomial kriging", () => {
       expect(d0.variogram.variogramType).toBe("exponential");
       expect(d0.variogram.range).toBeCloseTo(variogram.range, 5);
       expect(d0.buildNotes.logitInflation).toBe(model.buildNotes.logitInflation);
-      expect(d0.logitLooMsdr).toBeUndefined();
+      expect(typeof d0.logitLooMsdr).toBe("number");
+      expect(Number.isFinite(d0.logitLooMsdr!)).toBe(true);
       const d1 = model.diagnostics({ xs, ys, successes, trials });
-      expect(typeof d1.logitLooMsdr).toBe("number");
-      expect(Number.isFinite(d1.logitLooMsdr!)).toBe(true);
+      expect(d1.logitLooMsdr!).toBeCloseTo(d0.logitLooMsdr!, 5);
     } finally {
       model.free();
     }
@@ -2573,7 +2596,8 @@ describe("Space-time kriging", () => {
       expect(d0.variogram.family).toBe("separable");
       expect(d0.variogram.spatial.variogramType).toBe("exponential");
       expect(d0.buildNotes.logitInflation).toBe(model.buildNotes.logitInflation);
-      expect(d0.logitLooMsdr).toBeUndefined();
+      expect(typeof d0.logitLooMsdr).toBe("number");
+      expect(Number.isFinite(d0.logitLooMsdr!)).toBe(true);
       const d1 = model.diagnostics({
         lats,
         lons,
@@ -2581,8 +2605,7 @@ describe("Space-time kriging", () => {
         successes,
         trials,
       });
-      expect(typeof d1.logitLooMsdr).toBe("number");
-      expect(Number.isFinite(d1.logitLooMsdr!)).toBe(true);
+      expect(d1.logitLooMsdr!).toBeCloseTo(d0.logitLooMsdr!, 5);
     } finally {
       model.free();
     }

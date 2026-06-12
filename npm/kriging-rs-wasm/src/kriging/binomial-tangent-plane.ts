@@ -1,21 +1,27 @@
 /**
  * Geographic binomial kriging on a **local tangent plane** (equirectangular km coordinates)
- * with optional 2-D geometric anisotropy. Input sites remain lat/lon; the variogram range is
- * in **kilometers** (same as default geographic binomial).
+ * with optional 2-D geometric anisotropy.
  *
  * @module
  */
 
 import { KrigingError, wrapThrown } from "../errors.js";
 import { toFloat64Array, toUint32Array } from "../internal/convert.js";
-import { reshapeFlatToGrid } from "../internal/grid.js";
 import {
-  mapBinomialBatchArrayOutput,
-  mapBinomialBuildNotes,
-  mapBinomialDiagnostics,
-  mapBinomialPrediction,
-  mapBinomialPredictionArray,
-} from "../internal/mappers.js";
+  attachBinomialHandle,
+  binomialKFold,
+  binomialLeaveOneOut,
+  freeBinomialHandle,
+  getBinomialBuildNotes,
+  getBinomialDiagnostics2d,
+  packGeoDiagnosticsOpts,
+  predictBatchArraysBinomialGeo,
+  predictBatchBinomialGeo,
+  predictBinomialGeo,
+  predictGridBinomialGeo,
+  requireBinomialHandle,
+  type GeoBinomialDiagnosticsCounts,
+} from "../internal/binomial-model-shared.js";
 import { requireLoadedModule } from "../internal/module.js";
 import type {
   BinomialTangentPlaneKrigingWithPriorOptionsWasm,
@@ -24,12 +30,12 @@ import type {
 import type {
   BinomialBatchArrayOutput,
   BinomialBuildNotes,
+  BinomialCvResult,
   BinomialDiagnostics,
   BinomialGridOutput,
   BinomialPrediction,
   BinomialTangentPlaneKrigingOptions,
   BinomialTangentPlaneKrigingWithPriorOptions,
-  IntegerArrayInput,
   NumericArrayInput,
   PredictGridOptions,
 } from "../types.js";
@@ -67,25 +73,31 @@ function toTangentPlaneWithPriorOptionsWasm(
   };
 }
 
+function requireTangentFactory(
+  name: string
+): (...args: unknown[]) => WasmKrigingModelHandle {
+  const mod = requireLoadedModule();
+  const factory = mod.WasmKrigingModel?.[name as keyof typeof mod.WasmKrigingModel];
+  if (typeof factory !== "function") {
+    throw new KrigingError(
+      "BinomialTangentPlaneKriging is not available; rebuild the WASM package",
+      { code: "backend_unavailable" }
+    );
+  }
+  return factory as (...args: unknown[]) => WasmKrigingModelHandle;
+}
+
 /**
  * Binomial kriging on a local equirectangular tangent plane with 2-D anisotropy.
- * Prefer {@link BinomialKriging} when isotropic Haversine distances are adequate.
  */
 export class BinomialTangentPlaneKriging {
   private inner: WasmKrigingModelHandle | null;
 
   constructor(options: BinomialTangentPlaneKrigingOptions) {
-    const mod = requireLoadedModule();
-    const factory = mod.WasmKrigingModel?.binomialTangentPlaneFromArrays;
-    if (!factory) {
-      throw new KrigingError(
-        "BinomialTangentPlaneKriging is not available; rebuild the WASM package",
-        { code: "backend_unavailable" }
-      );
-    }
+    const factory = requireTangentFactory("binomialTangentPlaneFromArrays");
     try {
       this.inner = factory.call(
-        mod.WasmKrigingModel,
+        requireLoadedModule().WasmKrigingModel,
         toFloat64Array(options.lats),
         toFloat64Array(options.lons),
         toUint32Array(options.successes),
@@ -107,45 +119,25 @@ export class BinomialTangentPlaneKriging {
     }
   }
 
-  private requireInner(): WasmKrigingModelHandle {
-    if (this.inner === null) {
-      throw new KrigingError(FREED, { code: "model_freed" });
-    }
-    return this.inner;
-  }
-
   static newWithPrior(
     options: BinomialTangentPlaneKrigingWithPriorOptions
   ): BinomialTangentPlaneKriging {
-    const mod = requireLoadedModule();
-    const factory = mod.WasmKrigingModel?.binomialTangentPlaneNewWithPrior;
-    if (!factory) {
-      throw new KrigingError(
-        "BinomialTangentPlaneKriging is not available; rebuild the WASM package",
-        { code: "backend_unavailable" }
-      );
-    }
-    const instance = Object.create(
-      BinomialTangentPlaneKriging.prototype
-    ) as BinomialTangentPlaneKriging;
+    const factory = requireTangentFactory("binomialTangentPlaneNewWithPrior");
     try {
-      (instance as unknown as { inner: WasmKrigingModelHandle | null }).inner =
+      return attachBinomialHandle(
+        BinomialTangentPlaneKriging.prototype,
         factory.call(
-          mod.WasmKrigingModel,
+          requireLoadedModule().WasmKrigingModel,
           toTangentPlaneWithPriorOptionsWasm(options)
-        );
+        )
+      );
     } catch (e) {
       throw wrapThrown(e);
     }
-    return instance;
   }
 
   free(): void {
-    if (this.inner === null) return;
-    if (typeof this.inner.free === "function") {
-      this.inner.free();
-    }
-    this.inner = null;
+    this.inner = freeBinomialHandle(this.inner);
   }
 
   [Symbol.dispose](): void {
@@ -153,93 +145,56 @@ export class BinomialTangentPlaneKriging {
   }
 
   get buildNotes(): BinomialBuildNotes {
-    try {
-      return mapBinomialBuildNotes(this.requireInner().getBuildNotes());
-    } catch (e) {
-      throw wrapThrown(e);
-    }
+    return getBinomialBuildNotes(
+      requireBinomialHandle(this.inner, FREED),
+      FREED
+    );
   }
 
-  /**
-   * Same shape as {@link BinomialKriging.diagnostics}: variogram in km-range units, build
-   * notes, and optional LOO MSDR from `{ lats, lons, successes, trials }` (degrees).
-   */
-  diagnostics(counts?: {
-    lats: NumericArrayInput;
-    lons: NumericArrayInput;
-    successes: IntegerArrayInput;
-    trials: IntegerArrayInput;
-  }): BinomialDiagnostics {
-    try {
-      const inner = this.requireInner();
-      const getDiagnostics = inner.getDiagnostics;
-      if (typeof getDiagnostics !== "function") {
-        throw new KrigingError(
-          "BinomialTangentPlaneKriging.diagnostics requires WASM getDiagnostics",
-          { code: "internal_error" }
-        );
-      }
-      const opts: unknown =
-        counts === undefined
-          ? undefined
-          : {
-              lats: toFloat64Array(counts.lats),
-              lons: toFloat64Array(counts.lons),
-              successes: toUint32Array(counts.successes),
-              trials: toUint32Array(counts.trials),
-            };
-      return mapBinomialDiagnostics(getDiagnostics.call(inner, opts));
-    } catch (e) {
-      throw wrapThrown(e);
-    }
+  diagnostics(counts?: GeoBinomialDiagnosticsCounts): BinomialDiagnostics {
+    return getBinomialDiagnostics2d(
+      requireBinomialHandle(this.inner, FREED),
+      FREED,
+      counts,
+      packGeoDiagnosticsOpts
+    );
   }
 
   predict(lat: number, lon: number): BinomialPrediction {
-    return mapBinomialPrediction(this.requireInner().predict(lat, lon));
+    return predictBinomialGeo(requireBinomialHandle(this.inner, FREED), lat, lon);
   }
 
   predictBatch(lats: NumericArrayInput, lons: NumericArrayInput): BinomialPrediction[] {
-    const out = this
-      .requireInner()
-      .predictBatch(toFloat64Array(lats), toFloat64Array(lons));
-    return mapBinomialPredictionArray(out);
+    return predictBatchBinomialGeo(
+      requireBinomialHandle(this.inner, FREED),
+      lats,
+      lons
+    );
   }
 
   predictBatchArrays(
     lats: NumericArrayInput,
     lons: NumericArrayInput
   ): BinomialBatchArrayOutput {
-    const out = this
-      .requireInner()
-      .predictBatchArrays(toFloat64Array(lats), toFloat64Array(lons));
-    return mapBinomialBatchArrayOutput(out);
+    return predictBatchArraysBinomialGeo(
+      requireBinomialHandle(this.inner, FREED),
+      lats,
+      lons
+    );
   }
 
   predictGrid(options: PredictGridOptions): BinomialGridOutput {
-    const inner = this.requireInner();
-    const nRows = Math.max(1, Math.floor(options.yCells));
-    const nCols = Math.max(1, Math.floor(options.xCells));
-    const out = inner.predictGridArrays(
-      options.west,
-      options.east,
-      options.south,
-      options.north,
-      nCols,
-      nRows
+    return predictGridBinomialGeo(
+      requireBinomialHandle(this.inner, FREED),
+      options
     );
-    const {
-      prevalenceMedians: pmFlat,
-      prevalenceMeans: pmeanFlat,
-      logitValues: lFlat,
-      logitVariances: lvFlat,
-      prevalenceVariances: pvFlat,
-    } = mapBinomialBatchArrayOutput(out);
-    return {
-      prevalenceMedians: reshapeFlatToGrid(pmFlat, nRows, nCols),
-      prevalenceMeans: reshapeFlatToGrid(pmeanFlat, nRows, nCols),
-      logitValues: reshapeFlatToGrid(lFlat, nRows, nCols),
-      logitVariances: reshapeFlatToGrid(lvFlat, nRows, nCols),
-      prevalenceVariances: reshapeFlatToGrid(pvFlat, nRows, nCols),
-    };
+  }
+
+  leaveOneOut(): BinomialCvResult {
+    return binomialLeaveOneOut(requireBinomialHandle(this.inner, FREED), FREED);
+  }
+
+  kFold(k: number): BinomialCvResult {
+    return binomialKFold(requireBinomialHandle(this.inner, FREED), FREED, k);
   }
 }
