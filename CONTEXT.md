@@ -51,6 +51,14 @@ _Avoid_: SGS state, simulation pool, conditioning history.
 **Kriging predictor trait**:
 `trait KrigingPredictor` — the cross-cutting seam consumed by `cv`. Backend structs hold borrowed conditioning data and implement `predict_fold(train, test)`; [`leave_one_out_cv`](crate::predictor::cv::leave_one_out_cv) and [`k_fold_cv`](crate::predictor::cv::k_fold_cv) drive the fold loop. Replaces the 21 hand-written CV entry points with a single generic harness.
 
+**WASM kriging model handle**:
+The single tagged WASM adapter (`WasmKrigingModel`) wrapping every fitted kriging model variant. Owns prediction dispatch, resource lifecycle (`free`), and instance cross-validation (`leaveOneOut`, `kFold`). TypeScript model classes (`OrdinaryKriging`, `BinomialKriging`, …) are thin adapters over this handle — not separate WASM types.
+_Avoid_: WasmOrdinaryKriging, WasmBinomialKriging (legacy per-family WASM structs — removed in 0.6).
+
+**Unified CV / simulation seam**:
+The stateless WASM entry points `cv(options)` and `simulate(options)` keyed by `geometry` + `family`, for callers that pass raw arrays without building a model handle. Delegates to the same [`KrigingPredictor`](crate::predictor::cv::KrigingPredictor) and [`KrigingSimulator`](crate::predictor/simulation.rs) harnesses as the model-handle methods.
+_Avoid_: leaveOneOutBinomialProjected, conditionalSimulateSpaceTimeUniversal (legacy named exports — removed in 0.6).
+
 **Binomial counts**:
 The geometry-free `(successes, trials)` value with `smoothed_logit(prior)` and `smoothed_probability(prior)` methods. Coordinates are paired with counts via `BinomialSite<C>` where `C: SpatialMetric::Coord`. Replaces the three observation structs.
 

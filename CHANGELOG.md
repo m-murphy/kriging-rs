@@ -17,6 +17,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   downdate (Krause & Igel 2015) instead of refitting each fold from scratch. Constant-trend
   universal CV delegates to the ordinary fast path.
 
+## [0.6.0] - 2026-06-12
+
+### Changed (breaking)
+
+- **Unified WASM/TypeScript CV and simulation seam** — twenty-plus named
+  `leaveOneOut*` / `kFold*` / `conditionalSimulate*` exports are **removed**.
+  Use `cv({ geometry, family, … })` and `simulate({ geometry, family, … })`
+  instead. Convenience wrappers `leaveOneOut`, `kFold`, `conditionalSimulate`, and
+  `conditionalSimulateMany` remain; they default to `geometry: "geo"` and
+  `family: "ordinary"` when omitted.
+- **Spacetime binomial CV** no longer requires a dummy `values` array; only
+  `successes` / `trials` are validated for the binomial family.
+
+### Added
+
+- **`cv()`** — single WASM entry point dispatching on `(geometry, family)` for
+  geo, projected, and spacetime ordinary / simple / universal / binomial CV.
+- **`simulate()`** — single WASM entry point for all 2-D and spacetime SGS
+  variants; set `nRealizations > 1` for ensemble output.
+- TypeScript types **`CvOptions`**, **`SimulateOptions`**, **`KrigingGeometry`**,
+  **`KrigingFamily`**.
+- **Instance CV on fitted models** — all continuous and binomial model classes
+  (2-D geo/projected and spacetime) expose `.leaveOneOut()` and `.kFold(k)` using
+  the model's training data and variogram (binomial requires building from
+  `successes`/`trials`, not precomputed logits).
+- **`WasmKrigingModel` tagged handle** (ADR-0002) — one WASM type wraps every fitted
+  variant with shared `geometry` / `family` tags, predict dispatch, instance CV,
+  and static factories (`ordinaryGeoFromArrays`, `spacetimeBinomialGeoFromArrays`,
+  etc.). TypeScript model classes (`OrdinaryKriging`, `SpaceTimeOrdinaryKriging`, …)
+  are thin adapters over this handle.
+- **Removed per-family WASM model exports** — `WasmOrdinaryKriging`,
+  `WasmBinomialKriging`, `WasmSpaceTimeOrdinaryKriging`, and the other eleven
+  legacy `Wasm*Kriging` types are no longer exported from the WASM binary. Use
+  `WasmKrigingModel` static factories or the public TypeScript model classes.
+
+### Migration (npm / WASM)
+
+| Removed export | Replacement |
+|----------------|-------------|
+| `leaveOneOut` (geo ordinary) | `leaveOneOut({ lats, lons, values, variogram })` or `cv({ geometry: "geo", family: "ordinary", … })` |
+| `leaveOneOutSimple` / `kFoldSimple` | `cv({ geometry: "geo", family: "simple", mean, … })` |
+| `leaveOneOutUniversal` / `kFoldUniversal` | `cv({ geometry: "geo", family: "universal", trend, … })` |
+| `leaveOneOutProjected` / `kFoldProjected` | `cv({ geometry: "projected", family: "ordinary", xs, ys, majorAngleDeg, rangeRatio, … })` |
+| `leaveOneOutBinomial` / `kFoldBinomial` | `cv({ geometry: "geo", family: "binomial", successes, trials, … })` |
+| `leaveOneOutSpaceTime*` / `kFoldSpaceTime*` | `cv({ geometry: "spacetime", family: "ordinary" \| "simple" \| "universal" \| "binomial", times, spaceTimeVariogram, … })` |
+| `conditionalSimulate` (geo ordinary) | `conditionalSimulate({ conditioningLats, …, variogram, seed })` or `simulate({ geometry: "geo", family: "ordinary", … })` |
+| `conditionalSimulateSimple` / `Universal` / `Projected` / `Binomial` | `simulate({ geometry, family, … })` with the same fields as before |
+| `conditionalSimulateSpaceTime*` | `simulate({ geometry: "spacetime", family, spaceTimeVariogram, … })` |
+| `conditionalSimulateMany*` (all variants) | `conditionalSimulateMany({ geometry, family, nRealizations, baseSeed, … })` |
+
+Spacetime calls use **`spaceTimeVariogram`** (not `variogram`). Binomial simulation
+uses **`conditioningSuccesses`** / **`conditioningTrials`**; binomial CV uses
+**`successes`** / **`trials`**.
+
+```ts
+import { cv, leaveOneOut, kFold, simulate, conditionalSimulate } from "kriging-rs-wasm";
+
+// LOO ordinary CV (geometry/family optional on convenience wrappers)
+const loo = leaveOneOut({ lats, lons, values, variogram });
+
+// K-fold projected binomial CV
+const kf = cv({
+  geometry: "projected",
+  family: "binomial",
+  xs, ys, successes, trials, variogram,
+  majorAngleDeg: 0, rangeRatio: 1, k: 5,
+});
+
+// Spacetime SGS
+const samples = simulate({
+  geometry: "spacetime",
+  family: "ordinary",
+  conditioningLats, conditioningLons, conditioningTimes, conditioningValues,
+  targetLats, targetLons, targetTimes,
+  spaceTimeVariogram,
+  seed: 42n,
+});
+```
+
+Rebuild the published `pkg` after upgrading (`npm run build:wasm`).
+
+**Model handle:** public TypeScript classes construct via
+`WasmKrigingModel.*` factories internally. If you call WASM glue directly, use
+`WasmKrigingModel` static factories — per-family `Wasm*Kriging` types were
+removed in 0.6.0.
+
+| Removed export | Replacement |
+|----------------|-------------|
+| `WasmOrdinaryKriging`, `WasmSimpleKriging`, … | `WasmKrigingModel.ordinaryGeoFromArrays`, `WasmKrigingModel.simpleGeoFromArrays`, … |
+| `WasmSpaceTimeOrdinaryKriging`, … | `WasmKrigingModel.spacetimeOrdinaryGeoFromArrays`, … |
+
 ## [0.5.0] - 2026-06-12
 
 ### Added
@@ -84,8 +175,8 @@ sequential_gaussian_simulate(
 )?;
 ```
 
-WASM/TypeScript **export names are unchanged** (`wasm_leave_one_out`, `conditionalSimulate`, …);
-internals call the new predictor/simulator backends.
+WASM/TypeScript per-variant CV/SGS export names were **removed in 0.6.0**; use `cv()` /
+`simulate()` (see [0.6.0] migration). Rust internals call the predictor/simulator backends.
 
 ## [0.4.0] - 2026-04-26
 
