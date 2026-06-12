@@ -26,6 +26,7 @@ export { UniversalKriging } from "./kriging/universal.js";
 export { ProjectedKriging } from "./kriging/projected.js";
 export { BinomialKriging } from "./kriging/binomial.js";
 export { BinomialProjectedKriging } from "./kriging/binomial-projected.js";
+/** Advanced: local tangent-plane binomial kriging — see README "Choosing binomial geometry". */
 export { BinomialTangentPlaneKriging } from "./kriging/binomial-tangent-plane.js";
 export {
   computeDirectionalEmpiricalVariogram,
@@ -117,6 +118,7 @@ export type {
   ComputeDirectionalEmpiricalVariogramOptions,
   ComputeEmpiricalVariogramOptions,
   CvOptions,
+  CvOptionsInput,
   CvResidual,
   DateAxisOptions,
   CvResult,
@@ -126,7 +128,11 @@ export type {
   FitBinomialVariogramOptions,
   FitVariogramOptions,
   FittedVariogram,
+  GeoCvOptions,
+  GeoCvOptionsInput,
   GeoGridBounds,
+  GeoSimulateOptions,
+  GeoSimulateOptionsInput,
   IntegerArrayInput,
   InterpolateBinomialToGridOptions,
   InterpolateBinomialToGridResult,
@@ -134,6 +140,7 @@ export type {
   KrigingErrorCode,
   KrigingFamily,
   KrigingGeometry,
+  LeaveOneOutOptions,
   NeighborhoodOptions,
   NestedVariogramComponent,
   NestedVariogramEvaluation,
@@ -151,8 +158,11 @@ export type {
   PredictGridOptions,
   PredictProjectedGridOptions,
   ProjectedKrigingOptions,
+  ProjectedCvOptions,
+  ProjectedSimulateOptions,
   SimpleKrigingOptions,
   SimulateOptions,
+  SimulateOptionsInput,
   SimulateBinomialGridEnsembleOptions,
   SimulateBinomialGridOptions,
   SimulateBinomialGridSummaryOptions,
@@ -188,6 +198,8 @@ export type {
   SpaceTimeUniversalTrend,
   SpaceTimeVariogramFamily,
   SpaceTimeVariogramParams,
+  SpacetimeCvOptions,
+  SpacetimeSimulateOptions,
 } from "./types.js";
 export type { TimeUnit } from "./time.js";
 

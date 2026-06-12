@@ -12,11 +12,12 @@ import { resolveBinomialPriorInput } from "./prior.js";
 import { packSpaceTimeVariogram } from "./spacetime.js";
 import type {
   BinomialPriorInput,
-  CvOptions,
+  CvOptionsInput,
   IntegerArrayInput,
   NumericArrayInput,
-  SimulateOptions,
+  SimulateOptionsInput,
   SpaceTimeVariogramParams,
+  UnifiedOptionsFlat,
   VariogramParams,
 } from "../types.js";
 
@@ -32,7 +33,7 @@ function isSpaceTimeVariogram(
 }
 
 function resolveSpaceTimeVariogram(
-  options: CvOptions | SimulateOptions
+  options: UnifiedOptionsFlat
 ): SpaceTimeVariogramParams | undefined {
   if (options.spaceTimeVariogram) {
     return options.spaceTimeVariogram;
@@ -47,7 +48,7 @@ function resolveSpaceTimeVariogram(
 }
 
 function resolve2dVariogram(
-  options: CvOptions | SimulateOptions
+  options: UnifiedOptionsFlat
 ): VariogramParams | undefined {
   if (options.variogram && !isSpaceTimeVariogram(options.variogram)) {
     return options.variogram;
@@ -55,14 +56,14 @@ function resolve2dVariogram(
   return undefined;
 }
 
-function withGeometryFamilyDefaults<T extends CvOptions | SimulateOptions>(
-  options: T
-): T {
+function withGeometryFamilyDefaults(
+  options: CvOptionsInput | SimulateOptionsInput
+): UnifiedOptionsFlat {
   return {
     ...options,
     geometry: options.geometry ?? "geo",
     family: options.family ?? "ordinary",
-  } as T;
+  };
 }
 
 function packVariogram(variogram: VariogramParams) {
@@ -134,7 +135,7 @@ function packUintField(
   return value === undefined ? undefined : Array.from(toUint32Array(value));
 }
 
-export function packCvOptions(options: CvOptions): Record<string, unknown> {
+export function packCvOptions(options: CvOptionsInput): Record<string, unknown> {
   const normalized = withGeometryFamilyDefaults(options);
   const payload: Record<string, unknown> = {
     geometry: normalized.geometry,
@@ -196,10 +197,10 @@ function normalizeSeed(seed: number | bigint | undefined): number {
 }
 
 export function packSimulateOptions(
-  options: SimulateOptions
+  options: SimulateOptionsInput
 ): Record<string, unknown> {
   const normalized = withGeometryFamilyDefaults(options);
-  const legacy = normalized as SimulateOptions & {
+  const legacy = normalized as UnifiedOptionsFlat & {
     successes?: IntegerArrayInput;
     trials?: IntegerArrayInput;
   };

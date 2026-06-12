@@ -1065,71 +1065,280 @@ export type KrigingGeometry = "geo" | "projected" | "spacetime";
 /** Kriging family seam for unified CV / simulation entry points. */
 export type KrigingFamily = "ordinary" | "simple" | "universal" | "binomial";
 
+/** Omit `K` from each member of union `T` (TypeScript `Omit` is not distributive). */
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
+  ? Omit<T, K>
+  : never;
+
+/** Shared fold and prior options for {@link cv}. */
+type CvFoldOptions = {
+  /** Number of folds (`2 ≤ k ≤ n`). Omit for leave-one-out. */
+  k?: number;
+  prior?: BinomialPriorInput;
+};
+
+/** Projected anisotropy fields (2-D geometries only). */
+type ProjectedAnisotropyOptions = {
+  majorAngleDeg?: number;
+  rangeRatio?: number;
+};
+
+/** Family-specific fields for geo / projected CV. */
+type CvGeoFamilyOptions =
+  | {
+      family?: "ordinary";
+      values: NumericArrayInput;
+    }
+  | {
+      family: "simple";
+      values: NumericArrayInput;
+      mean: number;
+    }
+  | {
+      family: "universal";
+      values: NumericArrayInput;
+      trend?: UniversalTrend;
+    }
+  | {
+      family: "binomial";
+      successes: IntegerArrayInput;
+      trials: IntegerArrayInput;
+    };
+
+/** Family-specific fields for spacetime CV. */
+type CvSpacetimeFamilyOptions =
+  | {
+      family?: "ordinary";
+      values: NumericArrayInput;
+    }
+  | {
+      family: "simple";
+      values: NumericArrayInput;
+      mean: number;
+    }
+  | {
+      family: "universal";
+      values: NumericArrayInput;
+      trend?: SpaceTimeUniversalTrend;
+    }
+  | {
+      family: "binomial";
+      successes: IntegerArrayInput;
+      trials: IntegerArrayInput;
+    };
+
 /**
- * Unified cross-validation options keyed by {@link KrigingGeometry} and
- * {@link KrigingFamily}. Omit `k` for leave-one-out; set `k` for k-fold.
+ * Geographic cross-validation — `(lat, lon)` and a 2-D variogram.
  * Folds are deterministic round-robin (station `i` → fold `i % k`); shuffle inputs
  * for randomized validation. Binomial CV: stations with `trials[i] === 0` carry
  * `NaN` observed fields and are excluded from summary aggregates.
  */
-export interface CvOptions {
-  geometry: KrigingGeometry;
-  family: KrigingFamily;
-  /** Number of folds (`2 ≤ k ≤ n`). Omit for leave-one-out. */
-  k?: number;
-  lats?: NumericArrayInput;
-  lons?: NumericArrayInput;
-  xs?: NumericArrayInput;
-  ys?: NumericArrayInput;
-  values?: NumericArrayInput;
-  successes?: IntegerArrayInput;
-  trials?: IntegerArrayInput;
-  times?: NumericArrayInput;
-  /** Required for `geo` / `projected` geometries. */
-  variogram?: VariogramParams;
-  /** Required for `spacetime` geometry. */
-  spaceTimeVariogram?: SpaceTimeVariogramParams;
-  mean?: number;
-  trend?: UniversalTrend | SpaceTimeUniversalTrend;
-  majorAngleDeg?: number;
-  rangeRatio?: number;
-  prior?: BinomialPriorInput;
-}
+export type GeoCvOptions = CvFoldOptions & {
+  geometry: "geo";
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  variogram: VariogramParams;
+} & CvGeoFamilyOptions;
 
 /**
- * Unified sequential Gaussian simulation options keyed by {@link KrigingGeometry}
- * and {@link KrigingFamily}. Deterministic for a given `seed` (or `baseSeed` when
- * `nRealizations > 1`). Binomial simulation runs on the logit scale; stations with
- * `trials === 0` are dropped from the initial conditioning pool.
+ * Like {@link GeoCvOptions} but `geometry` defaults to `"geo"` and `family`
+ * defaults to `"ordinary"` on {@link leaveOneOut} / {@link kFold}.
  */
-export interface SimulateOptions {
-  geometry: KrigingGeometry;
-  family: KrigingFamily;
-  conditioningLats?: NumericArrayInput;
-  conditioningLons?: NumericArrayInput;
-  conditioningXs?: NumericArrayInput;
-  conditioningYs?: NumericArrayInput;
-  conditioningTimes?: NumericArrayInput;
-  conditioningValues?: NumericArrayInput;
-  conditioningSuccesses?: IntegerArrayInput;
-  conditioningTrials?: IntegerArrayInput;
-  targetLats?: NumericArrayInput;
-  targetLons?: NumericArrayInput;
-  targetXs?: NumericArrayInput;
-  targetYs?: NumericArrayInput;
-  targetTimes?: NumericArrayInput;
-  variogram?: VariogramParams;
-  spaceTimeVariogram?: SpaceTimeVariogramParams;
-  mean?: number;
-  trend?: UniversalTrend | SpaceTimeUniversalTrend;
-  majorAngleDeg?: number;
-  rangeRatio?: number;
+export type GeoCvOptionsInput = CvFoldOptions & {
+  geometry?: "geo";
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  variogram: VariogramParams;
+} & CvGeoFamilyOptions;
+
+/** Projected cross-validation — planar `(x, y)` and a 2-D variogram. */
+export type ProjectedCvOptions = CvFoldOptions &
+  ProjectedAnisotropyOptions & {
+    geometry: "projected";
+    xs: NumericArrayInput;
+    ys: NumericArrayInput;
+    variogram: VariogramParams;
+  } & CvGeoFamilyOptions;
+
+/** Spacetime cross-validation — `(lat, lon, time)` and a space-time variogram. */
+export type SpacetimeCvOptions = CvFoldOptions & {
+  geometry: "spacetime";
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  times: NumericArrayInput;
+  spaceTimeVariogram: SpaceTimeVariogramParams;
+} & CvSpacetimeFamilyOptions;
+
+/**
+ * Cross-validation options discriminated by `geometry`.
+ * Use {@link CvOptionsInput} at call sites that rely on geo + ordinary defaults.
+ */
+export type CvOptions = GeoCvOptions | ProjectedCvOptions | SpacetimeCvOptions;
+
+/** Input accepted by {@link cv}, {@link leaveOneOut}, and {@link kFold}. */
+export type CvOptionsInput =
+  | GeoCvOptionsInput
+  | ProjectedCvOptions
+  | SpacetimeCvOptions;
+
+/** {@link leaveOneOut} input — `k` is not accepted. */
+export type LeaveOneOutOptions = DistributiveOmit<CvOptionsInput, "k">;
+
+/** Shared seed / realization options for {@link simulate}. */
+type SimulateSeedOptions = {
   prior?: BinomialPriorInput;
   seed?: number | bigint;
   baseSeed?: number | bigint;
   nRealizations?: number;
   targetOrder?: ArrayLike<number> | Uint32Array;
-}
+};
+
+/** Family-specific fields for geo / projected simulation. */
+type SimulateGeoFamilyOptions =
+  | {
+      family?: "ordinary";
+      conditioningValues: NumericArrayInput;
+    }
+  | {
+      family: "simple";
+      conditioningValues: NumericArrayInput;
+      mean: number;
+    }
+  | {
+      family: "universal";
+      conditioningValues: NumericArrayInput;
+      trend?: UniversalTrend;
+    }
+  | {
+      family: "binomial";
+      conditioningSuccesses: IntegerArrayInput;
+      conditioningTrials: IntegerArrayInput;
+    };
+
+/** Family-specific fields for spacetime simulation. */
+type SimulateSpacetimeFamilyOptions =
+  | {
+      family?: "ordinary";
+      conditioningValues: NumericArrayInput;
+    }
+  | {
+      family: "simple";
+      conditioningValues: NumericArrayInput;
+      mean: number;
+    }
+  | {
+      family: "universal";
+      conditioningValues: NumericArrayInput;
+      trend?: SpaceTimeUniversalTrend;
+    }
+  | {
+      family: "binomial";
+      conditioningSuccesses: IntegerArrayInput;
+      conditioningTrials: IntegerArrayInput;
+    };
+
+/**
+ * Geographic sequential Gaussian simulation — Haversine conditioning and targets.
+ * Deterministic for a given `seed` (or `baseSeed` when `nRealizations > 1`).
+ * Binomial simulation runs on the logit scale; stations with `trials === 0` are
+ * dropped from the initial conditioning pool.
+ */
+export type GeoSimulateOptions = SimulateSeedOptions & {
+  geometry: "geo";
+  conditioningLats: NumericArrayInput;
+  conditioningLons: NumericArrayInput;
+  targetLats: NumericArrayInput;
+  targetLons: NumericArrayInput;
+  variogram: VariogramParams;
+} & SimulateGeoFamilyOptions;
+
+/**
+ * Like {@link GeoSimulateOptions} but `geometry` defaults to `"geo"` and `family`
+ * defaults to `"ordinary"` on {@link conditionalSimulate} / {@link conditionalSimulateMany}.
+ */
+export type GeoSimulateOptionsInput = SimulateSeedOptions & {
+  geometry?: "geo";
+  conditioningLats: NumericArrayInput;
+  conditioningLons: NumericArrayInput;
+  targetLats: NumericArrayInput;
+  targetLons: NumericArrayInput;
+  variogram: VariogramParams;
+} & SimulateGeoFamilyOptions;
+
+/** Projected sequential Gaussian simulation — planar conditioning and targets. */
+export type ProjectedSimulateOptions = SimulateSeedOptions &
+  ProjectedAnisotropyOptions & {
+    geometry: "projected";
+    conditioningXs: NumericArrayInput;
+    conditioningYs: NumericArrayInput;
+    targetXs: NumericArrayInput;
+    targetYs: NumericArrayInput;
+    variogram: VariogramParams;
+  } & SimulateGeoFamilyOptions;
+
+/** Spacetime sequential Gaussian simulation. */
+export type SpacetimeSimulateOptions = SimulateSeedOptions & {
+  geometry: "spacetime";
+  conditioningLats: NumericArrayInput;
+  conditioningLons: NumericArrayInput;
+  conditioningTimes: NumericArrayInput;
+  targetLats: NumericArrayInput;
+  targetLons: NumericArrayInput;
+  targetTimes: NumericArrayInput;
+  spaceTimeVariogram: SpaceTimeVariogramParams;
+} & SimulateSpacetimeFamilyOptions;
+
+/**
+ * Simulation options discriminated by `geometry`.
+ * Use {@link SimulateOptionsInput} at call sites that rely on geo + ordinary defaults.
+ */
+export type SimulateOptions =
+  | GeoSimulateOptions
+  | ProjectedSimulateOptions
+  | SpacetimeSimulateOptions;
+
+/** Input accepted by {@link simulate}, {@link conditionalSimulate}, and {@link conditionalSimulateMany}. */
+export type SimulateOptionsInput =
+  | GeoSimulateOptionsInput
+  | ProjectedSimulateOptions
+  | SpacetimeSimulateOptions;
+
+/**
+ * @internal Flat field bag for WASM serde packing after geometry/family normalization.
+ * Public callers should use the discriminated {@link CvOptionsInput} / {@link SimulateOptionsInput}.
+ */
+export type UnifiedOptionsFlat = CvFoldOptions &
+  SimulateSeedOptions & {
+    geometry?: KrigingGeometry;
+    family?: KrigingFamily;
+    lats?: NumericArrayInput;
+    lons?: NumericArrayInput;
+    xs?: NumericArrayInput;
+    ys?: NumericArrayInput;
+    values?: NumericArrayInput;
+    successes?: IntegerArrayInput;
+    trials?: IntegerArrayInput;
+    times?: NumericArrayInput;
+    variogram?: VariogramParams | SpaceTimeVariogramParams;
+    spaceTimeVariogram?: SpaceTimeVariogramParams;
+    mean?: number;
+    trend?: UniversalTrend | SpaceTimeUniversalTrend;
+    majorAngleDeg?: number;
+    rangeRatio?: number;
+    conditioningLats?: NumericArrayInput;
+    conditioningLons?: NumericArrayInput;
+    conditioningXs?: NumericArrayInput;
+    conditioningYs?: NumericArrayInput;
+    conditioningTimes?: NumericArrayInput;
+    conditioningValues?: NumericArrayInput;
+    conditioningSuccesses?: IntegerArrayInput;
+    conditioningTrials?: IntegerArrayInput;
+    targetLats?: NumericArrayInput;
+    targetLons?: NumericArrayInput;
+    targetXs?: NumericArrayInput;
+    targetYs?: NumericArrayInput;
+    targetTimes?: NumericArrayInput;
+  };
 
 /** Result of {@link cv} / {@link leaveOneOut} / {@link kFold} for continuous families. */
 export interface CvResult {

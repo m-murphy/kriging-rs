@@ -17,7 +17,7 @@ import { packSimulateOptions } from "./internal/unified-boundary.js";
 import type {
   BinomialSimulationManyResult,
   BinomialSimulationResult,
-  SimulateOptions,
+  SimulateOptionsInput,
 } from "./types.js";
 
 function mapBinomialSimulation(raw: unknown): BinomialSimulationResult {
@@ -46,7 +46,7 @@ function mapBinomialSimulationMany(raw: unknown): BinomialSimulationManyResult {
  * `nRealizations` and `nTargets`.
  */
 export function simulate(
-  options: SimulateOptions & Partial<Pick<SimulateOptions, "geometry" | "family">>
+  options: SimulateOptionsInput
 ): Float64Array | BinomialSimulationResult | BinomialSimulationManyResult {
   const mod = requireLoadedModule();
   const family = options.family ?? "ordinary";
@@ -65,7 +65,7 @@ export function simulate(
 
 /** Single-realization SGS — {@link simulate} with `nRealizations` unset. */
 export function conditionalSimulate(
-  options: SimulateOptions & Partial<Pick<SimulateOptions, "geometry" | "family">>
+  options: SimulateOptionsInput
 ): Float64Array | BinomialSimulationResult {
   if (options.nRealizations !== undefined && options.nRealizations > 1) {
     throw new KrigingError(
@@ -78,8 +78,7 @@ export function conditionalSimulate(
 
 /** Multi-realization SGS — {@link simulate} with `nRealizations >= 1`. */
 export function conditionalSimulateMany(
-  options: (SimulateOptions & { nRealizations: number }) &
-    Partial<Pick<SimulateOptions, "geometry" | "family">>
+  options: SimulateOptionsInput & { nRealizations: number }
 ): Float64Array | BinomialSimulationManyResult {
   if (options.nRealizations < 1) {
     throw new KrigingError("nRealizations must be >= 1", {
