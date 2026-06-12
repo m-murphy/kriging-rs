@@ -9,6 +9,7 @@
 
 pub mod binomial;
 pub(crate) mod engine;
+pub(crate) mod numerics;
 pub mod ordinary;
 pub mod simple;
 pub(crate) mod simple_engine;

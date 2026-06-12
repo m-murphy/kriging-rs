@@ -10,9 +10,12 @@ use crate::error::KrigingError;
 use crate::geo_dataset::GeoDataset;
 use crate::kriging::binomial::{
     BinomialKrigingModel, BinomialObservation, BinomialPrior, HeteroskedasticBinomialConfig,
+    delta_prevalence_variance,
 };
+use crate::kriging::engine::OrdinaryKrigingEngine;
 use crate::kriging::ordinary::OrdinaryKrigingModel;
 use crate::kriging::simple::SimpleKrigingModel;
+use crate::kriging::simple_engine::SimpleKrigingEngine;
 use crate::kriging::universal::{UniversalKrigingModel, UniversalTrend};
 use crate::projected::{
     Anisotropy2D, BinomialProjectedKrigingModel, ProjectedBinomialObservation, ProjectedCoord,
@@ -23,11 +26,13 @@ use crate::spacetime::dataset::SpaceTimeDataset;
 use crate::spacetime::kriging::binomial::{
     SpaceTimeBinomialKrigingModel, SpaceTimeBinomialObservation,
 };
+use crate::spacetime::kriging::engine::SpaceTimeOrdinaryKrigingEngine;
 use crate::spacetime::kriging::ordinary::SpaceTimeOrdinaryKrigingModel;
 use crate::spacetime::kriging::simple::SpaceTimeSimpleKrigingModel;
 use crate::spacetime::kriging::universal::{
     SpaceTimeUniversalKrigingModel, SpaceTimeUniversalTrend,
 };
+use crate::spacetime::metric::{GeoMetric, ProjectedMetric};
 use crate::spacetime::metric::{SpatialBasis, SpatialMetric};
 use crate::spacetime::variogram::SpaceTimeVariogram;
 use crate::utils::{logistic, logit_clamped};
@@ -48,12 +53,25 @@ pub trait KrigingPredictor {
         train: &[usize],
         test: &[usize],
     ) -> Result<Vec<Self::Residual>, KrigingError>;
+
+    /// Leave-one-out CV in input order. Engines override with O(n³) Cholesky-downdate paths.
+    fn leave_one_out(&self) -> Result<Vec<Self::Residual>, KrigingError> {
+        leave_one_out_via_folds(self)
+    }
 }
 
 /// Leave-one-out cross-validation: for each station `i`, fit on the complement and predict `i`.
 /// Residuals are returned in input order (`0..n`).
-pub fn leave_one_out_cv<P: KrigingPredictor>(p: &P) -> Result<Vec<P::Residual>, KrigingError> {
+pub fn leave_one_out_cv<P: KrigingPredictor + ?Sized>(
+    p: &P,
+) -> Result<Vec<P::Residual>, KrigingError> {
     p.validate()?;
+    p.leave_one_out()
+}
+
+fn leave_one_out_via_folds<P: KrigingPredictor + ?Sized>(
+    p: &P,
+) -> Result<Vec<P::Residual>, KrigingError> {
     let n = p.n();
     let mut out = Vec::with_capacity(n);
     for_each_loo_fold(n, |train, test| {
@@ -154,11 +172,6 @@ fn observed_logit_and_prevalence(successes: u32, trials: u32) -> (Real, Real) {
         let p = successes as Real / trials as Real;
         (logit_clamped(p), p)
     }
-}
-
-fn delta_prevalence_variance(prevalence: Real, logit_variance: Real) -> Real {
-    let factor = prevalence * (1.0 - prevalence);
-    factor * factor * logit_variance.max(0.0)
 }
 
 fn make_binomial_residual(
@@ -275,6 +288,27 @@ impl KrigingPredictor for OrdinaryGeoPredictor<'_> {
         validate_len(self.coords.len(), self.values.len())
     }
 
+    fn leave_one_out(&self) -> Result<Vec<CvResidual>, KrigingError> {
+        self.validate()?;
+        let engine = OrdinaryKrigingEngine::fit(
+            GeoMetric,
+            self.coords.to_vec(),
+            self.values.to_vec(),
+            self.variogram,
+        )?;
+        let preds = engine.leave_one_out_predictions()?;
+        Ok(preds
+            .into_iter()
+            .enumerate()
+            .map(|(i, pred)| CvResidual {
+                index: i,
+                observed: self.values[i],
+                predicted: pred.value,
+                variance: pred.variance,
+            })
+            .collect())
+    }
+
     fn predict_fold(
         &self,
         train: &[usize],
@@ -316,6 +350,28 @@ impl KrigingPredictor for SimpleGeoPredictor<'_> {
 
     fn validate(&self) -> Result<(), KrigingError> {
         validate_len(self.coords.len(), self.values.len())
+    }
+
+    fn leave_one_out(&self) -> Result<Vec<CvResidual>, KrigingError> {
+        self.validate()?;
+        let engine = SimpleKrigingEngine::fit(
+            GeoMetric,
+            self.coords.to_vec(),
+            self.values.to_vec(),
+            self.variogram,
+            self.mean,
+        )?;
+        let preds = engine.leave_one_out_predictions()?;
+        Ok(preds
+            .into_iter()
+            .enumerate()
+            .map(|(i, pred)| CvResidual {
+                index: i,
+                observed: self.values[i],
+                predicted: pred.value,
+                variance: pred.variance,
+            })
+            .collect())
     }
 
     fn predict_fold(
@@ -361,6 +417,18 @@ impl KrigingPredictor for UniversalGeoPredictor<'_> {
         validate_len(self.coords.len(), self.values.len())
     }
 
+    fn leave_one_out(&self) -> Result<Vec<CvResidual>, KrigingError> {
+        if self.trend == UniversalTrend::Constant {
+            return OrdinaryGeoPredictor {
+                coords: self.coords,
+                values: self.values,
+                variogram: self.variogram,
+            }
+            .leave_one_out();
+        }
+        leave_one_out_via_folds(self)
+    }
+
     fn predict_fold(
         &self,
         train: &[usize],
@@ -402,6 +470,27 @@ impl KrigingPredictor for ProjectedOrdinaryPredictor<'_> {
 
     fn validate(&self) -> Result<(), KrigingError> {
         validate_len(self.coords.len(), self.values.len())
+    }
+
+    fn leave_one_out(&self) -> Result<Vec<CvResidual>, KrigingError> {
+        self.validate()?;
+        let engine = OrdinaryKrigingEngine::fit(
+            ProjectedMetric::with_anisotropy(self.anisotropy),
+            self.coords.to_vec(),
+            self.values.to_vec(),
+            self.variogram,
+        )?;
+        let preds = engine.leave_one_out_predictions()?;
+        Ok(preds
+            .into_iter()
+            .enumerate()
+            .map(|(i, pred)| CvResidual {
+                index: i,
+                observed: self.values[i],
+                predicted: pred.value,
+                variance: pred.variance,
+            })
+            .collect())
     }
 
     fn predict_fold(
@@ -566,6 +655,28 @@ impl<M: SpatialMetric> KrigingPredictor for SpacetimeOrdinaryPredictor<'_, M> {
         validate_len(self.coords.len(), self.values.len())
     }
 
+    fn leave_one_out(&self) -> Result<Vec<CvResidual>, KrigingError> {
+        self.validate()?;
+        let engine = SpaceTimeOrdinaryKrigingEngine::fit_with_extra_diagonal(
+            self.metric,
+            self.coords.to_vec(),
+            self.values.to_vec(),
+            self.variogram,
+            &[],
+        )?;
+        let preds = engine.leave_one_out_predictions()?;
+        Ok(preds
+            .into_iter()
+            .enumerate()
+            .map(|(i, pred)| CvResidual {
+                index: i,
+                observed: self.values[i],
+                predicted: pred.value,
+                variance: pred.variance,
+            })
+            .collect())
+    }
+
     fn predict_fold(
         &self,
         train: &[usize],
@@ -659,6 +770,19 @@ impl<M: SpatialBasis> KrigingPredictor for SpacetimeUniversalPredictor<'_, M> {
         validate_len(self.coords.len(), self.values.len())
     }
 
+    fn leave_one_out(&self) -> Result<Vec<CvResidual>, KrigingError> {
+        if self.trend == SpaceTimeUniversalTrend::Constant {
+            return SpacetimeOrdinaryPredictor {
+                metric: self.metric,
+                coords: self.coords,
+                values: self.values,
+                variogram: self.variogram,
+            }
+            .leave_one_out();
+        }
+        leave_one_out_via_folds(self)
+    }
+
     fn predict_fold(
         &self,
         train: &[usize],
@@ -748,6 +872,31 @@ impl<M: SpatialMetric> KrigingPredictor for SpacetimeBinomialPredictor<'_, M> {
 mod tests {
     use super::*;
     use crate::variogram::models::VariogramType;
+
+    #[test]
+    fn ordinary_geo_fast_loo_matches_fold_loo() {
+        let coords = vec![
+            GeoCoord::try_new(0.0, 0.0).unwrap(),
+            GeoCoord::try_new(0.0, 1.0).unwrap(),
+            GeoCoord::try_new(1.0, 0.0).unwrap(),
+            GeoCoord::try_new(1.0, 1.0).unwrap(),
+        ];
+        let values = vec![10.0, 12.0, 14.0, 16.0];
+        let variogram = VariogramModel::new(0.01, 5.0, 300.0, VariogramType::Exponential).unwrap();
+        let p = OrdinaryGeoPredictor {
+            coords: &coords,
+            values: &values,
+            variogram,
+        };
+        let fast = p.leave_one_out().unwrap();
+        let slow = leave_one_out_via_folds(&p).unwrap();
+        assert_eq!(fast.len(), slow.len());
+        for (a, b) in fast.iter().zip(slow.iter()) {
+            assert_eq!(a.index, b.index);
+            assert!((a.predicted - b.predicted).abs() < 1e-4);
+            assert!((a.variance - b.variance).abs() < 1e-4);
+        }
+    }
 
     #[test]
     fn ordinary_geo_loo_returns_finite_residuals() {

@@ -85,7 +85,7 @@ impl<M: SpatialMetric> SpaceTimeSimpleKrigingEngine<M> {
             variogram,
             extra_diagonal,
         )?;
-        let chol_l = factor_spd(&c)?;
+        let chol_l = factor_spd(c)?;
 
         Ok(Self {
             metric,
@@ -142,8 +142,8 @@ impl<M: SpatialMetric> SpaceTimeSimpleKrigingEngine<M> {
             let ht = temporal_distance(self.times[i], time_site);
             cross[i] = self.variogram.covariance(hs, ht);
         }
-        let n_new = n + 1;
-        let diag_eps = spacetime_diagonal_jitter(n_new, self.variogram);
+        let _n_new = n + 1;
+        let diag_eps = spacetime_diagonal_jitter(self.variogram);
         let new_diag = self.cov_at_zero + diag_eps + obs_var;
 
         self.chol_l = cholesky_extend_spd_lower(&self.chol_l, &cross, new_diag)?;

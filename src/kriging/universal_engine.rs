@@ -10,7 +10,8 @@ use crate::cholesky_update::cholesky_extend_spd_lower;
 use crate::distance::{GeoCoord, PreparedGeoCoord};
 use crate::error::KrigingError;
 use crate::kriging::engine::{build_covariance, factor_spd, solve_spd_lower};
-use crate::kriging::ordinary::{Prediction, kriging_diagonal_jitter};
+use crate::kriging::numerics::{extend_beta_column, kriging_diagonal_jitter};
+use crate::kriging::ordinary::Prediction;
 use crate::kriging::universal::UniversalTrend;
 use crate::spacetime::metric::{GeoMetric, SpatialMetric};
 use crate::variogram::models::VariogramModel;
@@ -68,10 +69,10 @@ impl UniversalKrigingEngine {
         let prepared: Vec<_> = coords.iter().map(|&c| GeoMetric.prepare(c)).collect();
         let design = build_design(&coords, trend, n, p);
         let c = build_covariance(&GeoMetric, &prepared, variogram, extra_diagonal)?;
-        let chol_l = factor_spd(&c)?;
+        let chol_l = factor_spd(c)?;
         let beta = solve_beta_columns(&chol_l, &design, n, p)?;
         let schur = design.transpose() * &beta;
-        let schur_l = factor_spd(&schur)?;
+        let schur_l = factor_spd(schur)?;
 
         Ok(Self {
             coords,
@@ -125,9 +126,12 @@ impl UniversalKrigingEngine {
                 .variogram
                 .covariance(GeoMetric.distance(self.prepared[i], prepared_site));
         }
-        let n_new = n + 1;
-        let diag_eps = kriging_diagonal_jitter(n_new, self.variogram);
+        let diag_eps = kriging_diagonal_jitter(self.variogram);
         let new_diag = self.cov_at_zero + diag_eps + obs_var;
+
+        let gamma_v = solve_spd_lower(&self.chol_l, &cross)?;
+        let w_fwd = crate::cholesky_update::forward_solve_lower(&self.chol_l, &cross)?;
+        let schur = new_diag - w_fwd.dot(&w_fwd);
 
         self.chol_l = cholesky_extend_spd_lower(&self.chol_l, &cross, new_diag)?;
         self.coords.push(site);
@@ -137,7 +141,21 @@ impl UniversalKrigingEngine {
 
         let mut f_row = vec![0.0 as Real; p];
         self.trend.eval_basis(site, &mut f_row);
-        let mut new_design = DMatrix::zeros(n_new, p);
+
+        let mut new_beta = DMatrix::zeros(n + 1, p);
+        for l in 0..p {
+            let mut col = DVector::zeros(n);
+            for i in 0..n {
+                col[i] = self.beta[(i, l)];
+            }
+            let col_new = extend_beta_column(&col, &cross, &gamma_v, schur, f_row[l])?;
+            for i in 0..=n {
+                new_beta[(i, l)] = col_new[i];
+            }
+        }
+        self.beta = new_beta;
+
+        let mut new_design = DMatrix::zeros(n + 1, p);
         for i in 0..n {
             for l in 0..p {
                 new_design[(i, l)] = self.design[(i, l)];
@@ -147,9 +165,9 @@ impl UniversalKrigingEngine {
             new_design[(n, l)] = f_row[l];
         }
         self.design = new_design;
-        self.beta = solve_beta_columns(&self.chol_l, &self.design, n_new, p)?;
-        let schur = self.design.transpose() * &self.beta;
-        self.schur_l = factor_spd(&schur)?;
+
+        let schur_mat = self.design.transpose() * &self.beta;
+        self.schur_l = factor_spd(schur_mat)?;
         Ok(self)
     }
 

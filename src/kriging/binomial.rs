@@ -571,8 +571,8 @@ where
     Err(last_err.unwrap_or_else(|| KrigingError::MatrixError(build_failure_message.to_string())))
 }
 
-#[inline]
-fn delta_prevalence_variance(prevalence: Real, logit_variance: Real) -> Real {
+/// Delta-method variance of prevalence from logit mean and variance on the link scale.
+pub fn delta_prevalence_variance(prevalence: Real, logit_variance: Real) -> Real {
     let factor = prevalence * (1.0 - prevalence);
     factor * factor * logit_variance.max(0.0)
 }

@@ -7,8 +7,10 @@ use nalgebra::{DMatrix, DVector};
 
 use crate::Real;
 use crate::cholesky_update::cholesky_extend_spd_lower;
+use crate::cholesky_update::forward_solve_lower;
 use crate::error::KrigingError;
 use crate::kriging::engine::{factor_spd, solve_spd_lower};
+use crate::kriging::numerics::extend_beta_column;
 use crate::kriging::ordinary::Prediction;
 use crate::spacetime::coord::{SpaceTimeCoord, temporal_distance};
 use crate::spacetime::kriging::engine::build_covariance;
@@ -77,10 +79,10 @@ impl<M: SpatialBasis> SpaceTimeUniversalKrigingEngine<M> {
             variogram,
             extra_diagonal,
         )?;
-        let chol_l = factor_spd(&c)?;
+        let chol_l = factor_spd(c)?;
         let beta = solve_beta_columns(&chol_l, &design, n, p)?;
         let schur = design.transpose() * &beta;
-        let schur_l = factor_spd(&schur)?;
+        let schur_l = factor_spd(schur)?;
 
         Ok(Self {
             metric,
@@ -142,9 +144,12 @@ impl<M: SpatialBasis> SpaceTimeUniversalKrigingEngine<M> {
             let ht = temporal_distance(self.times[i], time_site);
             cross[i] = self.variogram.covariance(hs, ht);
         }
-        let n_new = n + 1;
-        let diag_eps = spacetime_diagonal_jitter(n_new, self.variogram);
+        let diag_eps = spacetime_diagonal_jitter(self.variogram);
         let new_diag = self.cov_at_zero + diag_eps + obs_var;
+
+        let gamma_v = solve_spd_lower(&self.chol_l, &cross)?;
+        let w_fwd = forward_solve_lower(&self.chol_l, &cross)?;
+        let schur = new_diag - w_fwd.dot(&w_fwd);
 
         self.chol_l = cholesky_extend_spd_lower(&self.chol_l, &cross, new_diag)?;
         self.coords.push(site);
@@ -156,7 +161,21 @@ impl<M: SpatialBasis> SpaceTimeUniversalKrigingEngine<M> {
         let (s1, s2) = self.metric.spatial_components(site.spatial);
         let mut f_row = vec![0.0 as Real; p];
         self.trend.eval(s1, s2, time_site, &mut f_row);
-        let mut new_design = DMatrix::zeros(n_new, p);
+
+        let mut new_beta = DMatrix::zeros(n + 1, p);
+        for l in 0..p {
+            let mut col = DVector::zeros(n);
+            for i in 0..n {
+                col[i] = self.beta[(i, l)];
+            }
+            let col_new = extend_beta_column(&col, &cross, &gamma_v, schur, f_row[l])?;
+            for i in 0..=n {
+                new_beta[(i, l)] = col_new[i];
+            }
+        }
+        self.beta = new_beta;
+
+        let mut new_design = DMatrix::zeros(n + 1, p);
         for i in 0..n {
             for l in 0..p {
                 new_design[(i, l)] = self.design[(i, l)];
@@ -166,9 +185,9 @@ impl<M: SpatialBasis> SpaceTimeUniversalKrigingEngine<M> {
             new_design[(n, l)] = f_row[l];
         }
         self.design = new_design;
-        self.beta = solve_beta_columns(&self.chol_l, &self.design, n_new, p)?;
-        let schur = self.design.transpose() * &self.beta;
-        self.schur_l = factor_spd(&schur)?;
+
+        let schur_mat = self.design.transpose() * &self.beta;
+        self.schur_l = factor_spd(schur_mat)?;
         Ok(self)
     }
 

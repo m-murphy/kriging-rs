@@ -1,14 +1,15 @@
-use nalgebra::{DMatrix, DVector};
+#[cfg(feature = "gpu")]
+use nalgebra::DVector;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 use crate::Real;
-use crate::distance::{GeoCoord, haversine_distance_prepared, prepare_geo_coord};
+use crate::distance::GeoCoord;
 use crate::error::KrigingError;
 use crate::geo_dataset::GeoDataset;
 use crate::kriging::engine::OrdinaryKrigingEngine;
 use crate::spacetime::metric::GeoMetric;
-use crate::variogram::models::{VariogramModel, VariogramType};
+use crate::variogram::models::VariogramModel;
 
 /// Result of a single kriging prediction: the interpolated value and the kriging variance.
 #[derive(Debug, Clone, Copy)]
@@ -29,10 +30,9 @@ pub struct Prediction {
 /// stations" and should not be supplied. When both are set, the intersection is used
 /// (nearest `k` among those within `max_radius`).
 ///
-/// Enabling a neighborhood switches prediction from a single precomputed LU factorization
-/// of the full kriging matrix to a per-target-point system build + solve. This trades
-/// some CPU cost for better conditioning and locality (useful for large datasets or
-/// non-stationary fields).
+/// Enabling a neighborhood builds and solves a smaller local dual-SPD system per target
+/// (same formulation as the full engine, restricted to nearby stations). This trades
+/// some CPU cost for better conditioning and locality on large datasets.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Neighborhood {
     pub max_neighbors: Option<usize>,
@@ -164,8 +164,8 @@ impl OrdinaryKrigingModel {
     }
 
     pub fn predict(&self, coord: GeoCoord) -> Result<Prediction, KrigingError> {
-        if self.neighborhood.is_some() {
-            return self.predict_local(coord);
+        if let Some(neighborhood) = self.neighborhood {
+            return self.engine.predict_neighborhood(coord, neighborhood);
         }
         self.engine
             .predict(&[coord])
@@ -173,19 +173,19 @@ impl OrdinaryKrigingModel {
     }
 
     pub fn predict_batch(&self, coords: &[GeoCoord]) -> Result<Vec<Prediction>, KrigingError> {
-        if self.neighborhood.is_some() {
+        if let Some(neighborhood) = self.neighborhood {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 return coords
                     .par_iter()
-                    .map(|coord| self.predict_local(*coord))
+                    .map(|coord| self.engine.predict_neighborhood(*coord, neighborhood))
                     .collect();
             }
             #[cfg(target_arch = "wasm32")]
             {
                 let mut out = Vec::with_capacity(coords.len());
                 for &coord in coords {
-                    out.push(self.predict_local(coord)?);
+                    out.push(self.engine.predict_neighborhood(coord, neighborhood)?);
                 }
                 return Ok(out);
             }
@@ -264,87 +264,6 @@ impl OrdinaryKrigingModel {
         }
     }
 
-    fn predict_local(&self, coord: GeoCoord) -> Result<Prediction, KrigingError> {
-        let neighborhood = self
-            .neighborhood
-            .expect("predict_local requires neighborhood");
-        let prepared_coord = prepare_geo_coord(coord);
-        let prepared = self.engine.prepared();
-        let n_total = prepared.len();
-
-        // Distance from target to every station.
-        let mut indexed: Vec<(usize, Real)> = (0..n_total)
-            .map(|i| (i, haversine_distance_prepared(prepared[i], prepared_coord)))
-            .collect();
-
-        if let Some(r) = neighborhood.max_radius {
-            indexed.retain(|(_, d)| *d <= r);
-        }
-        if let Some(k) = neighborhood.max_neighbors
-            && indexed.len() > k
-        {
-            indexed.select_nth_unstable_by(k, |a, b| {
-                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            indexed.truncate(k);
-        }
-
-        let k = indexed.len();
-        if k == 0 {
-            return Err(KrigingError::InvalidInput(
-                "no stations in search neighborhood for target point".to_string(),
-            ));
-        }
-
-        // Build the local kriging system on the selected stations.
-        let variogram = self.engine.variogram();
-        let diag_eps = kriging_diagonal_jitter(k, variogram);
-        let obs_diag = self.engine.observation_diagonal();
-        let mut a = DMatrix::from_element(k + 1, k + 1, 0.0);
-        for i in 0..k {
-            let (si, _) = indexed[i];
-            for j in i..k {
-                let (sj, _) = indexed[j];
-                let mut cov =
-                    variogram.covariance(haversine_distance_prepared(prepared[si], prepared[sj]));
-                if i == j {
-                    cov += diag_eps;
-                    if let Some(&d) = obs_diag.get(si) {
-                        cov += d;
-                    }
-                }
-                a[(i, j)] = cov;
-                a[(j, i)] = cov;
-            }
-            a[(i, k)] = 1.0;
-            a[(k, i)] = 1.0;
-        }
-
-        let mut rhs = DVector::from_element(k + 1, 0.0);
-        for i in 0..k {
-            rhs[i] = variogram.covariance(indexed[i].1);
-        }
-        rhs[k] = 1.0;
-
-        let sol = a.lu().solve(&rhs).ok_or_else(|| {
-            KrigingError::MatrixError(
-                "could not solve local (neighborhood) kriging system".to_string(),
-            )
-        })?;
-        let values = self.engine.values();
-        let cov_at_zero = self.engine.cov_at_zero();
-        let mut value: Real = 0.0;
-        let mut cov_dot: Real = 0.0;
-        for i in 0..k {
-            let (si, _) = indexed[i];
-            value += sol[i] * values[si];
-            cov_dot += sol[i] * rhs[i];
-        }
-        let mu = sol[k];
-        let variance = (cov_at_zero - cov_dot - mu).max(0.0);
-        Ok(Prediction { value, variance })
-    }
-
     #[cfg(feature = "gpu")]
     fn predict_batch_with_covariances(
         &self,
@@ -371,32 +290,8 @@ impl OrdinaryKrigingModel {
     }
 }
 
-/// Diagonal regularization ("jitter") added to the covariance block of a kriging matrix
-/// to keep it solvable under `f32` arithmetic.
-///
-/// Gaussian and cubic covariance are very smooth at the origin, so dense clusters of stations
-/// produce matrices whose condition number blows up in `f32`. Stronger jitter is applied for
-/// those models; all other models use a small floor.
-///
-/// The jitter is scaled with `sqrt(n)` (heuristic tracking condition-number growth with
-/// sample size) and floored at 1 % of the nugget so that small-nugget fits stay solvable.
-/// References: Ababou et al. (1994) Math Geol 26:99–133 (Gaussian is among the worst
-/// conditioned), Diamond & Armstrong (1984) Math Geol 16:809–822 (condition number is central
-/// to robustness).
-pub fn kriging_diagonal_jitter(n_stations: usize, variogram: VariogramModel) -> Real {
-    let (nugget, sill, _) = variogram.params();
-    let scale = (n_stations as Real).sqrt().max(1.0);
-    let nugget_floor: Real = (0.01 * nugget).max(1e-10);
-    // Gaussian and Cubic are the notoriously ill-conditioned cases (near-singular when
-    // ranges are large relative to station spacing). Exponential/Matérn/Stable are better
-    // behaved but still fail when two stations are exactly coincident — a small sill-scaled
-    // floor handles that case without materially biasing predictions in well-posed ones.
-    match variogram.variogram_type() {
-        VariogramType::Gaussian => (1e-5 * sill * scale).max(nugget_floor),
-        VariogramType::Cubic => (1e-4 * sill * scale).max(nugget_floor),
-        _ => (1e-8 * sill).max(nugget_floor),
-    }
-}
+/// Diagonal regularization for kriging covariance blocks (implemented in [`crate::kriging::numerics`]).
+pub use crate::kriging::numerics::kriging_diagonal_jitter;
 
 #[cfg(test)]
 mod tests {

@@ -11,7 +11,6 @@ use crate::spacetime::dataset::SpaceTimeDataset;
 use crate::spacetime::kriging::engine::SpaceTimeOrdinaryKrigingEngine;
 use crate::spacetime::metric::SpatialMetric;
 use crate::spacetime::variogram::SpaceTimeVariogram;
-use crate::variogram::models::VariogramType;
 
 /// Fitted ordinary space–time kriging model.
 ///
@@ -112,20 +111,12 @@ impl<M: SpatialMetric> SpaceTimeOrdinaryKrigingModel<M> {
 /// keep it solvable under `f32`. Picks the stronger of the spatial and temporal marginal
 /// jitters (Gaussian and Cubic marginals are the ill-conditioning cases) and scales by the
 /// ST `C(0, 0)` so the absolute magnitude matches the matrix entries.
-pub(crate) fn spacetime_diagonal_jitter(n_stations: usize, variogram: SpaceTimeVariogram) -> Real {
+pub(crate) fn spacetime_diagonal_jitter(variogram: SpaceTimeVariogram) -> Real {
     let c0 = variogram.c_at_zero();
-    let scale = (n_stations as Real).sqrt().max(1.0);
-    let worst_frac = variogram
-        .marginal_variogram_types()
-        .iter()
-        .map(|vt| match vt {
-            VariogramType::Gaussian => 1e-5 as Real,
-            VariogramType::Cubic => 1e-4 as Real,
-            _ => 1e-8 as Real,
-        })
-        .fold(1e-8 as Real, Real::max);
-    let floor = (1e-10 * c0).max(Real::MIN_POSITIVE);
-    (worst_frac * c0 * scale).max(floor)
+    let worst_frac = crate::kriging::numerics::worst_variogram_type_jitter_fraction(
+        &variogram.marginal_variogram_types(),
+    );
+    crate::kriging::numerics::covariance_diagonal_jitter(worst_frac, c0, 1e-10 * c0)
 }
 
 #[cfg(test)]
@@ -133,7 +124,7 @@ mod tests {
     use super::*;
     use crate::distance::GeoCoord;
     use crate::spacetime::metric::GeoMetric;
-    use crate::variogram::models::VariogramModel;
+    use crate::variogram::models::{VariogramModel, VariogramType};
 
     fn spatial_var() -> VariogramModel {
         VariogramModel::new(0.01, 1.0, 300.0, VariogramType::Exponential).unwrap()

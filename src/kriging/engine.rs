@@ -9,9 +9,14 @@ use rayon::prelude::*;
 use nalgebra::{DMatrix, DVector};
 
 use crate::Real;
-use crate::cholesky_update::{cholesky_extend_spd_lower, forward_solve_lower};
+use crate::cholesky_update::{
+    cholesky_delete_index, cholesky_extend_spd_lower, forward_solve_lower,
+};
 use crate::error::KrigingError;
-use crate::kriging::ordinary::{Prediction, kriging_diagonal_jitter};
+use crate::kriging::numerics::{
+    extend_constraint_beta, kriging_diagonal_jitter, predict_dual_spd, select_neighborhood_indices,
+};
+use crate::kriging::ordinary::{Neighborhood, Prediction};
 use crate::spacetime::metric::SpatialMetric;
 use crate::variogram::models::VariogramModel;
 
@@ -74,7 +79,7 @@ impl<M: SpatialMetric> OrdinaryKrigingEngine<M> {
 
         let prepared: Vec<M::Prepared> = coords.iter().map(|&c| metric.prepare(c)).collect();
         let c = build_covariance(&metric, &prepared, variogram, extra_diagonal)?;
-        let chol_l = factor_spd(&c)?;
+        let chol_l = factor_spd(c)?;
         let ones = DVector::from_element(n, 1.0);
         let beta = solve_spd_lower(&chol_l, &ones)?;
         let one_t_beta = beta.sum();
@@ -110,26 +115,13 @@ impl<M: SpatialMetric> OrdinaryKrigingEngine<M> {
     }
 
     /// Training values.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn values(&self) -> &[Real] {
         &self.values
     }
 
-    /// Prepared coordinates for distance lookups.
-    pub(crate) fn prepared(&self) -> &[M::Prepared] {
-        &self.prepared
-    }
-
-    /// Per-station extra diagonal observation variance (empty if homoscedastic).
-    pub(crate) fn observation_diagonal(&self) -> &[Real] {
-        &self.observation_diagonal
-    }
-
     pub(crate) fn metric(&self) -> M {
         self.metric
-    }
-
-    pub(crate) fn cov_at_zero(&self) -> Real {
-        self.cov_at_zero
     }
 
     /// Predict at one or more targets (batch API; single target = one-element slice).
@@ -171,20 +163,147 @@ impl<M: SpatialMetric> OrdinaryKrigingEngine<M> {
                 .variogram
                 .covariance(self.metric.distance(self.prepared[i], prepared_site));
         }
-        let n_new = n + 1;
-        let diag_eps = kriging_diagonal_jitter(n_new, self.variogram);
+        let diag_eps = kriging_diagonal_jitter(self.variogram);
         let new_diag = self.cov_at_zero + diag_eps + obs_var;
 
+        let w_fwd = forward_solve_lower(&self.chol_l, &cross)?;
+        let schur = new_diag - w_fwd.dot(&w_fwd);
+        let gamma_v = solve_spd_lower(&self.chol_l, &cross)?;
         self.chol_l = cholesky_extend_spd_lower(&self.chol_l, &cross, new_diag)?;
+        (self.beta, self.one_t_beta) = extend_constraint_beta(&self.beta, &cross, &gamma_v, schur)?;
         self.coords.push(site);
         self.prepared.push(prepared_site);
         self.values.push(value);
         self.observation_diagonal.push(obs_var);
-
-        let ones = DVector::from_element(n_new, 1.0);
-        self.beta = solve_spd_lower(&self.chol_l, &ones)?;
-        self.one_t_beta = self.beta.sum();
         Ok(self)
+    }
+
+    /// Predict using only a subset of training stations (dual SPD on the local block).
+    pub fn predict_subset(
+        &self,
+        indices: &[usize],
+        target: M::Coord,
+    ) -> Result<Prediction, KrigingError> {
+        let k = indices.len();
+        if k == 0 {
+            return Err(KrigingError::InvalidInput(
+                "predict_subset requires at least one station index".to_string(),
+            ));
+        }
+        let prepared_target = self.metric.prepare(target);
+        let variogram = self.variogram;
+        let obs_diag = &self.observation_diagonal;
+        let diag_eps = kriging_diagonal_jitter(variogram);
+
+        let mut local_c = DMatrix::zeros(k, k);
+        for ii in 0..k {
+            let si = indices[ii];
+            for jj in ii..k {
+                let sj = indices[jj];
+                let mut cov = variogram
+                    .covariance(self.metric.distance(self.prepared[si], self.prepared[sj]));
+                if ii == jj {
+                    cov += diag_eps;
+                    if let Some(&d) = obs_diag.get(si) {
+                        cov += d;
+                    }
+                }
+                local_c[(ii, jj)] = cov;
+                local_c[(jj, ii)] = cov;
+            }
+        }
+        let local_l = factor_spd(local_c)?;
+        let ones = DVector::from_element(k, 1.0);
+        let local_beta = solve_spd_lower(&local_l, &ones)?;
+        let one_t_beta = local_beta.sum();
+
+        let mut c0 = DVector::zeros(k);
+        for (ii, &si) in indices.iter().enumerate() {
+            c0[ii] = variogram.covariance(self.metric.distance(self.prepared[si], prepared_target));
+        }
+        let mut local_values = Vec::with_capacity(k);
+        for &si in indices {
+            local_values.push(self.values[si]);
+        }
+        predict_dual_spd(
+            &local_l,
+            &local_beta,
+            one_t_beta,
+            &c0,
+            &local_values,
+            self.cov_at_zero,
+        )
+    }
+
+    /// Predict at `target` using a search [`Neighborhood`] (local dual SPD per target).
+    pub fn predict_neighborhood(
+        &self,
+        target: M::Coord,
+        neighborhood: Neighborhood,
+    ) -> Result<Prediction, KrigingError> {
+        let prepared_target = self.metric.prepare(target);
+        let indices = select_neighborhood_indices(
+            &self.metric,
+            &self.prepared,
+            prepared_target,
+            neighborhood,
+        );
+        if indices.is_empty() {
+            return Err(KrigingError::InvalidInput(
+                "no stations in search neighborhood for target point".to_string(),
+            ));
+        }
+        self.predict_subset(&indices, target)
+    }
+
+    /// Leave-one-out predictions in input order: O(n³) total via Cholesky downdate per hold-out.
+    ///
+    /// Fast approximate LOO: deletes station `i` from the full `n`-station factorization (same
+    /// diagonal jitter as the full fit). Matches fold-refit closely when jitter is size-independent.
+    pub fn leave_one_out_predictions(&self) -> Result<Vec<Prediction>, KrigingError> {
+        let n = self.len();
+        if n < 2 {
+            return Err(KrigingError::InsufficientData(2));
+        }
+        let predict_hold = |hold: usize| -> Result<Prediction, KrigingError> {
+            let l_red = cholesky_delete_index(&self.chol_l, hold)?;
+            let beta_red = solve_spd_lower(&l_red, &DVector::from_element(n - 1, 1.0))?;
+            let one_t_beta = beta_red.sum();
+            let prepared_target = self.metric.prepare(self.coords[hold]);
+            let mut c0 = DVector::zeros(n - 1);
+            let mut values_red = Vec::with_capacity(n - 1);
+            let mut out_i = 0;
+            for i in 0..n {
+                if i == hold {
+                    continue;
+                }
+                c0[out_i] = self
+                    .variogram
+                    .covariance(self.metric.distance(self.prepared[i], prepared_target));
+                values_red.push(self.values[i]);
+                out_i += 1;
+            }
+            predict_dual_spd(
+                &l_red,
+                &beta_red,
+                one_t_beta,
+                &c0,
+                &values_red,
+                self.cov_at_zero,
+            )
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            (0..n).into_par_iter().map(predict_hold).collect()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut out = Vec::with_capacity(n);
+            for hold in 0..n {
+                out.push(predict_hold(hold)?);
+            }
+            Ok(out)
+        }
     }
 
     /// Predict from a precomputed cross-covariance vector `c0` (e.g. GPU RHS assembly).
@@ -211,19 +330,14 @@ impl<M: SpatialMetric> OrdinaryKrigingEngine<M> {
     }
 
     fn predict_from_cross_cov_inner(&self, c0: &DVector<Real>) -> Result<Prediction, KrigingError> {
-        let n = self.prepared.len();
-        let gamma0 = solve_spd_lower(&self.chol_l, c0)?;
-        let mu = (self.beta.dot(c0) - 1.0) / self.one_t_beta;
-        let w = gamma0 - mu * &self.beta;
-
-        let mut value = 0.0 as Real;
-        let mut cov_dot = 0.0 as Real;
-        for i in 0..n {
-            value += w[i] * self.values[i];
-            cov_dot += w[i] * c0[i];
-        }
-        let variance = (self.cov_at_zero - cov_dot - mu).max(0.0);
-        Ok(Prediction { value, variance })
+        predict_dual_spd(
+            &self.chol_l,
+            &self.beta,
+            self.one_t_beta,
+            c0,
+            &self.values,
+            self.cov_at_zero,
+        )
     }
 }
 
@@ -234,7 +348,7 @@ pub(crate) fn build_covariance<M: SpatialMetric>(
     obs_extra: &[Real],
 ) -> Result<DMatrix<Real>, KrigingError> {
     let n = prepared.len();
-    let diag_eps = kriging_diagonal_jitter(n, variogram);
+    let diag_eps = kriging_diagonal_jitter(variogram);
 
     let fill_row = |i: usize| -> Vec<Real> {
         let mut row = Vec::with_capacity(n - i);
@@ -267,9 +381,8 @@ pub(crate) fn build_covariance<M: SpatialMetric>(
     Ok(c)
 }
 
-pub(crate) fn factor_spd(c: &DMatrix<Real>) -> Result<DMatrix<Real>, KrigingError> {
-    c.clone()
-        .cholesky()
+pub(crate) fn factor_spd(c: DMatrix<Real>) -> Result<DMatrix<Real>, KrigingError> {
+    c.cholesky()
         .ok_or_else(|| {
             KrigingError::MatrixError("could not factorize ordinary kriging covariance".to_string())
         })

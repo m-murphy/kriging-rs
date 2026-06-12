@@ -6,9 +6,13 @@ use rayon::prelude::*;
 use nalgebra::{DMatrix, DVector};
 
 use crate::Real;
-use crate::cholesky_update::cholesky_extend_spd_lower;
+use crate::cholesky_update::{
+    cholesky_delete_index, cholesky_extend_spd_lower, forward_solve_lower,
+};
 use crate::error::KrigingError;
 use crate::kriging::engine::{factor_spd, solve_spd_lower};
+use crate::kriging::numerics::extend_constraint_beta;
+use crate::kriging::numerics::predict_dual_spd;
 use crate::kriging::ordinary::Prediction;
 use crate::spacetime::coord::{SpaceTimeCoord, temporal_distance};
 use crate::spacetime::kriging::ordinary::spacetime_diagonal_jitter;
@@ -19,6 +23,7 @@ use crate::spacetime::variogram::SpaceTimeVariogram;
 #[derive(Debug, Clone)]
 pub struct SpaceTimeOrdinaryKrigingEngine<M: SpatialMetric> {
     metric: M,
+    spatial_coords: Vec<M::Coord>,
     prepared_spatial: Vec<M::Prepared>,
     times: Vec<Real>,
     values: Vec<Real>,
@@ -61,8 +66,9 @@ impl<M: SpatialMetric> SpaceTimeOrdinaryKrigingEngine<M> {
             }
         }
 
+        let spatial_coords: Vec<M::Coord> = coords.iter().map(|c| c.spatial).collect();
         let prepared_spatial: Vec<M::Prepared> =
-            coords.iter().map(|c| metric.prepare(c.spatial)).collect();
+            spatial_coords.iter().map(|&c| metric.prepare(c)).collect();
         let times: Vec<Real> = coords.iter().map(|c| c.time).collect();
         let c = build_covariance(
             &metric,
@@ -71,13 +77,14 @@ impl<M: SpatialMetric> SpaceTimeOrdinaryKrigingEngine<M> {
             variogram,
             extra_diagonal,
         )?;
-        let chol_l = factor_spd(&c)?;
+        let chol_l = factor_spd(c)?;
         let ones = DVector::from_element(n, 1.0);
         let beta = solve_spd_lower(&chol_l, &ones)?;
         let one_t_beta = beta.sum();
 
         Ok(Self {
             metric,
+            spatial_coords,
             prepared_spatial,
             times,
             values,
@@ -100,6 +107,120 @@ impl<M: SpatialMetric> SpaceTimeOrdinaryKrigingEngine<M> {
 
     pub(crate) fn metric(&self) -> M {
         self.metric
+    }
+
+    /// Predict using a subset of training stations (local dual SPD block).
+    #[allow(dead_code)] // fold-refit reference path; LOO uses downdate directly
+    pub fn predict_subset(
+        &self,
+        indices: &[usize],
+        target: SpaceTimeCoord<M::Coord>,
+    ) -> Result<Prediction, KrigingError> {
+        let k = indices.len();
+        if k == 0 {
+            return Err(KrigingError::InvalidInput(
+                "predict_subset requires at least one station index".to_string(),
+            ));
+        }
+        let prepared_target = self.metric.prepare(target.spatial);
+        let time_target = target.time;
+        let variogram = self.variogram;
+        let obs_diag = &self.observation_diagonal;
+        let diag_eps = spacetime_diagonal_jitter(variogram);
+
+        let mut local_c = DMatrix::zeros(k, k);
+        for ii in 0..k {
+            let si = indices[ii];
+            for jj in ii..k {
+                let sj = indices[jj];
+                let hs = self
+                    .metric
+                    .distance(self.prepared_spatial[si], self.prepared_spatial[sj]);
+                let ht = temporal_distance(self.times[si], self.times[sj]);
+                let mut cov = variogram.covariance(hs, ht);
+                if ii == jj {
+                    cov += diag_eps;
+                    if let Some(&d) = obs_diag.get(si) {
+                        cov += d;
+                    }
+                }
+                local_c[(ii, jj)] = cov;
+                local_c[(jj, ii)] = cov;
+            }
+        }
+        let local_l = factor_spd(local_c)?;
+        let ones = DVector::from_element(k, 1.0);
+        let local_beta = solve_spd_lower(&local_l, &ones)?;
+        let one_t_beta = local_beta.sum();
+
+        let mut c0 = DVector::zeros(k);
+        let mut local_values = Vec::with_capacity(k);
+        for (ii, &si) in indices.iter().enumerate() {
+            let hs = self
+                .metric
+                .distance(self.prepared_spatial[si], prepared_target);
+            let ht = temporal_distance(self.times[si], time_target);
+            c0[ii] = variogram.covariance(hs, ht);
+            local_values.push(self.values[si]);
+        }
+        predict_dual_spd(
+            &local_l,
+            &local_beta,
+            one_t_beta,
+            &c0,
+            &local_values,
+            self.cov_at_zero,
+        )
+    }
+
+    /// Leave-one-out predictions via Cholesky downdate (O(n³) total).
+    pub fn leave_one_out_predictions(&self) -> Result<Vec<Prediction>, KrigingError> {
+        let n = self.len();
+        if n < 2 {
+            return Err(KrigingError::InsufficientData(2));
+        }
+        let predict_hold = |hold: usize| -> Result<Prediction, KrigingError> {
+            let l_red = cholesky_delete_index(&self.chol_l, hold)?;
+            let beta_red = solve_spd_lower(&l_red, &DVector::from_element(n - 1, 1.0))?;
+            let one_t_beta = beta_red.sum();
+            let target = SpaceTimeCoord::new(self.spatial_coords[hold], self.times[hold]);
+            let prepared_target = self.metric.prepare(target.spatial);
+            let mut c0 = DVector::zeros(n - 1);
+            let mut values_red = Vec::with_capacity(n - 1);
+            let mut out_i = 0;
+            for i in 0..n {
+                if i == hold {
+                    continue;
+                }
+                let hs = self
+                    .metric
+                    .distance(self.prepared_spatial[i], prepared_target);
+                let ht = temporal_distance(self.times[i], target.time);
+                c0[out_i] = self.variogram.covariance(hs, ht);
+                values_red.push(self.values[i]);
+                out_i += 1;
+            }
+            predict_dual_spd(
+                &l_red,
+                &beta_red,
+                one_t_beta,
+                &c0,
+                &values_red,
+                self.cov_at_zero,
+            )
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            (0..n).into_par_iter().map(predict_hold).collect()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut out = Vec::with_capacity(n);
+            for hold in 0..n {
+                out.push(predict_hold(hold)?);
+            }
+            Ok(out)
+        }
     }
 
     pub fn predict(
@@ -144,19 +265,19 @@ impl<M: SpatialMetric> SpaceTimeOrdinaryKrigingEngine<M> {
             let ht = temporal_distance(self.times[i], time_site);
             cross[i] = self.variogram.covariance(hs, ht);
         }
-        let n_new = n + 1;
-        let diag_eps = spacetime_diagonal_jitter(n_new, self.variogram);
+        let diag_eps = spacetime_diagonal_jitter(self.variogram);
         let new_diag = self.cov_at_zero + diag_eps + obs_var;
 
+        let w_fwd = forward_solve_lower(&self.chol_l, &cross)?;
+        let schur = new_diag - w_fwd.dot(&w_fwd);
+        let gamma_v = solve_spd_lower(&self.chol_l, &cross)?;
         self.chol_l = cholesky_extend_spd_lower(&self.chol_l, &cross, new_diag)?;
+        (self.beta, self.one_t_beta) = extend_constraint_beta(&self.beta, &cross, &gamma_v, schur)?;
+        self.spatial_coords.push(site.spatial);
         self.prepared_spatial.push(prepared_site);
         self.times.push(time_site);
         self.values.push(value);
         self.observation_diagonal.push(obs_var);
-
-        let ones = DVector::from_element(n_new, 1.0);
-        self.beta = solve_spd_lower(&self.chol_l, &ones)?;
-        self.one_t_beta = self.beta.sum();
         Ok(self)
     }
 
@@ -199,7 +320,7 @@ pub(crate) fn build_covariance<M: SpatialMetric>(
     obs_extra: &[Real],
 ) -> Result<DMatrix<Real>, KrigingError> {
     let n = prepared_spatial.len();
-    let diag_eps = spacetime_diagonal_jitter(n, variogram);
+    let diag_eps = spacetime_diagonal_jitter(variogram);
 
     let fill_row = |i: usize| -> Vec<Real> {
         let mut row = Vec::with_capacity(n - i);
