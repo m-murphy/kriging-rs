@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-12
+
+### Added
+
+- **Dual SPD ordinary kriging engine** — [`OrdinaryKrigingEngine<M: SpatialMetric>`](src/kriging/engine.rs)
+  and [`SpaceTimeOrdinaryKrigingEngine<M>`](src/spacetime/kriging/engine.rs): Cholesky on the
+  covariance block `C` plus precomputed `β = C⁻¹·1`, with incremental conditioning via
+  [`cholesky_extend_spd_lower`](src/cholesky_update.rs). See [ADR-0001](docs/adr/0001-dual-spd-ordinary-kriging.md).
+- **Simple kriging engines** for incremental SGS and prediction wrappers:
+  [`SimpleKrigingEngine<M>`](src/kriging/simple_engine.rs) and
+  [`SpaceTimeSimpleKrigingEngine<M>`](src/spacetime/kriging/simple_engine.rs).
+- **Universal kriging engines** (dual SPD with multi-constraint Schur complement):
+  [`UniversalKrigingEngine`](src/kriging/universal_engine.rs) and
+  [`SpaceTimeUniversalKrigingEngine<M>`](src/spacetime/kriging/universal_engine.rs).
+  Constant trend delegates to the ordinary engine.
+- **Calibrated logit ordinary build** — shared [`build_calibrated_logit_ordinary`](src/kriging/binomial.rs)
+  for geographic, projected, and space–time binomial models.
+- **Generic predictor / simulator harnesses** in [`src/predictor/`](src/predictor/):
+  - [`KrigingPredictor`](src/predictor/cv.rs) + [`leave_one_out_cv`](src/predictor/cv.rs) /
+    [`k_fold_cv`](src/predictor/cv.rs)
+  - [`KrigingSimulator`](src/predictor/simulation.rs) +
+    [`sequential_gaussian_simulate`](src/predictor/simulation.rs) /
+    [`sequential_binomial_simulate`](src/predictor/simulation.rs)
+  - Per-geometry backend structs (e.g. [`OrdinaryGeoPredictor`](src/predictor/cv.rs),
+    [`BinomialProjectedSimulator`](src/predictor/simulation.rs))
+- **Domain vocabulary** — [`CONTEXT.md`](CONTEXT.md) and architecture review artifacts.
+
+### Changed (breaking)
+
+- **0.4 → 0.5 numerical drift:** ordinary (and binomial-via-ordinary) predictions may differ at
+  the last few ULPs in `f32` due to the dual-SPD formulation (mathematically equivalent in exact
+  arithmetic). One CV tolerance was relaxed accordingly.
+- **CV and simulation Rust API:** the 20 named `leave_one_out_*` / `k_fold_*` and 16
+  `conditional_simulate_*` entry points are **removed**. Use predictor/simulator backend structs
+  with the generic harnesses instead (re-exported from [`cv`](src/cv.rs) and
+  [`simulation`](src/simulation.rs)).
+- **Incremental SGS:** all continuous and binomial simulator backends extend the kriging
+  conditioner per target (ordinary, simple, universal with any supported drift, projected,
+  space–time). No refit-per-target paths remain in production SGS.
+- **SGS harness:** skips appending a sampled target when kriging variance is below
+  `1e-10` (target already in the conditioning set), avoiding duplicate-site Cholesky failures.
+
+### Removed
+
+- Dead helpers duplicated from [`predictor/simulation`](src/predictor/simulation.rs) in
+  [`simulation.rs`](src/simulation.rs) (`Rng`, `resolve_target_order`, `validate_continuous_inputs`).
+
+### Fixed
+
+- **GPU batch prediction** on [`OrdinaryKrigingModel`](src/kriging/ordinary.rs): uses
+  `engine.coords()` and `engine.variogram()` after the engine refactor.
+- **`OrdinaryKrigingEngine::condition`** now appends to `coords` as well as `prepared`/`values`.
+
+### Migration (Rust)
+
+```rust
+// CV — was leave_one_out_ordinary(&coords, &values, variogram)
+leave_one_out_cv(&OrdinaryGeoPredictor { coords, values, variogram })?;
+
+// SGS — was conditional_simulate_ordinary(...)
+sequential_gaussian_simulate(
+    OrdinaryGeoSimulator::new(cond_coords, cond_values, variogram)?,
+    &targets,
+    SimulationOptions::new(seed),
+)?;
+```
+
+WASM/TypeScript **export names are unchanged** (`wasm_leave_one_out`, `conditionalSimulate`, …);
+internals call the new predictor/simulator backends.
+
 ## [0.4.0] - 2026-04-26
 
 ### Added
@@ -213,7 +283,7 @@ Higher-level ergonomics layered on top of the WASM bindings.
 
 - **npm package (kriging-rs-wasm)**
   - `init()` now returns `Promise<void>` (was `Promise<unknown>`) so callers can use it directly without a wrapper.
-  - Optional `nuggetOverride` on `OrdinaryKrigingFromFittedOptions`, `BinomialKrigingFromFittedVariogramOptions`, and `BinomialKrigingFromFittedVariogramWithPriorOptions` to override the fitted variogram nugget when building the model.
+  - Optional `nuggetOverride` on `OrdinaryKrigingFromFittedOptions` to override the fitted variogram nugget when building the model. Binomial count data uses `fitBinomialVariogram` (calibrated path); use its returned `FittedVariogram` with `BinomialKriging.fromFittedVariogram*` instead of overriding the nugget separately.
   - `model.free()` is idempotent: safe to call multiple times; subsequent calls are no-ops. The TypeScript wrapper clears its reference after the first call so use-after-free throws a clear error. Documented in README and JSDoc.
 
 ## [0.1.0] - 2025-03-15
