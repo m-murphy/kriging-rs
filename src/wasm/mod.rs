@@ -22,8 +22,8 @@ use crate::geo_dataset::GeoDataset;
 #[cfg(feature = "gpu")]
 use crate::gpu::detect_gpu_support;
 use crate::kriging::binomial::{
-    BinomialBuildNotes, BinomialKrigingModel, BinomialObservation, BinomialPrior,
-    BinomialStability, HeteroskedasticBinomialConfig,
+    BinomialBuildNotes, BinomialDiagnostics, BinomialFit, BinomialKrigingModel,
+    BinomialObservation, BinomialPrior, BinomialStability, HeteroskedasticBinomialConfig,
     build_binomial_observations_dropping_zero_trials, estimate_binomial_prior_from_counts,
     fit_binomial_variogram,
 };
@@ -33,9 +33,9 @@ use crate::kriging::universal::{UniversalKrigingModel, UniversalTrend};
 use crate::predictor::cv::leave_one_out_cv;
 use crate::projected::{
     Anisotropy2D, BinomialProjectedKrigingModel, BinomialTangentPlaneKrigingModel,
-    DirectionalConfig, ProjectedBinomialObservation, ProjectedCoord, ProjectedDataset,
-    ProjectedKrigingModel, compute_directional_empirical_variogram,
-    tangent_plane_reference_centroid,
+    DirectionalConfig, ProjectedBinomialFit, ProjectedBinomialObservation, ProjectedCoord,
+    ProjectedDataset, ProjectedKrigingModel, TangentPlaneBinomialFit,
+    compute_directional_empirical_variogram, tangent_plane_reference_centroid,
 };
 use crate::simulation::{BinomialSimulationManyResult, BinomialSimulationResult};
 use crate::variogram::empirical::{EmpiricalEstimator, PositiveReal, VariogramConfig};
@@ -45,6 +45,7 @@ use crate::variogram::nested::NestedVariogram;
 use crate::{Real, compute_empirical_variogram};
 use std::num::NonZeroUsize;
 
+mod binomial_dispatch;
 mod cv_dispatch;
 mod cv_options;
 mod model_cv;
@@ -277,32 +278,6 @@ fn build_observations(
         .map_err(kriging_err_to_js)
 }
 
-fn binomial_cv_slices(observations: &[BinomialObservation]) -> (Vec<GeoCoord>, Vec<u32>, Vec<u32>) {
-    let mut cv_coords = Vec::with_capacity(observations.len());
-    let mut cv_successes = Vec::with_capacity(observations.len());
-    let mut cv_trials = Vec::with_capacity(observations.len());
-    for obs in observations {
-        cv_coords.push(obs.coord());
-        cv_successes.push(obs.successes());
-        cv_trials.push(obs.trials());
-    }
-    (cv_coords, cv_successes, cv_trials)
-}
-
-fn binomial_projected_cv_slices(
-    observations: &[ProjectedBinomialObservation],
-) -> (Vec<ProjectedCoord>, Vec<u32>, Vec<u32>) {
-    let mut cv_coords = Vec::with_capacity(observations.len());
-    let mut cv_successes = Vec::with_capacity(observations.len());
-    let mut cv_trials = Vec::with_capacity(observations.len());
-    for obs in observations {
-        cv_coords.push(obs.coord());
-        cv_successes.push(obs.successes());
-        cv_trials.push(obs.trials());
-    }
-    (cv_coords, cv_successes, cv_trials)
-}
-
 #[derive(Debug, Serialize)]
 pub(super) struct JsPrediction {
     pub value: f64,
@@ -396,148 +371,160 @@ struct JsBinomialDiagnosticsOut {
     logit_loo_msdr: Option<f64>,
 }
 
-fn binomial_diagnostics_geo_js(
+fn binomial_diagnostics_to_js(d: &BinomialDiagnostics) -> Result<JsValue, JsValue> {
+    serde_wasm_bindgen::to_value(&JsBinomialDiagnosticsOut {
+        variogram: variogram_to_js_params(d.variogram),
+        build_notes: d.build_notes.clone(),
+        logit_loo_msdr: d.logit_loo_msdr.map(|v| v as f64),
+    })
+    .map_err(err_to_js)
+}
+
+/// LOO MSDR from caller-supplied count tensors when the fit has no retained training counts
+/// (precomputed-logit builds).
+fn binomial_logit_loo_msdr_geo_js(
     inner: &BinomialKrigingModel,
     build_notes: &BinomialBuildNotes,
     options: JsValue,
-) -> Result<JsValue, JsValue> {
+) -> Result<f64, JsValue> {
+    let inp: BinomialDiagnosticsLooGeo =
+        serde_wasm_bindgen::from_value(options).map_err(err_to_js)?;
+    let n = inner.len();
+    if inp.lats.len() != n
+        || inp.lons.len() != n
+        || inp.successes.len() != n
+        || inp.trials.len() != n
+    {
+        return Err(coded_err(
+            "loo arrays must match model station count",
+            "mismatched_arrays",
+        ));
+    }
+    let coords = to_coords(&inp.lats, &inp.lons)?;
     let vm = inner.variogram();
-    let variogram = variogram_to_js_params(vm);
-    let logit_loo_msdr = if options.is_undefined() || options.is_null() {
-        None
-    } else {
-        let inp: BinomialDiagnosticsLooGeo =
-            serde_wasm_bindgen::from_value(options).map_err(err_to_js)?;
-        let n = inner.len();
-        if inp.lats.len() != n
-            || inp.lons.len() != n
-            || inp.successes.len() != n
-            || inp.trials.len() != n
-        {
-            return Err(coded_err(
-                "loo arrays must match model station count",
-                "mismatched_arrays",
-            ));
-        }
-        let coords = to_coords(&inp.lats, &inp.lons)?;
-        let residuals = leave_one_out_cv(&BinomialGeoPredictor {
-            coords: &coords,
-            successes: &inp.successes,
-            trials: &inp.trials,
-            variogram: vm,
-            prior: build_notes.prior,
-        })
-        .map_err(kriging_err_to_js)?;
-        let summary = BinomialCvSummary::from_residuals(&residuals);
-        Some(summary.logit.msdr as f64)
-    };
-    serde_wasm_bindgen::to_value(&JsBinomialDiagnosticsOut {
-        variogram,
-        build_notes: build_notes.clone(),
-        logit_loo_msdr,
+    let residuals = leave_one_out_cv(&BinomialGeoPredictor {
+        coords: &coords,
+        successes: &inp.successes,
+        trials: &inp.trials,
+        variogram: vm,
+        prior: build_notes.prior,
     })
-    .map_err(err_to_js)
+    .map_err(kriging_err_to_js)?;
+    Ok(BinomialCvSummary::from_residuals(&residuals).logit.msdr as f64)
 }
 
-fn binomial_diagnostics_projected_js(
+fn binomial_logit_loo_msdr_projected_js(
     inner: &BinomialProjectedKrigingModel,
     build_notes: &BinomialBuildNotes,
     options: JsValue,
-) -> Result<JsValue, JsValue> {
+) -> Result<f64, JsValue> {
+    let inp: BinomialDiagnosticsLooProjected =
+        serde_wasm_bindgen::from_value(options).map_err(err_to_js)?;
+    let n = inner.len();
+    if inp.xs.len() != n || inp.ys.len() != n || inp.successes.len() != n || inp.trials.len() != n {
+        return Err(coded_err(
+            "loo arrays must match model station count",
+            "mismatched_arrays",
+        ));
+    }
+    let coords: Vec<ProjectedCoord> = inp
+        .xs
+        .iter()
+        .zip(inp.ys.iter())
+        .map(|(&x, &y)| ProjectedCoord::new(x as Real, y as Real))
+        .collect();
     let vm = inner.variogram();
-    let variogram = variogram_to_js_params(vm);
-    let ani = inner.anisotropy();
-    let logit_loo_msdr = if options.is_undefined() || options.is_null() {
-        None
-    } else {
-        let inp: BinomialDiagnosticsLooProjected =
-            serde_wasm_bindgen::from_value(options).map_err(err_to_js)?;
-        let n = inner.len();
-        if inp.xs.len() != n
-            || inp.ys.len() != n
-            || inp.successes.len() != n
-            || inp.trials.len() != n
-        {
-            return Err(coded_err(
-                "loo arrays must match model station count",
-                "mismatched_arrays",
-            ));
-        }
-        let coords: Vec<ProjectedCoord> = inp
-            .xs
-            .iter()
-            .zip(inp.ys.iter())
-            .map(|(&x, &y)| ProjectedCoord::new(x as Real, y as Real))
-            .collect();
-        let residuals = leave_one_out_cv(&BinomialProjectedPredictor {
-            coords: &coords,
-            successes: &inp.successes,
-            trials: &inp.trials,
-            variogram: vm,
-            anisotropy: ani,
-            prior: build_notes.prior,
-        })
-        .map_err(kriging_err_to_js)?;
-        let summary = BinomialCvSummary::from_residuals(&residuals);
-        Some(summary.logit.msdr as f64)
-    };
-    serde_wasm_bindgen::to_value(&JsBinomialDiagnosticsOut {
-        variogram,
-        build_notes: build_notes.clone(),
-        logit_loo_msdr,
+    let residuals = leave_one_out_cv(&BinomialProjectedPredictor {
+        coords: &coords,
+        successes: &inp.successes,
+        trials: &inp.trials,
+        variogram: vm,
+        anisotropy: inner.anisotropy(),
+        prior: build_notes.prior,
     })
-    .map_err(err_to_js)
+    .map_err(kriging_err_to_js)?;
+    Ok(BinomialCvSummary::from_residuals(&residuals).logit.msdr as f64)
 }
 
-fn binomial_diagnostics_tangent_geo_js(
+fn binomial_logit_loo_msdr_tangent_geo_js(
     inner: &BinomialTangentPlaneKrigingModel,
     build_notes: &BinomialBuildNotes,
     options: JsValue,
-) -> Result<JsValue, JsValue> {
-    let vm = inner.variogram();
-    let variogram = variogram_to_js_params(vm);
-    let ani = inner.anisotropy();
+) -> Result<f64, JsValue> {
+    let inp: BinomialDiagnosticsLooGeo =
+        serde_wasm_bindgen::from_value(options).map_err(err_to_js)?;
+    let n = inner.len();
+    if inp.lats.len() != n
+        || inp.lons.len() != n
+        || inp.successes.len() != n
+        || inp.trials.len() != n
+    {
+        return Err(coded_err(
+            "loo arrays must match model station count",
+            "mismatched_arrays",
+        ));
+    }
     let reference = inner.reference();
-    let logit_loo_msdr = if options.is_undefined() || options.is_null() {
-        None
-    } else {
-        let inp: BinomialDiagnosticsLooGeo =
-            serde_wasm_bindgen::from_value(options).map_err(err_to_js)?;
-        let n = inner.len();
-        if inp.lats.len() != n
-            || inp.lons.len() != n
-            || inp.successes.len() != n
-            || inp.trials.len() != n
-        {
-            return Err(coded_err(
-                "loo arrays must match model station count",
-                "mismatched_arrays",
-            ));
-        }
-        let mut pcs = Vec::with_capacity(n);
-        for i in 0..n {
-            let g = GeoCoord::try_new(inp.lats[i] as Real, inp.lons[i] as Real)
-                .map_err(kriging_err_to_js)?;
-            pcs.push(ProjectedCoord::equirectangular(g, reference));
-        }
-        let residuals = leave_one_out_cv(&BinomialProjectedPredictor {
-            coords: &pcs,
-            successes: &inp.successes,
-            trials: &inp.trials,
-            variogram: vm,
-            anisotropy: ani,
-            prior: build_notes.prior,
-        })
-        .map_err(kriging_err_to_js)?;
-        let summary = BinomialCvSummary::from_residuals(&residuals);
-        Some(summary.logit.msdr as f64)
-    };
-    serde_wasm_bindgen::to_value(&JsBinomialDiagnosticsOut {
-        variogram,
-        build_notes: build_notes.clone(),
-        logit_loo_msdr,
+    let ani = inner.anisotropy();
+    let vm = inner.variogram();
+    let mut pcs = Vec::with_capacity(n);
+    for i in 0..n {
+        let g = GeoCoord::try_new(inp.lats[i] as Real, inp.lons[i] as Real)
+            .map_err(kriging_err_to_js)?;
+        pcs.push(ProjectedCoord::equirectangular(g, reference));
+    }
+    let residuals = leave_one_out_cv(&BinomialProjectedPredictor {
+        coords: &pcs,
+        successes: &inp.successes,
+        trials: &inp.trials,
+        variogram: vm,
+        anisotropy: ani,
+        prior: build_notes.prior,
     })
-    .map_err(err_to_js)
+    .map_err(kriging_err_to_js)?;
+    Ok(BinomialCvSummary::from_residuals(&residuals).logit.msdr as f64)
+}
+
+fn binomial_fit_diagnostics_js(fit: &BinomialFit, options: JsValue) -> Result<JsValue, JsValue> {
+    let d = if fit.training_counts().is_some() || options.is_undefined() || options.is_null() {
+        fit.diagnostics().map_err(kriging_err_to_js)?
+    } else {
+        let mut d = fit.diagnostics().map_err(kriging_err_to_js)?;
+        d.logit_loo_msdr =
+            Some(binomial_logit_loo_msdr_geo_js(&fit.model, &fit.notes, options)? as Real);
+        d
+    };
+    binomial_diagnostics_to_js(&d)
+}
+
+fn projected_binomial_fit_diagnostics_js(
+    fit: &ProjectedBinomialFit,
+    options: JsValue,
+) -> Result<JsValue, JsValue> {
+    let d = if fit.training_counts().is_some() || options.is_undefined() || options.is_null() {
+        fit.diagnostics().map_err(kriging_err_to_js)?
+    } else {
+        let mut d = fit.diagnostics().map_err(kriging_err_to_js)?;
+        d.logit_loo_msdr =
+            Some(binomial_logit_loo_msdr_projected_js(&fit.model, &fit.notes, options)? as Real);
+        d
+    };
+    binomial_diagnostics_to_js(&d)
+}
+
+fn tangent_binomial_fit_diagnostics_js(
+    fit: &TangentPlaneBinomialFit,
+    options: JsValue,
+) -> Result<JsValue, JsValue> {
+    let d = if fit.training_counts().is_some() || options.is_undefined() || options.is_null() {
+        fit.diagnostics().map_err(kriging_err_to_js)?
+    } else {
+        let mut d = fit.diagnostics().map_err(kriging_err_to_js)?;
+        d.logit_loo_msdr =
+            Some(binomial_logit_loo_msdr_tangent_geo_js(&fit.model, &fit.notes, options)? as Real);
+        d
+    };
+    binomial_diagnostics_to_js(&d)
 }
 
 pub(super) fn map_predictions(out: Vec<crate::kriging::ordinary::Prediction>) -> Vec<JsPrediction> {
@@ -958,11 +945,7 @@ impl WasmOrdinaryKriging {
 }
 
 pub(crate) struct WasmBinomialKriging {
-    inner: BinomialKrigingModel,
-    build_notes: BinomialBuildNotes,
-    cv_coords: Vec<GeoCoord>,
-    cv_successes: Vec<u32>,
-    cv_trials: Vec<u32>,
+    fit: BinomialFit,
 }
 
 impl WasmBinomialKriging {
@@ -988,7 +971,6 @@ impl WasmBinomialKriging {
             heteroskedastic_config_from_optional_stability_str(opts.stability.as_deref())?,
             opts.one_step_laplace_observation_variance,
         );
-        let (cv_coords, cv_successes, cv_trials) = binomial_cv_slices(&observations);
         let fit = BinomialKrigingModel::new_with_config(
             observations,
             model,
@@ -997,13 +979,7 @@ impl WasmBinomialKriging {
             &zero_trial_drops,
         )
         .map_err(kriging_err_to_js)?;
-        Ok(Self {
-            inner: fit.model,
-            build_notes: fit.notes,
-            cv_coords,
-            cv_successes,
-            cv_trials,
-        })
+        Ok(Self { fit })
     }
 
     /// Zero-(extra-)copy factory: takes typed arrays directly instead of a JS object. See
@@ -1033,7 +1009,6 @@ impl WasmBinomialKriging {
             heteroskedastic_config_from_optional_stability_str(stability.as_deref())?,
             one_step_laplace_observation_variance,
         );
-        let (cv_coords, cv_successes, cv_trials) = binomial_cv_slices(&observations);
         let fit = BinomialKrigingModel::new_with_config(
             observations,
             model,
@@ -1042,13 +1017,7 @@ impl WasmBinomialKriging {
             &zero_trial_drops,
         )
         .map_err(kriging_err_to_js)?;
-        Ok(Self {
-            inner: fit.model,
-            build_notes: fit.notes,
-            cv_coords,
-            cv_successes,
-            cv_trials,
-        })
+        Ok(Self { fit })
     }
 
     /// Factory for binomial kriging when the caller already has finite logit values (for
@@ -1075,13 +1044,7 @@ impl WasmBinomialKriging {
         let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
         let fit = BinomialKrigingModel::from_precomputed_logits(coords, logits_real, model)
             .map_err(kriging_err_to_js)?;
-        Ok(Self {
-            inner: fit.model,
-            build_notes: fit.notes,
-            cv_coords: Vec::new(),
-            cv_successes: Vec::new(),
-            cv_trials: Vec::new(),
-        })
+        Ok(Self { fit })
     }
 
     /// Pre-computed logits with a per-site **logit observation variance** on the diagonal
@@ -1136,13 +1099,7 @@ impl WasmBinomialKriging {
             prior,
         )
         .map_err(kriging_err_to_js)?;
-        Ok(Self {
-            inner: fit.model,
-            build_notes: fit.notes,
-            cv_coords: Vec::new(),
-            cv_successes: Vec::new(),
-            cv_trials: Vec::new(),
-        })
+        Ok(Self { fit })
     }
 
     pub fn new_with_prior(options: JsValue) -> Result<WasmBinomialKriging, JsValue> {
@@ -1169,7 +1126,6 @@ impl WasmBinomialKriging {
             heteroskedastic_config_from_optional_stability_str(opts.stability.as_deref())?,
             opts.one_step_laplace_observation_variance,
         );
-        let (cv_coords, cv_successes, cv_trials) = binomial_cv_slices(&observations);
         let fit = BinomialKrigingModel::new_with_config(
             observations,
             model,
@@ -1178,33 +1134,26 @@ impl WasmBinomialKriging {
             &zero_trial_drops,
         )
         .map_err(kriging_err_to_js)?;
-        Ok(Self {
-            inner: fit.model,
-            build_notes: fit.notes,
-            cv_coords,
-            cv_successes,
-            cv_trials,
-        })
+        Ok(Self { fit })
     }
 
     /// Build diagnostics: calibration version, prior, logit inflation, and dropped
     /// zero-trial input rows (by original array index). See [`BinomialBuildNotes`].
     pub fn get_build_notes(&self) -> Result<JsValue, JsValue> {
-        serde_wasm_bindgen::to_value(&self.build_notes).map_err(err_to_js)
+        serde_wasm_bindgen::to_value(&self.fit.notes).map_err(err_to_js)
     }
 
     /// Variogram parameters, [`BinomialBuildNotes`], and optional leave-one-out logit MSDR.
     ///
-    /// Pass a JS object `{ lats, lons, successes, trials }` (same lengths as the training
-    /// station count) to compute [`BinomialDiagnostics::logit_loo_msdr`]; omit or pass
-    /// `undefined` to skip LOO.
+    /// Count-based builds compute LOO from retained training counts. Precomputed-logit builds
+    /// may pass `{ lats, lons, successes, trials }` to supply LOO tensors explicitly.
     pub fn get_diagnostics(&self, options: JsValue) -> Result<JsValue, JsValue> {
-        binomial_diagnostics_geo_js(&self.inner, &self.build_notes, options)
+        binomial_fit_diagnostics_js(&self.fit, options)
     }
 
     pub fn predict(&self, lat: f64, lon: f64) -> Result<JsValue, JsValue> {
         let coord = GeoCoord::try_new(lat as Real, lon as Real).map_err(kriging_err_to_js)?;
-        let pred = self.inner.predict(coord).map_err(kriging_err_to_js)?;
+        let pred = self.fit.model.predict(coord).map_err(kriging_err_to_js)?;
         serde_wasm_bindgen::to_value(&JsBinomialPrediction {
             prevalence_median: pred.prevalence_median as f64,
             prevalence_mean: pred.prevalence_mean as f64,
@@ -1218,7 +1167,8 @@ impl WasmBinomialKriging {
     pub fn predict_batch(&self, lats: &[f64], lons: &[f64]) -> Result<JsValue, JsValue> {
         let coords = to_coords(lats, lons)?;
         let out = self
-            .inner
+            .fit
+            .model
             .predict_batch(&coords)
             .map_err(kriging_err_to_js)?;
         serde_wasm_bindgen::to_value(&map_binomial_predictions(out)).map_err(err_to_js)
@@ -1227,7 +1177,8 @@ impl WasmBinomialKriging {
     pub fn predict_batch_arrays(&self, lats: &[f64], lons: &[f64]) -> Result<JsValue, JsValue> {
         let coords = to_coords(lats, lons)?;
         let out = self
-            .inner
+            .fit
+            .model
             .predict_batch(&coords)
             .map_err(kriging_err_to_js)?;
         let (pm, pmean, logits, lv, pv) = split_binomial_predictions(out);
@@ -1249,7 +1200,8 @@ impl WasmBinomialKriging {
     ) -> Result<JsValue, JsValue> {
         let coords = build_grid_coords(x_min, x_max, y_min, y_max, x_cells, y_cells)?;
         let out = self
-            .inner
+            .fit
+            .model
             .predict_batch(&coords)
             .map_err(kriging_err_to_js)?;
         let (pm, pmean, logits, lv, pv) = split_binomial_predictions(out);
@@ -1264,7 +1216,8 @@ impl WasmBinomialKriging {
     pub async fn predict_batch_gpu(&self, lats: &[f64], lons: &[f64]) -> Result<JsValue, JsValue> {
         let coords = to_coords(lats, lons)?;
         let out = self
-            .inner
+            .fit
+            .model
             .predict_batch_gpu(&coords)
             .await
             .map_err(kriging_err_to_js)?;
@@ -1279,7 +1232,8 @@ impl WasmBinomialKriging {
     ) -> Result<JsValue, JsValue> {
         let coords = to_coords(lats, lons)?;
         let out = self
-            .inner
+            .fit
+            .model
             .predict_batch_gpu_or_cpu(&coords)
             .await
             .map_err(kriging_err_to_js)?;
@@ -1287,35 +1241,35 @@ impl WasmBinomialKriging {
     }
 
     pub fn leave_one_out(&self) -> Result<JsValue, JsValue> {
-        if self.cv_coords.is_empty() {
-            return Err(coded_err(
+        let counts = self.fit.training_counts().ok_or_else(|| {
+            coded_err(
                 "leaveOneOut requires count data; build the model from successes/trials, not precomputed logits",
                 "invalid_input",
-            ));
-        }
+            )
+        })?;
         model_cv::binomial_geo_cv(
-            &self.cv_coords,
-            &self.cv_successes,
-            &self.cv_trials,
-            self.inner.variogram(),
-            self.build_notes.prior,
+            self.fit.model.coords(),
+            counts.successes(),
+            counts.trials(),
+            self.fit.model.variogram(),
+            self.fit.notes.prior,
             None,
         )
     }
 
     pub fn k_fold(&self, k: usize) -> Result<JsValue, JsValue> {
-        if self.cv_coords.is_empty() {
-            return Err(coded_err(
+        let counts = self.fit.training_counts().ok_or_else(|| {
+            coded_err(
                 "kFold requires count data; build the model from successes/trials, not precomputed logits",
                 "invalid_input",
-            ));
-        }
+            )
+        })?;
         model_cv::binomial_geo_cv(
-            &self.cv_coords,
-            &self.cv_successes,
-            &self.cv_trials,
-            self.inner.variogram(),
-            self.build_notes.prior,
+            self.fit.model.coords(),
+            counts.successes(),
+            counts.trials(),
+            self.fit.model.variogram(),
+            self.fit.notes.prior,
             Some(k),
         )
     }
@@ -1367,15 +1321,11 @@ fn wasm_build_binomial_tangent_plane_inner(
         anisotropy,
     )
     .map_err(kriging_err_to_js)?;
-    Ok(WasmBinomialTangentPlaneKriging {
-        inner: fit.model,
-        build_notes: fit.notes,
-    })
+    Ok(WasmBinomialTangentPlaneKriging { fit })
 }
 
 pub(crate) struct WasmBinomialTangentPlaneKriging {
-    inner: BinomialTangentPlaneKrigingModel,
-    build_notes: BinomialBuildNotes,
+    fit: TangentPlaneBinomialFit,
 }
 
 impl WasmBinomialTangentPlaneKriging {
@@ -1477,19 +1427,17 @@ impl WasmBinomialTangentPlaneKriging {
     }
 
     pub fn get_build_notes(&self) -> Result<JsValue, JsValue> {
-        serde_wasm_bindgen::to_value(&self.build_notes).map_err(err_to_js)
+        serde_wasm_bindgen::to_value(&self.fit.notes).map_err(err_to_js)
     }
 
-    /// Same JSON shape as [`WasmBinomialKriging::get_diagnostics`]. LOO uses `{ lats, lons,
-    /// successes, trials }` in degrees; coordinates are mapped to the model tangent plane
-    /// with the same reference as the fit before projected LOO.
+    /// Same JSON shape as [`WasmBinomialKriging::get_diagnostics`].
     pub fn get_diagnostics(&self, options: JsValue) -> Result<JsValue, JsValue> {
-        binomial_diagnostics_tangent_geo_js(&self.inner, &self.build_notes, options)
+        tangent_binomial_fit_diagnostics_js(&self.fit, options)
     }
 
     pub fn predict(&self, lat: f64, lon: f64) -> Result<JsValue, JsValue> {
         let coord = GeoCoord::try_new(lat as Real, lon as Real).map_err(kriging_err_to_js)?;
-        let pred = self.inner.predict(coord).map_err(kriging_err_to_js)?;
+        let pred = self.fit.model.predict(coord).map_err(kriging_err_to_js)?;
         serde_wasm_bindgen::to_value(&JsBinomialPrediction {
             prevalence_median: pred.prevalence_median as f64,
             prevalence_mean: pred.prevalence_mean as f64,
@@ -1503,7 +1451,8 @@ impl WasmBinomialTangentPlaneKriging {
     pub fn predict_batch(&self, lats: &[f64], lons: &[f64]) -> Result<JsValue, JsValue> {
         let coords = to_coords(lats, lons)?;
         let out = self
-            .inner
+            .fit
+            .model
             .predict_batch(&coords)
             .map_err(kriging_err_to_js)?;
         serde_wasm_bindgen::to_value(&map_binomial_predictions(out)).map_err(err_to_js)
@@ -1512,7 +1461,8 @@ impl WasmBinomialTangentPlaneKriging {
     pub fn predict_batch_arrays(&self, lats: &[f64], lons: &[f64]) -> Result<JsValue, JsValue> {
         let coords = to_coords(lats, lons)?;
         let out = self
-            .inner
+            .fit
+            .model
             .predict_batch(&coords)
             .map_err(kriging_err_to_js)?;
         let (pm, pmean, logits, lv, pv) = split_binomial_predictions(out);
@@ -1532,7 +1482,8 @@ impl WasmBinomialTangentPlaneKriging {
     ) -> Result<JsValue, JsValue> {
         let coords = build_grid_coords(x_min, x_max, y_min, y_max, x_cells, y_cells)?;
         let out = self
-            .inner
+            .fit
+            .model
             .predict_batch(&coords)
             .map_err(kriging_err_to_js)?;
         let (pm, pmean, logits, lv, pv) = split_binomial_predictions(out);
@@ -1541,6 +1492,42 @@ impl WasmBinomialTangentPlaneKriging {
         set_object_field(&result, "nRows", &JsValue::from_f64(y_cells as f64))?;
         set_object_field(&result, "nCols", &JsValue::from_f64(x_cells as f64))?;
         Ok(result.into())
+    }
+
+    pub fn leave_one_out(&self) -> Result<JsValue, JsValue> {
+        let counts = self.fit.training_counts().ok_or_else(|| {
+            coded_err(
+                "leaveOneOut requires count data; build the model from successes/trials, not precomputed logits",
+                "invalid_input",
+            )
+        })?;
+        model_cv::binomial_projected_cv(
+            self.fit.model.coords(),
+            counts.successes(),
+            counts.trials(),
+            self.fit.model.variogram(),
+            self.fit.model.anisotropy(),
+            self.fit.notes.prior,
+            None,
+        )
+    }
+
+    pub fn k_fold(&self, k: usize) -> Result<JsValue, JsValue> {
+        let counts = self.fit.training_counts().ok_or_else(|| {
+            coded_err(
+                "kFold requires count data; build the model from successes/trials, not precomputed logits",
+                "invalid_input",
+            )
+        })?;
+        model_cv::binomial_projected_cv(
+            self.fit.model.coords(),
+            counts.successes(),
+            counts.trials(),
+            self.fit.model.variogram(),
+            self.fit.model.anisotropy(),
+            self.fit.notes.prior,
+            Some(k),
+        )
     }
 }
 
@@ -2211,11 +2198,7 @@ fn build_projected_binomial_observations(
 }
 
 pub(crate) struct WasmBinomialProjectedKriging {
-    inner: BinomialProjectedKrigingModel,
-    build_notes: BinomialBuildNotes,
-    cv_coords: Vec<ProjectedCoord>,
-    cv_successes: Vec<u32>,
-    cv_trials: Vec<u32>,
+    fit: ProjectedBinomialFit,
 }
 
 impl WasmBinomialProjectedKriging {
@@ -2247,7 +2230,6 @@ impl WasmBinomialProjectedKriging {
                 "too_few_points",
             ));
         }
-        let (cv_coords, cv_successes, cv_trials) = binomial_projected_cv_slices(&observations);
         let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
         let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
             .map_err(kriging_err_to_js)?;
@@ -2264,16 +2246,10 @@ impl WasmBinomialProjectedKriging {
             hcfg,
         )
         .map_err(kriging_err_to_js)?;
-        let mut build_notes = fit.notes;
-        build_notes.zero_trial_dropped_indices = zero_trial_drops;
-        build_notes.zero_trial_dropped_indices.sort_unstable();
-        Ok(Self {
-            inner: fit.model,
-            build_notes,
-            cv_coords,
-            cv_successes,
-            cv_trials,
-        })
+        let mut fit = fit;
+        fit.notes.zero_trial_dropped_indices = zero_trial_drops;
+        fit.notes.zero_trial_dropped_indices.sort_unstable();
+        Ok(Self { fit })
     }
 
     /// As [`fromArrays`](Self::from_arrays), with an explicit Beta prior.
@@ -2302,7 +2278,6 @@ impl WasmBinomialProjectedKriging {
                 "too_few_points",
             ));
         }
-        let (cv_coords, cv_successes, cv_trials) = binomial_projected_cv_slices(&observations);
         let model = parse_variogram(variogram_type, nugget, sill, range, shape)?;
         let anisotropy = Anisotropy2D::new(major_angle_deg as Real, range_ratio as Real)
             .map_err(kriging_err_to_js)?;
@@ -2312,7 +2287,7 @@ impl WasmBinomialProjectedKriging {
             heteroskedastic_config_from_optional_stability_str(stability.as_deref())?,
             one_step_laplace_observation_variance,
         );
-        let fit = BinomialProjectedKrigingModel::new_with_prior(
+        let mut fit = BinomialProjectedKrigingModel::new_with_prior(
             observations,
             model,
             anisotropy,
@@ -2320,16 +2295,9 @@ impl WasmBinomialProjectedKriging {
             hcfg,
         )
         .map_err(kriging_err_to_js)?;
-        let mut build_notes = fit.notes;
-        build_notes.zero_trial_dropped_indices = zero_trial_drops;
-        build_notes.zero_trial_dropped_indices.sort_unstable();
-        Ok(Self {
-            inner: fit.model,
-            build_notes,
-            cv_coords,
-            cv_successes,
-            cv_trials,
-        })
+        fit.notes.zero_trial_dropped_indices = zero_trial_drops;
+        fit.notes.zero_trial_dropped_indices.sort_unstable();
+        Ok(Self { fit })
     }
 
     /// Build a projected binomial model from caller-supplied logit values,
@@ -2368,13 +2336,7 @@ impl WasmBinomialProjectedKriging {
             anisotropy,
         )
         .map_err(kriging_err_to_js)?;
-        Ok(Self {
-            inner: fit.model,
-            build_notes: fit.notes,
-            cv_coords: Vec::new(),
-            cv_successes: Vec::new(),
-            cv_trials: Vec::new(),
-        })
+        Ok(Self { fit })
     }
 
     /// Like [`Self::from_precomputed_logits`], with per-site logit observation variances on the
@@ -2437,66 +2399,59 @@ impl WasmBinomialProjectedKriging {
             prior,
         )
         .map_err(kriging_err_to_js)?;
-        Ok(Self {
-            inner: fit.model,
-            build_notes: fit.notes,
-            cv_coords: Vec::new(),
-            cv_successes: Vec::new(),
-            cv_trials: Vec::new(),
-        })
+        Ok(Self { fit })
     }
 
     /// Build / conditioning diagnostics for the projected binomial model. See
     /// [`BinomialBuildNotes`].
     pub fn get_build_notes(&self) -> Result<JsValue, JsValue> {
-        serde_wasm_bindgen::to_value(&self.build_notes).map_err(err_to_js)
+        serde_wasm_bindgen::to_value(&self.fit.notes).map_err(err_to_js)
     }
 
-    /// Same JSON shape as [`WasmBinomialKriging::get_diagnostics`]. LOO uses `{ xs, ys,
-    /// successes, trials }` in the same planar units as the fit.
+    /// Same JSON shape as [`WasmBinomialKriging::get_diagnostics`].
     pub fn get_diagnostics(&self, options: JsValue) -> Result<JsValue, JsValue> {
-        binomial_diagnostics_projected_js(&self.inner, &self.build_notes, options)
+        projected_binomial_fit_diagnostics_js(&self.fit, options)
     }
 
     pub fn leave_one_out(&self) -> Result<JsValue, JsValue> {
-        if self.cv_coords.is_empty() {
-            return Err(coded_err(
+        let counts = self.fit.training_counts().ok_or_else(|| {
+            coded_err(
                 "leaveOneOut requires count data; build the model from successes/trials, not precomputed logits",
                 "invalid_input",
-            ));
-        }
+            )
+        })?;
         model_cv::binomial_projected_cv(
-            &self.cv_coords,
-            &self.cv_successes,
-            &self.cv_trials,
-            self.inner.variogram(),
-            self.inner.anisotropy(),
-            self.build_notes.prior,
+            self.fit.model.coords(),
+            counts.successes(),
+            counts.trials(),
+            self.fit.model.variogram(),
+            self.fit.model.anisotropy(),
+            self.fit.notes.prior,
             None,
         )
     }
 
     pub fn k_fold(&self, k: usize) -> Result<JsValue, JsValue> {
-        if self.cv_coords.is_empty() {
-            return Err(coded_err(
+        let counts = self.fit.training_counts().ok_or_else(|| {
+            coded_err(
                 "kFold requires count data; build the model from successes/trials, not precomputed logits",
                 "invalid_input",
-            ));
-        }
+            )
+        })?;
         model_cv::binomial_projected_cv(
-            &self.cv_coords,
-            &self.cv_successes,
-            &self.cv_trials,
-            self.inner.variogram(),
-            self.inner.anisotropy(),
-            self.build_notes.prior,
+            self.fit.model.coords(),
+            counts.successes(),
+            counts.trials(),
+            self.fit.model.variogram(),
+            self.fit.model.anisotropy(),
+            self.fit.notes.prior,
             Some(k),
         )
     }
 
     pub fn predict(&self, x: f64, y: f64) -> Result<JsValue, JsValue> {
         let coord = ProjectedCoord::new(x as Real, y as Real);
-        let pred = self.inner.predict(coord).map_err(kriging_err_to_js)?;
+        let pred = self.fit.model.predict(coord).map_err(kriging_err_to_js)?;
         serde_wasm_bindgen::to_value(&JsBinomialPrediction {
             prevalence_median: pred.prevalence_median as f64,
             prevalence_mean: pred.prevalence_mean as f64,
@@ -2520,7 +2475,8 @@ impl WasmBinomialProjectedKriging {
             .map(|(&x, &y)| ProjectedCoord::new(x as Real, y as Real))
             .collect();
         let out = self
-            .inner
+            .fit
+            .model
             .predict_batch(&coords)
             .map_err(kriging_err_to_js)?;
         serde_wasm_bindgen::to_value(&map_binomial_predictions(out)).map_err(err_to_js)
@@ -2539,7 +2495,8 @@ impl WasmBinomialProjectedKriging {
             .map(|(&x, &y)| ProjectedCoord::new(x as Real, y as Real))
             .collect();
         let out = self
-            .inner
+            .fit
+            .model
             .predict_batch(&coords)
             .map_err(kriging_err_to_js)?;
         let (pm, pmean, logits, lv, pv) = split_binomial_predictions(out);
@@ -2561,7 +2518,8 @@ impl WasmBinomialProjectedKriging {
     ) -> Result<JsValue, JsValue> {
         let coords = build_projected_grid_coords(x_min, x_max, y_min, y_max, x_cells, y_cells)?;
         let out = self
-            .inner
+            .fit
+            .model
             .predict_batch(&coords)
             .map_err(kriging_err_to_js)?;
         let (pm, pmean, logits, lv, pv) = split_binomial_predictions(out);

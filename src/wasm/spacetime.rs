@@ -9,22 +9,22 @@
 #![allow(clippy::unnecessary_cast)]
 
 use js_sys::{Float64Array, Object};
-use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
-use crate::BinomialBuildNotes;
 use crate::Real;
 use crate::cv::{
-    BinomialCvSummary, SpacetimeBinomialPredictor, SpacetimeOrdinaryPredictor,
-    SpacetimeSimplePredictor, SpacetimeUniversalPredictor, k_fold_cv, leave_one_out_cv,
+    SpacetimeBinomialPredictor, SpacetimeOrdinaryPredictor, SpacetimeSimplePredictor,
+    SpacetimeUniversalPredictor, k_fold_cv, leave_one_out_cv,
 };
 use crate::distance::GeoCoord;
+use crate::kriging::binomial::BinomialCalibratedResult;
 use crate::projected::{Anisotropy2D, ProjectedCoord};
 use crate::simulation::{
     SpacetimeBinomialSimulator, SpacetimeOrdinarySimulator, SpacetimeSimpleSimulator,
     SpacetimeUniversalSimulator, sequential_binomial_simulate, sequential_binomial_simulate_many,
     sequential_gaussian_simulate, sequential_gaussian_simulate_many,
 };
+use crate::spacetime::SpaceTimeBinomialDiagnostics;
 use crate::spacetime::{
     EmpiricalSpaceTimeVariogram, GeoMetric, ProjectedMetric, SpaceTimeBinomialKrigingModel,
     SpaceTimeBinomialObservation, SpaceTimeCoord, SpaceTimeDataset, SpaceTimeFitConfig,
@@ -254,20 +254,6 @@ fn st_projected_cv_slices(
         dataset.values().to_vec(),
         anisotropy,
     )
-}
-
-fn st_binomial_cv_slices<C: Copy>(
-    observations: &[SpaceTimeBinomialObservation<C>],
-) -> (Vec<SpaceTimeCoord<C>>, Vec<u32>, Vec<u32>) {
-    let mut coords = Vec::with_capacity(observations.len());
-    let mut successes = Vec::with_capacity(observations.len());
-    let mut trials = Vec::with_capacity(observations.len());
-    for obs in observations {
-        coords.push(obs.coord());
-        successes.push(obs.successes());
-        trials.push(obs.trials());
-    }
-    (coords, successes, trials)
 }
 
 // ---------- Geo: Ordinary ----------
@@ -681,22 +667,22 @@ fn st_binomial_geo_collect_observations(
     Ok((observations, zero_trial_drops))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StBinomialDiagnosticsLoo {
-    lats: Vec<f64>,
-    lons: Vec<f64>,
-    times: Vec<f64>,
-    successes: Vec<u32>,
-    trials: Vec<u32>,
-}
+type StGeoBinomialFit = BinomialCalibratedResult<SpaceTimeBinomialKrigingModel<GeoMetric>>;
 
 pub(crate) struct WasmSpaceTimeBinomialKriging {
-    inner: SpaceTimeBinomialKrigingModel<GeoMetric>,
-    build_notes: BinomialBuildNotes,
-    cv_coords: Vec<SpaceTimeCoord<GeoCoord>>,
-    cv_successes: Vec<u32>,
-    cv_trials: Vec<u32>,
+    fit: StGeoBinomialFit,
+}
+
+fn st_binomial_diagnostics_to_js(d: &SpaceTimeBinomialDiagnostics) -> Result<JsValue, JsValue> {
+    let variogram_js = space_time_variogram_diagnostic_js(&d.variogram)?;
+    let notes_js = serde_wasm_bindgen::to_value(&d.build_notes).map_err(err_to_js)?;
+    let out = Object::new();
+    set_object_field(&out, "variogram", &variogram_js)?;
+    set_object_field(&out, "buildNotes", &notes_js)?;
+    if let Some(m) = d.logit_loo_msdr {
+        set_object_field(&out, "logitLooMsdr", &JsValue::from_f64(m as f64))?;
+    }
+    Ok(out.into())
 }
 
 impl WasmSpaceTimeBinomialKriging {
@@ -725,7 +711,6 @@ impl WasmSpaceTimeBinomialKriging {
     ) -> Result<WasmSpaceTimeBinomialKriging, JsValue> {
         let (observations, zero_trial_drops) =
             st_binomial_geo_collect_observations(lats, lons, times, successes, trials)?;
-        let (cv_coords, cv_successes, cv_trials) = st_binomial_cv_slices(&observations);
         let variogram = parse_spacetime_variogram(
             family,
             spatial_type,
@@ -746,18 +731,11 @@ impl WasmSpaceTimeBinomialKriging {
             heteroskedastic_config_from_optional_stability_str(stability.as_deref())?,
             one_step_laplace_observation_variance,
         );
-        let fit = SpaceTimeBinomialKrigingModel::new(GeoMetric, observations, variogram, hcfg)
+        let mut fit = SpaceTimeBinomialKrigingModel::new(GeoMetric, observations, variogram, hcfg)
             .map_err(kriging_err_to_js)?;
-        let mut build_notes = fit.notes;
-        build_notes.zero_trial_dropped_indices = zero_trial_drops;
-        build_notes.zero_trial_dropped_indices.sort_unstable();
-        Ok(Self {
-            inner: fit.model,
-            build_notes,
-            cv_coords,
-            cv_successes,
-            cv_trials,
-        })
+        fit.notes.zero_trial_dropped_indices = zero_trial_drops;
+        fit.notes.zero_trial_dropped_indices.sort_unstable();
+        Ok(Self { fit })
     }
 
     /// Like [`Self::from_arrays`] but with an explicit Beta(`prior_alpha`, `prior_beta`) prior
@@ -789,7 +767,6 @@ impl WasmSpaceTimeBinomialKriging {
     ) -> Result<WasmSpaceTimeBinomialKriging, JsValue> {
         let (observations, zero_trial_drops) =
             st_binomial_geo_collect_observations(lats, lons, times, successes, trials)?;
-        let (cv_coords, cv_successes, cv_trials) = st_binomial_cv_slices(&observations);
         let variogram = parse_spacetime_variogram(
             family,
             spatial_type,
@@ -811,7 +788,7 @@ impl WasmSpaceTimeBinomialKriging {
             heteroskedastic_config_from_optional_stability_str(stability.as_deref())?,
             one_step_laplace_observation_variance,
         );
-        let fit = SpaceTimeBinomialKrigingModel::new_with_prior(
+        let mut fit = SpaceTimeBinomialKrigingModel::new_with_prior(
             GeoMetric,
             observations,
             variogram,
@@ -819,16 +796,9 @@ impl WasmSpaceTimeBinomialKriging {
             hcfg,
         )
         .map_err(kriging_err_to_js)?;
-        let mut build_notes = fit.notes;
-        build_notes.zero_trial_dropped_indices = zero_trial_drops;
-        build_notes.zero_trial_dropped_indices.sort_unstable();
-        Ok(Self {
-            inner: fit.model,
-            build_notes,
-            cv_coords,
-            cv_successes,
-            cv_trials,
-        })
+        fit.notes.zero_trial_dropped_indices = zero_trial_drops;
+        fit.notes.zero_trial_dropped_indices.sort_unstable();
+        Ok(Self { fit })
     }
 
     /// Build from pre-computed finite logits at each `(lat, lon, time)` (no per-trial observation
@@ -896,13 +866,7 @@ impl WasmSpaceTimeBinomialKriging {
             variogram,
         )
         .map_err(kriging_err_to_js)?;
-        Ok(Self {
-            inner: fit.model,
-            build_notes: fit.notes,
-            cv_coords: Vec::new(),
-            cv_successes: Vec::new(),
-            cv_trials: Vec::new(),
-        })
+        Ok(Self { fit })
     }
 
     /// Like [`Self::from_precomputed_logits`], with per-site logit observation variances on the
@@ -993,69 +957,24 @@ impl WasmSpaceTimeBinomialKriging {
             prior,
         )
         .map_err(kriging_err_to_js)?;
-        Ok(Self {
-            inner: fit.model,
-            build_notes: fit.notes,
-            cv_coords: Vec::new(),
-            cv_successes: Vec::new(),
-            cv_trials: Vec::new(),
-        })
+        Ok(Self { fit })
     }
 
     pub fn get_build_notes(&self) -> Result<JsValue, JsValue> {
-        serde_wasm_bindgen::to_value(&self.build_notes).map_err(err_to_js)
+        serde_wasm_bindgen::to_value(&self.fit.notes).map_err(err_to_js)
     }
 
     /// `variogram` is a [`SpaceTimeVariogramParams`]-shaped object; `buildNotes` matches
-    /// geographic binomial; optional `logitLooMsdr` when `{ lats, lons, times, successes, trials }`
-    /// is supplied (same lengths as the model).
-    pub fn get_diagnostics(&self, options: JsValue) -> Result<JsValue, JsValue> {
-        let vg = self.inner.variogram();
-        let variogram_js = space_time_variogram_diagnostic_js(&vg)?;
-        let notes_js = serde_wasm_bindgen::to_value(&self.build_notes).map_err(err_to_js)?;
-        let logit_loo_msdr = if options.is_undefined() || options.is_null() {
-            None
-        } else {
-            let inp: StBinomialDiagnosticsLoo =
-                serde_wasm_bindgen::from_value(options).map_err(err_to_js)?;
-            let n = self.inner.len();
-            if inp.lats.len() != n
-                || inp.lons.len() != n
-                || inp.times.len() != n
-                || inp.successes.len() != n
-                || inp.trials.len() != n
-            {
-                return Err(coded_err(
-                    "loo arrays must match model station count",
-                    "mismatched_arrays",
-                ));
-            }
-            let coords = st_build_geo_coords(&inp.lats, &inp.lons, &inp.times)?;
-            let residuals = leave_one_out_cv(&SpacetimeBinomialPredictor {
-                metric: GeoMetric,
-                coords: &coords,
-                successes: &inp.successes,
-                trials: &inp.trials,
-                variogram: vg,
-                prior: self.build_notes.prior,
-            })
-            .map_err(kriging_err_to_js)?;
-            let summary = BinomialCvSummary::from_residuals(&residuals);
-            Some(summary.logit.msdr as f64)
-        };
-        let out = Object::new();
-        set_object_field(&out, "variogram", &variogram_js)?;
-        set_object_field(&out, "buildNotes", &notes_js)?;
-        if let Some(m) = logit_loo_msdr {
-            set_object_field(&out, "logitLooMsdr", &JsValue::from_f64(m))?;
-        }
-        Ok(out.into())
+    /// geographic binomial; optional `logitLooMsdr` from retained training counts.
+    pub fn get_diagnostics(&self, _options: JsValue) -> Result<JsValue, JsValue> {
+        let d = self.fit.diagnostics(GeoMetric).map_err(kriging_err_to_js)?;
+        st_binomial_diagnostics_to_js(&d)
     }
 
     pub fn predict(&self, lat: f64, lon: f64, time: f64) -> Result<JsValue, JsValue> {
         let coord = GeoCoord::try_new(lat as Real, lon as Real).map_err(kriging_err_to_js)?;
         let target = SpaceTimeCoord::try_new(coord, time as Real).map_err(kriging_err_to_js)?;
-        let pred = self.inner.predict(target).map_err(kriging_err_to_js)?;
+        let pred = self.fit.model.predict(target).map_err(kriging_err_to_js)?;
         serde_wasm_bindgen::to_value(&JsBinomialPrediction {
             prevalence_median: pred.prevalence_median as f64,
             prevalence_mean: pred.prevalence_mean as f64,
@@ -1074,7 +993,8 @@ impl WasmSpaceTimeBinomialKriging {
     ) -> Result<JsValue, JsValue> {
         let targets = build_geo_targets(lats, lons, times)?;
         let out = self
-            .inner
+            .fit
+            .model
             .predict_batch(&targets)
             .map_err(kriging_err_to_js)?;
         serde_wasm_bindgen::to_value(&map_binomial_predictions(out)).map_err(err_to_js)
@@ -1088,7 +1008,8 @@ impl WasmSpaceTimeBinomialKriging {
     ) -> Result<JsValue, JsValue> {
         let targets = build_geo_targets(lats, lons, times)?;
         let out = self
-            .inner
+            .fit
+            .model
             .predict_batch(&targets)
             .map_err(kriging_err_to_js)?;
         let (pm, pmean, logits, lv, pv) = split_binomial_predictions(out);
@@ -1098,35 +1019,37 @@ impl WasmSpaceTimeBinomialKriging {
     }
 
     pub fn leave_one_out(&self) -> Result<JsValue, JsValue> {
-        if self.cv_coords.is_empty() {
-            return Err(coded_err(
+        let counts = self.fit.training_counts().ok_or_else(|| {
+            coded_err(
                 "leaveOneOut requires count data; build the model from successes/trials, not precomputed logits",
                 "invalid_input",
-            ));
-        }
+            )
+        })?;
+        let coords = self.fit.model.coords();
         model_cv::spacetime_binomial_geo_cv(
-            &self.cv_coords,
-            &self.cv_successes,
-            &self.cv_trials,
-            self.inner.variogram(),
-            self.build_notes.prior,
+            &coords,
+            counts.successes(),
+            counts.trials(),
+            self.fit.model.variogram(),
+            self.fit.notes.prior,
             None,
         )
     }
 
     pub fn k_fold(&self, k: usize) -> Result<JsValue, JsValue> {
-        if self.cv_coords.is_empty() {
-            return Err(coded_err(
+        let counts = self.fit.training_counts().ok_or_else(|| {
+            coded_err(
                 "kFold requires count data; build the model from successes/trials, not precomputed logits",
                 "invalid_input",
-            ));
-        }
+            )
+        })?;
+        let coords = self.fit.model.coords();
         model_cv::spacetime_binomial_geo_cv(
-            &self.cv_coords,
-            &self.cv_successes,
-            &self.cv_trials,
-            self.inner.variogram(),
-            self.build_notes.prior,
+            &coords,
+            counts.successes(),
+            counts.trials(),
+            self.fit.model.variogram(),
+            self.fit.notes.prior,
             Some(k),
         )
     }

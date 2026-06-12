@@ -5,6 +5,7 @@
 
 use wasm_bindgen::prelude::*;
 
+use super::binomial_dispatch::BinomialAdapterRef;
 use super::spacetime::{
     WasmSpaceTimeBinomialKriging, WasmSpaceTimeOrdinaryKriging,
     WasmSpaceTimeOrdinaryProjectedKriging, WasmSpaceTimeSimpleKriging,
@@ -32,7 +33,7 @@ pub enum KrigingModelTag {
     SpaceTimeOrdinaryProjected,
 }
 
-enum KrigingModelInner {
+pub(crate) enum KrigingModelInner {
     OrdinaryGeo(WasmOrdinaryKriging),
     SimpleGeo(WasmSimpleKriging),
     UniversalGeo(WasmUniversalKriging),
@@ -116,43 +117,37 @@ impl WasmKrigingModel {
 
     #[wasm_bindgen(js_name = leaveOneOut)]
     pub fn leave_one_out(&self) -> Result<JsValue, JsValue> {
+        if let Some(adapter) = BinomialAdapterRef::from_model_inner(&self.inner) {
+            return adapter.leave_one_out();
+        }
         match &self.inner {
             KrigingModelInner::OrdinaryGeo(m) => m.leave_one_out(),
             KrigingModelInner::SimpleGeo(m) => m.leave_one_out(),
             KrigingModelInner::UniversalGeo(m) => m.leave_one_out(),
-            KrigingModelInner::BinomialGeo(m) => m.leave_one_out(),
             KrigingModelInner::ProjectedOrdinary(m) => m.leave_one_out(),
-            KrigingModelInner::BinomialProjected(m) => m.leave_one_out(),
-            KrigingModelInner::BinomialTangentPlane(_) => Err(coded_err(
-                "leaveOneOut is not available for binomial tangent-plane models",
-                "invalid_input",
-            )),
             KrigingModelInner::SpaceTimeOrdinaryGeo(m) => m.leave_one_out(),
             KrigingModelInner::SpaceTimeSimpleGeo(m) => m.leave_one_out(),
             KrigingModelInner::SpaceTimeUniversalGeo(m) => m.leave_one_out(),
-            KrigingModelInner::SpaceTimeBinomialGeo(m) => m.leave_one_out(),
             KrigingModelInner::SpaceTimeOrdinaryProjected(m) => m.leave_one_out(),
+            _ => unreachable!("binomial variants handled above"),
         }
     }
 
     #[wasm_bindgen(js_name = kFold)]
     pub fn k_fold(&self, k: usize) -> Result<JsValue, JsValue> {
+        if let Some(adapter) = BinomialAdapterRef::from_model_inner(&self.inner) {
+            return adapter.k_fold(k);
+        }
         match &self.inner {
             KrigingModelInner::OrdinaryGeo(m) => m.k_fold(k),
             KrigingModelInner::SimpleGeo(m) => m.k_fold(k),
             KrigingModelInner::UniversalGeo(m) => m.k_fold(k),
-            KrigingModelInner::BinomialGeo(m) => m.k_fold(k),
             KrigingModelInner::ProjectedOrdinary(m) => m.k_fold(k),
-            KrigingModelInner::BinomialProjected(m) => m.k_fold(k),
-            KrigingModelInner::BinomialTangentPlane(_) => Err(coded_err(
-                "kFold is not available for binomial tangent-plane models",
-                "invalid_input",
-            )),
             KrigingModelInner::SpaceTimeOrdinaryGeo(m) => m.k_fold(k),
             KrigingModelInner::SpaceTimeSimpleGeo(m) => m.k_fold(k),
             KrigingModelInner::SpaceTimeUniversalGeo(m) => m.k_fold(k),
-            KrigingModelInner::SpaceTimeBinomialGeo(m) => m.k_fold(k),
             KrigingModelInner::SpaceTimeOrdinaryProjected(m) => m.k_fold(k),
+            _ => unreachable!("binomial variants handled above"),
         }
     }
 
@@ -1179,12 +1174,9 @@ impl WasmKrigingModel {
 
     #[wasm_bindgen(js_name = getBuildNotes)]
     pub fn get_build_notes(&self) -> Result<JsValue, JsValue> {
-        match &self.inner {
-            KrigingModelInner::BinomialGeo(m) => m.get_build_notes(),
-            KrigingModelInner::BinomialProjected(m) => m.get_build_notes(),
-            KrigingModelInner::BinomialTangentPlane(m) => m.get_build_notes(),
-            KrigingModelInner::SpaceTimeBinomialGeo(m) => m.get_build_notes(),
-            _ => Err(coded_err(
+        match BinomialAdapterRef::from_model_inner(&self.inner) {
+            Some(adapter) => adapter.get_build_notes(),
+            None => Err(coded_err(
                 "getBuildNotes is only available for binomial model handles",
                 "invalid_input",
             )),
@@ -1193,12 +1185,9 @@ impl WasmKrigingModel {
 
     #[wasm_bindgen(js_name = getDiagnostics)]
     pub fn get_diagnostics(&self, options: JsValue) -> Result<JsValue, JsValue> {
-        match &self.inner {
-            KrigingModelInner::BinomialGeo(m) => m.get_diagnostics(options),
-            KrigingModelInner::BinomialProjected(m) => m.get_diagnostics(options),
-            KrigingModelInner::BinomialTangentPlane(m) => m.get_diagnostics(options),
-            KrigingModelInner::SpaceTimeBinomialGeo(m) => m.get_diagnostics(options),
-            _ => Err(coded_err(
+        match BinomialAdapterRef::from_model_inner(&self.inner) {
+            Some(adapter) => adapter.get_diagnostics(options),
+            None => Err(coded_err(
                 "getDiagnostics is only available for binomial model handles",
                 "invalid_input",
             )),
