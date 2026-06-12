@@ -105,6 +105,18 @@ impl<M: SpatialMetric> SpaceTimeOrdinaryKrigingEngine<M> {
         self.variogram
     }
 
+    /// Training space–time coordinates in station order.
+    pub fn coords(&self) -> Vec<SpaceTimeCoord<M::Coord>>
+    where
+        M::Coord: Copy,
+    {
+        self.spatial_coords
+            .iter()
+            .zip(&self.times)
+            .map(|(&spatial, &time)| SpaceTimeCoord::new(spatial, time))
+            .collect()
+    }
+
     pub(crate) fn metric(&self) -> M {
         self.metric
     }

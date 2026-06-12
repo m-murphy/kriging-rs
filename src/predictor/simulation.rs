@@ -629,6 +629,7 @@ impl BinomialGeoSimulator {
             prior,
             &[],
             false,
+            None,
             "binomial simulation engine build failed",
             |extra| {
                 OrdinaryKrigingEngine::fit_with_extra_diagonal(
@@ -691,6 +692,7 @@ impl BinomialProjectedSimulator {
             prior,
             &[],
             false,
+            None,
             "binomial projected simulation engine build failed",
             |extra| {
                 OrdinaryKrigingEngine::fit_with_extra_diagonal(
@@ -995,6 +997,7 @@ impl<M: SpatialMetric> SpacetimeBinomialSimulator<M> {
             prior,
             &[],
             false,
+            None,
             "space-time binomial simulation engine build failed",
             |extra| {
                 SpaceTimeOrdinaryKrigingEngine::fit_with_extra_diagonal(

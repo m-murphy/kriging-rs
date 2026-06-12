@@ -91,6 +91,14 @@ impl<M: SpatialMetric> SpaceTimeOrdinaryKrigingModel<M> {
         self.engine.variogram()
     }
 
+    /// Training space–time coordinates in station order.
+    pub fn coords(&self) -> Vec<SpaceTimeCoord<M::Coord>>
+    where
+        M::Coord: Copy,
+    {
+        self.engine.coords()
+    }
+
     /// Single-target prediction.
     pub fn predict(&self, target: SpaceTimeCoord<M::Coord>) -> Result<Prediction, KrigingError> {
         self.engine

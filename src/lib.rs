@@ -130,9 +130,9 @@ pub use geo_dataset::GeoDataset;
 pub use gpu::{GpuBackend, GpuSupport, build_rhs_covariances_gpu, detect_gpu_support, gpu_square};
 pub use kriging::binomial::{
     BINOMIAL_CALIBRATION_VERSION, BINOMIAL_CALIBRATION_VERSION_ONE_STEP_LAPLACE_OBS_VAR,
-    BinomialBuildNotes, BinomialCalibratedResult, BinomialDiagnostics, BinomialFit,
+    BinomialBuildNotes, BinomialCalibratedResult, BinomialCounts, BinomialDiagnostics, BinomialFit,
     BinomialKrigingModel, BinomialObservation, BinomialPrediction, BinomialPrior,
-    BinomialStability, HeteroskedasticBinomialConfig,
+    BinomialStability, HeteroskedasticBinomialConfig, binomial_logit_loo_msdr,
     build_binomial_observations_dropping_zero_trials, estimate_binomial_prior_from_counts,
     fit_binomial_variogram, indices_of_zero_trials, logit_observation_variance_empirical_bayes,
     logit_observation_variance_laplace_binomial,

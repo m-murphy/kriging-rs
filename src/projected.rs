@@ -17,10 +17,12 @@ use crate::Real;
 use crate::distance::GeoCoord;
 use crate::error::KrigingError;
 use crate::kriging::binomial::{
-    BINOMIAL_CALIBRATION_VERSION, BinomialBuildNotes, BinomialCalibratedResult,
-    BinomialObservation, BinomialPrediction, BinomialPrior, HeteroskedasticBinomialConfig,
-    binomial_prediction_from_ordinary, build_calibrated_logit_ordinary, finish_binomial_notes,
+    BINOMIAL_CALIBRATION_VERSION, BinomialBuildNotes, BinomialCalibratedResult, BinomialCounts,
+    BinomialDiagnostics, BinomialObservation, BinomialPrediction, BinomialPrior,
+    HeteroskedasticBinomialConfig, binomial_logit_loo_msdr, binomial_prediction_from_ordinary,
+    build_calibrated_logit_ordinary, finish_binomial_notes,
 };
+use crate::predictor::cv::BinomialProjectedPredictor;
 
 use crate::kriging::engine::OrdinaryKrigingEngine;
 use crate::kriging::ordinary::Prediction;
@@ -480,6 +482,13 @@ impl BinomialProjectedKrigingModel {
         if observations.len() < 2 {
             return Err(KrigingError::InsufficientData(2));
         }
+        let training_counts = Some(BinomialCounts::from_slices(
+            &observations
+                .iter()
+                .map(|o| o.successes())
+                .collect::<Vec<_>>(),
+            &observations.iter().map(|o| o.trials()).collect::<Vec<_>>(),
+        )?);
         let coords: Vec<ProjectedCoord> = observations.iter().map(|o| o.coord()).collect();
         let logits: Vec<Real> = observations
             .iter()
@@ -499,6 +508,7 @@ impl BinomialProjectedKrigingModel {
             prior,
             &[],
             false,
+            training_counts,
             "binomial projected kriging build failed",
             |extra| {
                 let dataset = ProjectedDataset::new(coords.clone(), logits.clone())?;
@@ -539,6 +549,7 @@ impl BinomialProjectedKrigingModel {
                 effective_dof: None,
                 last_msdr: None,
             }),
+            training_counts: None,
         })
     }
 
@@ -573,6 +584,7 @@ impl BinomialProjectedKrigingModel {
             prior_for_notes,
             &[],
             false,
+            None,
             "from_precomputed (projected) with observation variances: build failed",
             |extra| {
                 let dataset = ProjectedDataset::new(coords.clone(), logits.clone())?;
@@ -582,6 +594,10 @@ impl BinomialProjectedKrigingModel {
                 .map(|inner| Self { inner })
             },
         )
+    }
+
+    pub fn coords(&self) -> &[ProjectedCoord] {
+        self.inner.coords()
     }
 
     pub fn anisotropy(&self) -> Anisotropy2D {
@@ -614,6 +630,39 @@ impl BinomialProjectedKrigingModel {
             .into_iter()
             .map(binomial_prediction_from_ordinary)
             .collect())
+    }
+}
+
+impl BinomialCalibratedResult<BinomialProjectedKrigingModel> {
+    /// Variogram, build notes, and optional LOO logit MSDR from retained training counts.
+    pub fn diagnostics(&self) -> Result<BinomialDiagnostics, KrigingError> {
+        let variogram = self.model.variogram();
+        let build_notes = self.notes.clone();
+        let logit_loo_msdr = if let Some(counts) = self.training_counts() {
+            let coords = self.model.coords();
+            if coords.len() != counts.len() {
+                return Err(KrigingError::DimensionMismatch(format!(
+                    "training coords length {} does not match counts length {}",
+                    coords.len(),
+                    counts.len()
+                )));
+            }
+            Some(binomial_logit_loo_msdr(&BinomialProjectedPredictor {
+                coords,
+                successes: counts.successes(),
+                trials: counts.trials(),
+                variogram,
+                anisotropy: self.model.anisotropy(),
+                prior: build_notes.prior,
+            })?)
+        } else {
+            None
+        };
+        Ok(BinomialDiagnostics {
+            variogram,
+            build_notes,
+            logit_loo_msdr,
+        })
     }
 }
 
@@ -653,6 +702,10 @@ pub struct BinomialTangentPlaneKrigingModel {
 pub type TangentPlaneBinomialFit = BinomialCalibratedResult<BinomialTangentPlaneKrigingModel>;
 
 impl BinomialTangentPlaneKrigingModel {
+    pub fn coords(&self) -> &[ProjectedCoord] {
+        self.inner.coords()
+    }
+
     /// Calibrated build with default `Beta(1, 1)` prior and default heteroskedastic config.
     pub fn new(
         observations: Vec<BinomialObservation>,
@@ -708,12 +761,15 @@ impl BinomialTangentPlaneKrigingModel {
                 .warnings
                 .push("tangent_plane_equirectangular_small_area".to_string());
         }
+        let training_counts = fit.training_counts().cloned();
+        let notes = fit.notes;
         Ok(BinomialCalibratedResult {
             model: Self {
                 reference,
                 inner: fit.model,
             },
-            notes: fit.notes,
+            notes,
+            training_counts,
         })
     }
 
@@ -754,6 +810,39 @@ impl BinomialTangentPlaneKrigingModel {
             .map(|g| ProjectedCoord::equirectangular(g, self.reference))
             .collect();
         self.inner.predict_batch(&planar)
+    }
+}
+
+impl BinomialCalibratedResult<BinomialTangentPlaneKrigingModel> {
+    /// Variogram, build notes, and optional LOO logit MSDR from retained training counts.
+    pub fn diagnostics(&self) -> Result<BinomialDiagnostics, KrigingError> {
+        let variogram = self.model.variogram();
+        let build_notes = self.notes.clone();
+        let logit_loo_msdr = if let Some(counts) = self.training_counts() {
+            let coords = self.model.coords();
+            if coords.len() != counts.len() {
+                return Err(KrigingError::DimensionMismatch(format!(
+                    "training coords length {} does not match counts length {}",
+                    coords.len(),
+                    counts.len()
+                )));
+            }
+            Some(binomial_logit_loo_msdr(&BinomialProjectedPredictor {
+                coords,
+                successes: counts.successes(),
+                trials: counts.trials(),
+                variogram,
+                anisotropy: self.model.anisotropy(),
+                prior: build_notes.prior,
+            })?)
+        } else {
+            None
+        };
+        Ok(BinomialDiagnostics {
+            variogram,
+            build_notes,
+            logit_loo_msdr,
+        })
     }
 }
 

@@ -29,6 +29,57 @@ use std::ops::Deref;
 /// Contract version for binomial kriging calibration (`BinomialBuildNotes::calibration_version`).
 pub const BINOMIAL_CALIBRATION_VERSION: u32 = 2;
 
+/// Geometry-free binomial count pair `(successes, trials)` retained on count-based fits for
+/// instance cross-validation and [`BinomialFit::diagnostics`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinomialCounts {
+    successes: Vec<u32>,
+    trials: Vec<u32>,
+}
+
+impl BinomialCounts {
+    /// Parallel `(successes, trials)` slices with equal length (one row per training station).
+    pub fn from_slices(successes: &[u32], trials: &[u32]) -> Result<Self, KrigingError> {
+        if successes.len() != trials.len() {
+            return Err(KrigingError::DimensionMismatch(
+                "successes and trials must have equal length".to_string(),
+            ));
+        }
+        Ok(Self {
+            successes: successes.to_vec(),
+            trials: trials.to_vec(),
+        })
+    }
+
+    /// Count tensors extracted from geographic [`BinomialObservation`]s.
+    pub fn from_geo_observations(observations: &[BinomialObservation]) -> Self {
+        Self {
+            successes: observations.iter().map(|o| o.successes()).collect(),
+            trials: observations.iter().map(|o| o.trials()).collect(),
+        }
+    }
+
+    #[inline]
+    pub fn successes(&self) -> &[u32] {
+        &self.successes
+    }
+
+    #[inline]
+    pub fn trials(&self) -> &[u32] {
+        &self.trials
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.successes.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.successes.is_empty()
+    }
+}
+
 /// [`BinomialBuildNotes::calibration_version`] when [`HeteroskedasticBinomialConfig::one_step_laplace_observation_variance`]
 /// is enabled: per-site observation variance uses Fisher information at a **one-step Newton**
 /// update of the logit from the EB-smoothed value (binomial score step).
@@ -409,12 +460,19 @@ pub struct BinomialCalibratedResult<T> {
     pub model: T,
     /// Build diagnostics: include in logs, WASM responses, and UIs.
     pub notes: BinomialBuildNotes,
+    /// Count tensors when built from `(successes, trials)`; absent for precomputed-logit builds.
+    pub(crate) training_counts: Option<BinomialCounts>,
 }
 
 impl<T> BinomialCalibratedResult<T> {
     /// Keep only the model (e.g. for internal prediction or legacy call sites).
     pub fn into_model(self) -> T {
         self.model
+    }
+
+    /// Count tensors retained at build time for LOO diagnostics and instance CV.
+    pub fn training_counts(&self) -> Option<&BinomialCounts> {
+        self.training_counts.as_ref()
     }
 }
 
@@ -441,40 +499,40 @@ pub struct BinomialDiagnostics {
     pub logit_loo_msdr: Option<Real>,
 }
 
+/// Logit-scale MSDR from leave-one-out cross-validation on a binomial [`KrigingPredictor`].
+pub fn binomial_logit_loo_msdr<P>(predictor: &P) -> Result<Real, KrigingError>
+where
+    P: crate::predictor::cv::KrigingPredictor<Residual = crate::cv::BinomialCvResidual>,
+{
+    let residuals = leave_one_out_cv(predictor)?;
+    Ok(BinomialCvSummary::from_residuals(&residuals).logit.msdr)
+}
+
 impl BinomialCalibratedResult<BinomialKrigingModel> {
     /// Bundle the fitted variogram, [`BinomialBuildNotes`], and optional LOO logit MSDR.
     ///
-    /// When `loo_counts` is `Some((coords, successes, trials))`, every slice must have the
-    /// same length as [`BinomialKrigingModel::len`], and LOO uses the notes’ prior and the
-    /// model’s variogram (see [`BinomialDiagnostics::logit_loo_msdr`]).
-    pub fn diagnostics(
-        &self,
-        loo_counts: Option<(&[GeoCoord], &[u32], &[u32])>,
-    ) -> Result<BinomialDiagnostics, KrigingError> {
+    /// When [`BinomialCalibratedResult::training_counts`] is present (count-based build),
+    /// LOO MSDR is computed from the model’s training coordinates and retained counts using
+    /// the notes’ prior and variogram (see [`BinomialDiagnostics::logit_loo_msdr`]).
+    pub fn diagnostics(&self) -> Result<BinomialDiagnostics, KrigingError> {
         let variogram = self.model.variogram();
         let build_notes = self.notes.clone();
-        let logit_loo_msdr = if let Some((coords, succ, trials)) = loo_counts {
-            let n = self.model.len();
-            if coords.len() != n {
+        let logit_loo_msdr = if let Some(counts) = self.training_counts.as_ref() {
+            let coords = self.model.coords();
+            if coords.len() != counts.len() {
                 return Err(KrigingError::DimensionMismatch(format!(
-                    "loo coords length {} does not match model station count {n}",
-                    coords.len()
+                    "training coords length {} does not match counts length {}",
+                    coords.len(),
+                    counts.len()
                 )));
             }
-            if coords.len() != succ.len() || succ.len() != trials.len() {
-                return Err(KrigingError::DimensionMismatch(
-                    "loo successes and trials must match coords length".to_string(),
-                ));
-            }
-            let residuals = leave_one_out_cv(&BinomialGeoPredictor {
+            Some(binomial_logit_loo_msdr(&BinomialGeoPredictor {
                 coords,
-                successes: succ,
-                trials,
+                successes: counts.successes(),
+                trials: counts.trials(),
                 variogram,
                 prior: build_notes.prior,
-            })?;
-            let summary = BinomialCvSummary::from_residuals(&residuals);
-            Some(summary.logit.msdr)
+            })?)
         } else {
             None
         };
@@ -515,12 +573,14 @@ pub(crate) fn finish_binomial_notes(mut notes: BinomialBuildNotes) -> BinomialBu
 ///
 /// Callers supply a closure that builds the inner ordinary model (geographic, projected, or
 /// space–time) from the inflated per-site extra diagonal.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_calibrated_logit_ordinary<O, F>(
     base_logit_observation_variance: Vec<Real>,
     config: &HeteroskedasticBinomialConfig,
     prior_for_notes: BinomialPrior,
     extra_zero_trial_drops: &[usize],
     from_precomputed_logits_only: bool,
+    training_counts: Option<BinomialCounts>,
     build_failure_message: &str,
     build_with_inflated_extra: F,
 ) -> Result<BinomialCalibratedResult<O>, KrigingError>
@@ -560,6 +620,7 @@ where
                         effective_dof: None,
                         last_msdr: None,
                     }),
+                    training_counts,
                 });
             }
             Err(e) => {
@@ -739,6 +800,7 @@ impl BinomialKrigingModel {
         if observations.len() < 2 {
             return Err(KrigingError::InsufficientData(2));
         }
+        let training_counts = Some(BinomialCounts::from_geo_observations(&observations));
         let coords: Vec<GeoCoord> = observations.iter().map(|o| o.coord()).collect();
         let logits: Vec<Real> = observations
             .iter()
@@ -759,6 +821,7 @@ impl BinomialKrigingModel {
             prior,
             extra_zero_trial_drops,
             false,
+            training_counts,
             "binomial kriging build failed",
             |extra| {
                 let dataset = GeoDataset::new(coords.clone(), logits.clone())?;
@@ -766,6 +829,11 @@ impl BinomialKrigingModel {
                     .map(|ordinary_model| Self { ordinary_model })
             },
         )
+    }
+
+    /// Training coordinates (same order as [`Self::len`] stations).
+    pub fn coords(&self) -> &[GeoCoord] {
+        self.ordinary_model.coords()
     }
 
     /// Build a binomial kriging model from pre-computed logit values.
@@ -837,6 +905,7 @@ impl BinomialKrigingModel {
             prior_for_notes,
             &[],
             false,
+            None,
             "from_precomputed with observation variances: build failed",
             |extra| {
                 let dataset = GeoDataset::new(coords.clone(), logits.clone())?;
@@ -971,18 +1040,19 @@ mod tests {
             })
             .collect();
         let fit = BinomialKrigingModel::new_with_prior(obs.clone(), v, p).expect("fit");
-        let d = fit.diagnostics(None).expect("d");
+        let logits_fit = BinomialKrigingModel::from_precomputed_logits(
+            obs.iter().map(|o| o.coord()).collect(),
+            obs.iter().map(|o| o.smoothed_logit_with_prior(p)).collect(),
+            v,
+        )
+        .expect("logits fit");
+        let d0 = logits_fit.diagnostics().expect("d0");
+        assert!(d0.logit_loo_msdr.is_none());
+        let d = fit.diagnostics().expect("d");
         assert_eq!(d.variogram, v);
         assert_eq!(d.build_notes.prior, p);
-        assert!(d.logit_loo_msdr.is_none());
-        let coords: Vec<GeoCoord> = obs.iter().map(|o| o.coord()).collect();
-        let succ: Vec<u32> = obs.iter().map(|o| o.successes()).collect();
-        let trials: Vec<u32> = obs.iter().map(|o| o.trials()).collect();
-        let d2 = fit
-            .diagnostics(Some((&coords, &succ, &trials)))
-            .expect("d2");
-        assert!(d2.logit_loo_msdr.is_some());
-        assert!(d2.logit_loo_msdr.unwrap().is_finite());
+        assert!(d.logit_loo_msdr.is_some());
+        assert!(d.logit_loo_msdr.unwrap().is_finite());
     }
 
     #[test]

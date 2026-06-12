@@ -7,10 +7,11 @@
 use crate::Real;
 use crate::error::KrigingError;
 use crate::kriging::binomial::{
-    BINOMIAL_CALIBRATION_VERSION, BinomialBuildNotes, BinomialCalibratedResult, BinomialPrediction,
-    BinomialPrior, HeteroskedasticBinomialConfig, binomial_prediction_from_ordinary,
-    build_calibrated_logit_ordinary, finish_binomial_notes,
+    BINOMIAL_CALIBRATION_VERSION, BinomialBuildNotes, BinomialCalibratedResult, BinomialCounts,
+    BinomialPrediction, BinomialPrior, HeteroskedasticBinomialConfig, binomial_logit_loo_msdr,
+    binomial_prediction_from_ordinary, build_calibrated_logit_ordinary, finish_binomial_notes,
 };
+use crate::predictor::cv::SpacetimeBinomialPredictor;
 use crate::spacetime::SpaceTimeCoord;
 use crate::spacetime::dataset::SpaceTimeDataset;
 use crate::spacetime::kriging::ordinary::SpaceTimeOrdinaryKrigingModel;
@@ -74,6 +75,14 @@ impl<C: Copy> SpaceTimeBinomialObservation<C> {
     }
 }
 
+/// Auditable snapshot of a space–time binomial fit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpaceTimeBinomialDiagnostics {
+    pub variogram: SpaceTimeVariogram,
+    pub build_notes: BinomialBuildNotes,
+    pub logit_loo_msdr: Option<Real>,
+}
+
 /// Fitted binomial space–time kriging model.
 #[derive(Debug)]
 pub struct SpaceTimeBinomialKrigingModel<M: SpatialMetric> {
@@ -120,6 +129,13 @@ impl<M: SpatialMetric> SpaceTimeBinomialKrigingModel<M> {
         if observations.len() < 2 {
             return Err(KrigingError::InsufficientData(2));
         }
+        let training_counts = Some(BinomialCounts::from_slices(
+            &observations
+                .iter()
+                .map(|o| o.successes())
+                .collect::<Vec<_>>(),
+            &observations.iter().map(|o| o.trials()).collect::<Vec<_>>(),
+        )?);
         let config = hetero_config;
         let coords: Vec<SpaceTimeCoord<M::Coord>> =
             observations.iter().map(|o| o.coord()).collect();
@@ -141,6 +157,7 @@ impl<M: SpatialMetric> SpaceTimeBinomialKrigingModel<M> {
             prior,
             &[],
             false,
+            training_counts,
             "space-time binomial kriging build failed",
             |extra| {
                 let dataset = SpaceTimeDataset::new(coords.clone(), logits.clone())?;
@@ -180,6 +197,7 @@ impl<M: SpatialMetric> SpaceTimeBinomialKrigingModel<M> {
                 effective_dof: None,
                 last_msdr: None,
             }),
+            training_counts: None,
         })
     }
 
@@ -214,6 +232,7 @@ impl<M: SpatialMetric> SpaceTimeBinomialKrigingModel<M> {
             prior_for_notes,
             &[],
             false,
+            None,
             "space-time from_precomputed: build failed",
             |extra| {
                 let dataset = SpaceTimeDataset::new(coords.clone(), logits.clone())?;
@@ -223,6 +242,13 @@ impl<M: SpatialMetric> SpaceTimeBinomialKrigingModel<M> {
                 .map(|inner| Self { inner })
             },
         )
+    }
+
+    pub fn coords(&self) -> Vec<SpaceTimeCoord<M::Coord>>
+    where
+        M::Coord: Copy,
+    {
+        self.inner.coords()
     }
 
     pub fn variogram(&self) -> SpaceTimeVariogram {
@@ -254,6 +280,42 @@ impl<M: SpatialMetric> SpaceTimeBinomialKrigingModel<M> {
             .into_iter()
             .map(binomial_prediction_from_ordinary)
             .collect())
+    }
+}
+
+impl<M: SpatialMetric> BinomialCalibratedResult<SpaceTimeBinomialKrigingModel<M>>
+where
+    M::Coord: Copy,
+{
+    /// Space–time variogram, build notes, and optional LOO logit MSDR from retained counts.
+    pub fn diagnostics(&self, metric: M) -> Result<SpaceTimeBinomialDiagnostics, KrigingError> {
+        let variogram = self.model.variogram();
+        let build_notes = self.notes.clone();
+        let logit_loo_msdr = if let Some(counts) = self.training_counts() {
+            let coords = self.model.coords();
+            if coords.len() != counts.len() {
+                return Err(KrigingError::DimensionMismatch(format!(
+                    "training coords length {} does not match counts length {}",
+                    coords.len(),
+                    counts.len()
+                )));
+            }
+            Some(binomial_logit_loo_msdr(&SpacetimeBinomialPredictor {
+                metric,
+                coords: &coords,
+                successes: counts.successes(),
+                trials: counts.trials(),
+                variogram,
+                prior: build_notes.prior,
+            })?)
+        } else {
+            None
+        };
+        Ok(SpaceTimeBinomialDiagnostics {
+            variogram,
+            build_notes,
+            logit_loo_msdr,
+        })
     }
 }
 
