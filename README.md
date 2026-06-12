@@ -52,7 +52,7 @@ println!("{:?}", prediction.value);
   working values → **ordinary kriging with per-site logit observation variance** (calibrated
   binomial) on the covariance diagonal, then `logistic` to prevalence; *not* a full
   binomial-likelihood field model. Build diagnostics are always returned on the Rust side
-  ([`BinomialBuildNotes`]) and exposed in WASM as `getBuildNotes()`. See
+  ([`BinomialBuildNotes`]) and exposed in WASM as the `buildNotes` getter. See
   [benches/BROWSER_BENCHMARKS.md](benches/BROWSER_BENCHMARKS.md) for a large
   browser-representative prediction workload
 
