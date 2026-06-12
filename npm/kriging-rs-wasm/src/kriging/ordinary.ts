@@ -17,7 +17,8 @@ import {
   mapOrdinaryPredictionArray,
 } from "../internal/mappers.js";
 import { requireLoadedModule } from "../internal/module.js";
-import type { WasmOrdinaryInstance } from "../internal/wasm-shapes.js";
+import { modelKFold, modelLeaveOneOut } from "../internal/model-cv.js";
+import type { WasmKrigingModelHandle } from "../internal/wasm-shapes.js";
 import type {
   NeighborhoodOptions,
   NumericArrayInput,
@@ -27,6 +28,7 @@ import type {
   OrdinaryKrigingOptions,
   OrdinaryPrediction,
   PredictGridOptions,
+  CvResult,
 } from "../types.js";
 
 const ORDINARY_FREED = "OrdinaryKriging model has been freed";
@@ -41,7 +43,7 @@ const ORDINARY_FREED = "OrdinaryKriging model has been freed";
  * (e.g. mismatched array lengths, singular covariance).
  */
 export class OrdinaryKriging {
-  private inner: WasmOrdinaryInstance | null;
+  private inner: WasmKrigingModelHandle | null;
 
   /**
    * Build an ordinary kriging model from sample locations, values, and variogram parameters.
@@ -55,7 +57,7 @@ export class OrdinaryKriging {
       // Prefer the zero-object-overhead `fromArrays` factory when the WASM package exposes
       // it: it skips the `serde_wasm_bindgen::from_value` deserialization that would
       // otherwise dominate constructor cost for large sample sets.
-      this.inner = mod.WasmOrdinaryKriging.fromArrays(
+      this.inner = mod.WasmKrigingModel.ordinaryGeoFromArrays(
         toFloat64Array(options.lats),
         toFloat64Array(options.lons),
         toFloat64Array(options.values),
@@ -70,7 +72,7 @@ export class OrdinaryKriging {
     }
   }
 
-  private requireInner(): WasmOrdinaryInstance {
+  private requireInner(): WasmKrigingModelHandle {
     if (this.inner === null) {
       throw new KrigingError(ORDINARY_FREED, { code: "model_freed" });
     }
@@ -286,5 +288,19 @@ export class OrdinaryKriging {
       }
     }
     return this.predictBatch(latArr, lonArr);
+  }
+
+  /**
+   * Leave-one-out cross-validation on this model's training stations and variogram.
+   */
+  leaveOneOut(): CvResult {
+    return modelLeaveOneOut(this.requireInner(), "ordinary") as CvResult;
+  }
+
+  /**
+   * K-fold cross-validation on this model's training data (deterministic round-robin).
+   */
+  kFold(k: number): CvResult {
+    return modelKFold(this.requireInner(), k, "ordinary") as CvResult;
   }
 }

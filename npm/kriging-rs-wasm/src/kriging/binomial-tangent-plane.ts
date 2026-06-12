@@ -19,7 +19,7 @@ import {
 import { requireLoadedModule } from "../internal/module.js";
 import type {
   BinomialTangentPlaneKrigingWithPriorOptionsWasm,
-  WasmBinomialInstance,
+  WasmKrigingModelHandle,
 } from "../internal/wasm-shapes.js";
 import type {
   BinomialBatchArrayOutput,
@@ -72,19 +72,20 @@ function toTangentPlaneWithPriorOptionsWasm(
  * Prefer {@link BinomialKriging} when isotropic Haversine distances are adequate.
  */
 export class BinomialTangentPlaneKriging {
-  private inner: WasmBinomialInstance | null;
+  private inner: WasmKrigingModelHandle | null;
 
   constructor(options: BinomialTangentPlaneKrigingOptions) {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmBinomialTangentPlaneKriging;
-    if (!ctor) {
+    const factory = mod.WasmKrigingModel?.binomialTangentPlaneFromArrays;
+    if (!factory) {
       throw new KrigingError(
         "BinomialTangentPlaneKriging is not available; rebuild the WASM package",
         { code: "backend_unavailable" }
       );
     }
     try {
-      this.inner = ctor.fromArrays(
+      this.inner = factory.call(
+        mod.WasmKrigingModel,
         toFloat64Array(options.lats),
         toFloat64Array(options.lons),
         toUint32Array(options.successes),
@@ -106,7 +107,7 @@ export class BinomialTangentPlaneKriging {
     }
   }
 
-  private requireInner(): WasmBinomialInstance {
+  private requireInner(): WasmKrigingModelHandle {
     if (this.inner === null) {
       throw new KrigingError(FREED, { code: "model_freed" });
     }
@@ -117,8 +118,8 @@ export class BinomialTangentPlaneKriging {
     options: BinomialTangentPlaneKrigingWithPriorOptions
   ): BinomialTangentPlaneKriging {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmBinomialTangentPlaneKriging;
-    if (!ctor) {
+    const factory = mod.WasmKrigingModel?.binomialTangentPlaneNewWithPrior;
+    if (!factory) {
       throw new KrigingError(
         "BinomialTangentPlaneKriging is not available; rebuild the WASM package",
         { code: "backend_unavailable" }
@@ -128,8 +129,11 @@ export class BinomialTangentPlaneKriging {
       BinomialTangentPlaneKriging.prototype
     ) as BinomialTangentPlaneKriging;
     try {
-      (instance as unknown as { inner: WasmBinomialInstance | null }).inner =
-        ctor.newWithPrior(toTangentPlaneWithPriorOptionsWasm(options));
+      (instance as unknown as { inner: WasmKrigingModelHandle | null }).inner =
+        factory.call(
+          mod.WasmKrigingModel,
+          toTangentPlaneWithPriorOptionsWasm(options)
+        );
     } catch (e) {
       throw wrapThrown(e);
     }

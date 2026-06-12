@@ -16,15 +16,17 @@ import {
   mapSpaceTimeBinomialDiagnostics,
 } from "../internal/mappers.js";
 import { requireLoadedModule } from "../internal/module.js";
+import { modelKFold, modelLeaveOneOut } from "../internal/model-cv.js";
 import {
   fittedToSpaceTimeVariogramParams,
   packSpaceTimeVariogram,
 } from "../internal/spacetime.js";
 import { timesFromDates } from "../time.js";
-import type { WasmSpaceTimeBinomialInstance } from "../internal/wasm-shapes.js";
+import type { WasmKrigingModelHandle } from "../internal/wasm-shapes.js";
 import type {
   BinomialBatchArrayOutput,
   BinomialBuildNotes,
+  BinomialCvResult,
   BinomialGridOutput,
   BinomialPrediction,
   DateAxisOptions,
@@ -48,12 +50,12 @@ const FREED = "SpaceTimeBinomialKriging model has been freed";
  * (`[0, 1]`) and logit scales.
  */
 export class SpaceTimeBinomialKriging {
-  private inner: WasmSpaceTimeBinomialInstance | null;
+  private inner: WasmKrigingModelHandle | null;
 
   constructor(options: SpaceTimeBinomialKrigingOptions) {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmSpaceTimeBinomialKriging;
-    if (!ctor) {
+    const factory = mod.WasmKrigingModel?.spacetimeBinomialGeoFromArrays;
+    if (!factory) {
       throw new KrigingError(
         "SpaceTimeBinomialKriging is not available; rebuild the WASM package",
         { code: "backend_unavailable" }
@@ -61,7 +63,8 @@ export class SpaceTimeBinomialKriging {
     }
     const packed = packSpaceTimeVariogram(options.variogram);
     try {
-      this.inner = ctor.fromArrays(
+      this.inner = factory.call(
+        mod.WasmKrigingModel,
         toFloat64Array(options.lats),
         toFloat64Array(options.lons),
         toFloat64Array(options.times),
@@ -97,8 +100,8 @@ export class SpaceTimeBinomialKriging {
     options: SpaceTimeBinomialKrigingWithPriorOptions
   ): SpaceTimeBinomialKriging {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmSpaceTimeBinomialKriging;
-    if (!ctor) {
+    const factory = mod.WasmKrigingModel?.spacetimeBinomialGeoFromArraysWithPrior;
+    if (!factory) {
       throw new KrigingError(
         "SpaceTimeBinomialKriging is not available; rebuild the WASM package",
         { code: "backend_unavailable" }
@@ -109,8 +112,9 @@ export class SpaceTimeBinomialKriging {
       SpaceTimeBinomialKriging.prototype
     ) as SpaceTimeBinomialKriging;
     try {
-      (instance as unknown as { inner: WasmSpaceTimeBinomialInstance | null }).inner =
-        ctor.fromArraysWithPrior(
+      (instance as unknown as { inner: WasmKrigingModelHandle | null }).inner =
+        factory.call(
+          mod.WasmKrigingModel,
           toFloat64Array(options.lats),
           toFloat64Array(options.lons),
           toFloat64Array(options.times),
@@ -149,8 +153,8 @@ export class SpaceTimeBinomialKriging {
     options: SpaceTimeBinomialFromPrecomputedLogitsOptions
   ): SpaceTimeBinomialKriging {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmSpaceTimeBinomialKriging;
-    if (!ctor) {
+    const factory = mod.WasmKrigingModel?.spacetimeBinomialGeoFromPrecomputedLogits;
+    if (!factory) {
       throw new KrigingError(
         "SpaceTimeBinomialKriging is not available; rebuild the WASM package",
         { code: "backend_unavailable" }
@@ -161,8 +165,9 @@ export class SpaceTimeBinomialKriging {
       SpaceTimeBinomialKriging.prototype
     ) as SpaceTimeBinomialKriging;
     try {
-      (instance as unknown as { inner: WasmSpaceTimeBinomialInstance | null }).inner =
-        ctor.fromPrecomputedLogits(
+      (instance as unknown as { inner: WasmKrigingModelHandle | null }).inner =
+        factory.call(
+          mod.WasmKrigingModel,
           toFloat64Array(options.lats),
           toFloat64Array(options.lons),
           toFloat64Array(options.times),
@@ -196,8 +201,9 @@ export class SpaceTimeBinomialKriging {
     options: SpaceTimeBinomialFromPrecomputedLogitsWithVariancesOptions
   ): SpaceTimeBinomialKriging {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmSpaceTimeBinomialKriging;
-    if (!ctor) {
+    const factory =
+      mod.WasmKrigingModel?.spacetimeBinomialGeoFromPrecomputedLogitsWithVariances;
+    if (!factory) {
       throw new KrigingError(
         "SpaceTimeBinomialKriging is not available; rebuild the WASM package",
         { code: "backend_unavailable" }
@@ -210,8 +216,9 @@ export class SpaceTimeBinomialKriging {
     const priorAlpha = options.prior?.alpha;
     const priorBeta = options.prior?.beta;
     try {
-      (instance as unknown as { inner: WasmSpaceTimeBinomialInstance | null }).inner =
-        ctor.fromPrecomputedLogitsWithVariances(
+      (instance as unknown as { inner: WasmKrigingModelHandle | null }).inner =
+        factory.call(
+          mod.WasmKrigingModel,
           toFloat64Array(options.lats),
           toFloat64Array(options.lons),
           toFloat64Array(options.times),
@@ -242,7 +249,7 @@ export class SpaceTimeBinomialKriging {
     return instance;
   }
 
-  private requireInner(): WasmSpaceTimeBinomialInstance {
+  private requireInner(): WasmKrigingModelHandle {
     if (this.inner === null) {
       throw new KrigingError(FREED, { code: "model_freed" });
     }
@@ -324,7 +331,7 @@ export class SpaceTimeBinomialKriging {
   }
 
   predict(lat: number, lon: number, time: number): BinomialPrediction {
-    return mapBinomialPrediction(this.requireInner().predict(lat, lon, time));
+    return mapBinomialPrediction(this.requireInner().predictSpaceTime(lat, lon, time));
   }
 
   predictBatch(
@@ -332,7 +339,7 @@ export class SpaceTimeBinomialKriging {
     lons: NumericArrayInput,
     times: NumericArrayInput
   ): BinomialPrediction[] {
-    const out = this.requireInner().predictBatch(
+    const out = this.requireInner().predictBatchSpaceTime(
       toFloat64Array(lats),
       toFloat64Array(lons),
       toFloat64Array(times)
@@ -345,7 +352,7 @@ export class SpaceTimeBinomialKriging {
     lons: NumericArrayInput,
     times: NumericArrayInput
   ): BinomialBatchArrayOutput {
-    const out = this.requireInner().predictBatchArrays(
+    const out = this.requireInner().predictBatchArraysSpaceTime(
       toFloat64Array(lats),
       toFloat64Array(lons),
       toFloat64Array(times)
@@ -366,7 +373,7 @@ export class SpaceTimeBinomialKriging {
     const { lats, lons } = buildGridLatsLons(options);
     const times = new Float64Array(lats.length);
     times.fill(options.time);
-    const out = inner.predictBatchArrays(lats, lons, times);
+    const out = inner.predictBatchArraysSpaceTime(lats, lons, times);
     const {
       prevalenceMedians: prevFlat,
       prevalenceMeans: pmeanFlat,
@@ -442,6 +449,14 @@ export class SpaceTimeBinomialKriging {
   predictGridAtDate(options: PredictGridAtDateOptions): BinomialGridOutput {
     const time = dateToTime(options.date, options);
     return this.predictGridAtTime({ ...options, time });
+  }
+
+  leaveOneOut(): BinomialCvResult {
+    return modelLeaveOneOut(this.requireInner(), "binomial") as BinomialCvResult;
+  }
+
+  kFold(k: number): BinomialCvResult {
+    return modelKFold(this.requireInner(), k, "binomial") as BinomialCvResult;
   }
 }
 

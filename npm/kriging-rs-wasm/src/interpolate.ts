@@ -6,7 +6,7 @@
  * @module
  */
 
-import { kFoldBinomial, leaveOneOutBinomial } from "./cv.js";
+import { cv } from "./cv.js";
 import { resolveBinomialPriorInput } from "./internal/prior.js";
 import { BinomialKriging } from "./kriging/binomial.js";
 import { OrdinaryKriging } from "./kriging/ordinary.js";
@@ -172,16 +172,20 @@ function runBinomialCvIfRequested(
   };
 
   if (withCv === true || withCv === "loo") {
-    return leaveOneOutBinomial({
+    return cv({
+      geometry: "geo",
+      family: "binomial",
       lats: options.lats,
       lons: options.lons,
       successes: options.successes,
       trials: options.trials,
       variogram,
       prior: priorResolved,
-    }).summary;
+    }).summary as BinomialCvSummary;
   }
-  return kFoldBinomial({
+  return cv({
+    geometry: "geo",
+    family: "binomial",
     lats: options.lats,
     lons: options.lons,
     successes: options.successes,
@@ -189,5 +193,5 @@ function runBinomialCvIfRequested(
     variogram,
     k: withCv.k,
     prior: priorResolved,
-  }).summary;
+  }).summary as BinomialCvSummary;
 }

@@ -1058,7 +1058,74 @@ export interface CvSummary {
   msdr: number;
 }
 
-/** Result of {@link leaveOneOut} / {@link kFold}. */
+/** Geometry seam for unified CV / simulation entry points. */
+export type KrigingGeometry = "geo" | "projected" | "spacetime";
+
+/** Kriging family seam for unified CV / simulation entry points. */
+export type KrigingFamily = "ordinary" | "simple" | "universal" | "binomial";
+
+/**
+ * Unified cross-validation options keyed by {@link KrigingGeometry} and
+ * {@link KrigingFamily}. Omit `k` for leave-one-out; set `k` for k-fold.
+ */
+export interface CvOptions {
+  geometry: KrigingGeometry;
+  family: KrigingFamily;
+  /** Number of folds (`2 ≤ k ≤ n`). Omit for leave-one-out. */
+  k?: number;
+  lats?: NumericArrayInput;
+  lons?: NumericArrayInput;
+  xs?: NumericArrayInput;
+  ys?: NumericArrayInput;
+  values?: NumericArrayInput;
+  successes?: IntegerArrayInput;
+  trials?: IntegerArrayInput;
+  times?: NumericArrayInput;
+  /** Required for `geo` / `projected` geometries. */
+  variogram?: VariogramParams;
+  /** Required for `spacetime` geometry. */
+  spaceTimeVariogram?: SpaceTimeVariogramParams;
+  mean?: number;
+  trend?: UniversalTrend | SpaceTimeUniversalTrend;
+  majorAngleDeg?: number;
+  rangeRatio?: number;
+  prior?: BinomialPriorInput;
+}
+
+/**
+ * Unified sequential Gaussian simulation options keyed by {@link KrigingGeometry}
+ * and {@link KrigingFamily}.
+ */
+export interface SimulateOptions {
+  geometry: KrigingGeometry;
+  family: KrigingFamily;
+  conditioningLats?: NumericArrayInput;
+  conditioningLons?: NumericArrayInput;
+  conditioningXs?: NumericArrayInput;
+  conditioningYs?: NumericArrayInput;
+  conditioningTimes?: NumericArrayInput;
+  conditioningValues?: NumericArrayInput;
+  conditioningSuccesses?: IntegerArrayInput;
+  conditioningTrials?: IntegerArrayInput;
+  targetLats?: NumericArrayInput;
+  targetLons?: NumericArrayInput;
+  targetXs?: NumericArrayInput;
+  targetYs?: NumericArrayInput;
+  targetTimes?: NumericArrayInput;
+  variogram?: VariogramParams;
+  spaceTimeVariogram?: SpaceTimeVariogramParams;
+  mean?: number;
+  trend?: UniversalTrend | SpaceTimeUniversalTrend;
+  majorAngleDeg?: number;
+  rangeRatio?: number;
+  prior?: BinomialPriorInput;
+  seed?: number | bigint;
+  baseSeed?: number | bigint;
+  nRealizations?: number;
+  targetOrder?: ArrayLike<number> | Uint32Array;
+}
+
+/** Result of {@link cv} / {@link leaveOneOut} / {@link kFold} for continuous families. */
 export interface CvResult {
   /** Per-station residuals in input order. */
   residuals: CvResidual[];

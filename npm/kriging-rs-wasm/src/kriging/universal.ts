@@ -12,8 +12,10 @@ import {
   mapOrdinaryPredictionArray,
 } from "../internal/mappers.js";
 import { requireLoadedModule } from "../internal/module.js";
-import type { WasmUniversalInstance } from "../internal/wasm-shapes.js";
+import { modelKFold, modelLeaveOneOut } from "../internal/model-cv.js";
+import type { WasmKrigingModelHandle } from "../internal/wasm-shapes.js";
 import type {
+  CvResult,
   NumericArrayInput,
   OrdinaryBatchArrayOutput,
   OrdinaryPrediction,
@@ -27,7 +29,7 @@ const UNIVERSAL_FREED = "UniversalKriging model has been freed";
  * to ordinary kriging), `"linear"` (linear drift in lat/lon), or `"quadratic"`.
  */
 export class UniversalKriging {
-  private inner: WasmUniversalInstance | null;
+  private inner: WasmKrigingModelHandle | null;
 
   /**
    * Build a universal kriging model from sample data, variogram parameters, and a
@@ -41,15 +43,16 @@ export class UniversalKriging {
    */
   constructor(options: UniversalKrigingOptions) {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmUniversalKriging;
-    if (!ctor) {
+    const factory = mod.WasmKrigingModel?.universalGeoFromArrays;
+    if (!factory) {
       throw new KrigingError(
         "UniversalKriging is not available; rebuild the WASM package",
         { code: "backend_unavailable" }
       );
     }
     try {
-      this.inner = ctor.fromArrays(
+      this.inner = factory.call(
+        mod.WasmKrigingModel,
         toFloat64Array(options.lats),
         toFloat64Array(options.lons),
         toFloat64Array(options.values),
@@ -65,7 +68,7 @@ export class UniversalKriging {
     }
   }
 
-  private requireInner(): WasmUniversalInstance {
+  private requireInner(): WasmKrigingModelHandle {
     if (this.inner === null) {
       throw new KrigingError(UNIVERSAL_FREED, { code: "model_freed" });
     }
@@ -123,5 +126,13 @@ export class UniversalKriging {
       toFloat64Array(lons)
     );
     return mapOrdinaryBatchArrayOutput(out);
+  }
+
+  leaveOneOut(): CvResult {
+    return modelLeaveOneOut(this.requireInner(), "universal") as CvResult;
+  }
+
+  kFold(k: number): CvResult {
+    return modelKFold(this.requireInner(), k, "universal") as CvResult;
   }
 }

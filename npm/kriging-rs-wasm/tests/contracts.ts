@@ -9,10 +9,8 @@ import {
   SpaceTimeSimpleKriging,
   SpaceTimeUniversalKriging,
   computeEmpiricalSpaceTimeVariogram,
-  conditionalSimulateSpaceTime,
-  conditionalSimulateSpaceTimeBinomial,
-  conditionalSimulateSpaceTimeSimple,
-  conditionalSimulateSpaceTimeUniversal,
+  cv,
+  conditionalSimulate,
   fitSpaceTimeVariogram,
   fitBinomialVariogram,
   fitVariogram,
@@ -20,14 +18,8 @@ import {
   init,
   interpolateOrdinaryToGrid,
   interpolateBinomialToGrid,
-  kFoldSpaceTime,
-  kFoldSpaceTimeBinomial,
-  kFoldSpaceTimeSimple,
-  kFoldSpaceTimeUniversal,
-  leaveOneOutSpaceTime,
-  leaveOneOutSpaceTimeBinomial,
-  leaveOneOutSpaceTimeSimple,
-  leaveOneOutSpaceTimeUniversal,
+  leaveOneOut,
+  kFold,
   VariogramType,
   type BinomialBatchArrayOutput,
   type BinomialBuildNotes,
@@ -425,74 +417,74 @@ const _stFit: FitSpaceTimeVariogramResult = fitSpaceTimeVariogram({
 });
 
 // Space-time CV / SGS contracts
-const _stCv: CvResult = leaveOneOutSpaceTime({
+const _stCv: CvResult = leaveOneOut({ geometry: "spacetime", family: "ordinary", 
   lats,
   lons,
   times,
   values,
-  variogram: stVariogram,
-});
-const _stCvKf: CvResult = kFoldSpaceTime({
+  spaceTimeVariogram: stVariogram,
+}) as CvResult;
+const _stCvKf: CvResult = kFold({ geometry: "spacetime", family: "ordinary", 
   lats,
   lons,
   times,
   values,
-  variogram: stVariogram,
+  spaceTimeVariogram: stVariogram,
   k: 3,
-});
-const _stCvSimple: CvResult = leaveOneOutSpaceTimeSimple({
+}) as CvResult;
+const _stCvSimple: CvResult = leaveOneOut({ geometry: "spacetime", family: "simple", 
   lats,
   lons,
   times,
   values,
-  variogram: stVariogram,
+  spaceTimeVariogram: stVariogram,
   mean: 4,
-});
-const _stCvSimpleKf: CvResult = kFoldSpaceTimeSimple({
+}) as CvResult;
+const _stCvSimpleKf: CvResult = kFold({ geometry: "spacetime", family: "simple", 
   lats,
   lons,
   times,
   values,
-  variogram: stVariogram,
+  spaceTimeVariogram: stVariogram,
   mean: 4,
   k: 3,
-});
-const _stCvUniv: CvResult = leaveOneOutSpaceTimeUniversal({
+}) as CvResult;
+const _stCvUniv: CvResult = leaveOneOut({ geometry: "spacetime", family: "universal", 
   lats,
   lons,
   times,
   values,
-  variogram: stVariogram,
+  spaceTimeVariogram: stVariogram,
   trend: "linearInSpaceAndTime",
-});
-const _stCvUnivKf: CvResult = kFoldSpaceTimeUniversal({
+}) as CvResult;
+const _stCvUnivKf: CvResult = kFold({ geometry: "spacetime", family: "universal", 
   lats,
   lons,
   times,
   values,
-  variogram: stVariogram,
+  spaceTimeVariogram: stVariogram,
   trend: "linearInSpaceAndTime",
   k: 3,
-});
-const _stCvBin: BinomialCvResult = leaveOneOutSpaceTimeBinomial({
+}) as CvResult;
+const _stCvBin: BinomialCvResult = cv({ geometry: "spacetime", family: "binomial", 
   lats,
   lons,
   times,
   successes,
   trials,
-  variogram: stVariogram,
-});
-const _stCvBinKf: BinomialCvResult = kFoldSpaceTimeBinomial({
+  spaceTimeVariogram: stVariogram,
+}) as BinomialCvResult;
+const _stCvBinKf: BinomialCvResult = cv({ geometry: "spacetime", family: "binomial",
+  k: 3,
   lats,
   lons,
   times,
   successes,
   trials,
-  variogram: stVariogram,
-  k: 3,
-});
+  spaceTimeVariogram: stVariogram,
+}) as BinomialCvResult;
 
-const _stSgs: Float64Array = conditionalSimulateSpaceTime({
+const _stSgs: Float64Array = conditionalSimulate({ geometry: "spacetime", family: "ordinary", 
   conditioningLats: lats,
   conditioningLons: lons,
   conditioningTimes: times,
@@ -500,10 +492,10 @@ const _stSgs: Float64Array = conditionalSimulateSpaceTime({
   targetLats: new Float64Array([0.5]),
   targetLons: new Float64Array([0.5]),
   targetTimes: new Float64Array([0.5]),
-  variogram: stVariogram,
+  spaceTimeVariogram: stVariogram,
   seed: 1n,
-});
-const _stSgsSimple: Float64Array = conditionalSimulateSpaceTimeSimple({
+}) as Float64Array;
+const _stSgsSimple: Float64Array = conditionalSimulate({ geometry: "spacetime", family: "simple", 
   conditioningLats: lats,
   conditioningLons: lons,
   conditioningTimes: times,
@@ -511,11 +503,11 @@ const _stSgsSimple: Float64Array = conditionalSimulateSpaceTimeSimple({
   targetLats: new Float64Array([0.5]),
   targetLons: new Float64Array([0.5]),
   targetTimes: new Float64Array([0.5]),
-  variogram: stVariogram,
+  spaceTimeVariogram: stVariogram,
   mean: 4,
   seed: 1n,
-});
-const _stSgsUniv: Float64Array = conditionalSimulateSpaceTimeUniversal({
+}) as Float64Array;
+const _stSgsUniv: Float64Array = conditionalSimulate({ geometry: "spacetime", family: "universal", 
   conditioningLats: lats,
   conditioningLons: lons,
   conditioningTimes: times,
@@ -523,23 +515,23 @@ const _stSgsUniv: Float64Array = conditionalSimulateSpaceTimeUniversal({
   targetLats: new Float64Array([0.5]),
   targetLons: new Float64Array([0.5]),
   targetTimes: new Float64Array([0.5]),
-  variogram: stVariogram,
+  spaceTimeVariogram: stVariogram,
   trend: "constant",
   seed: 1n,
-});
+}) as Float64Array;
 const _stSgsBin: BinomialSimulationResult =
-  conditionalSimulateSpaceTimeBinomial({
+  conditionalSimulate({ geometry: "spacetime", family: "binomial", 
     conditioningLats: lats,
     conditioningLons: lons,
     conditioningTimes: times,
-    successes,
-    trials,
+    conditioningSuccesses: successes,
+    conditioningTrials: trials,
     targetLats: new Float64Array([0.5]),
     targetLons: new Float64Array([0.5]),
     targetTimes: new Float64Array([0.5]),
-    variogram: stVariogram,
+    spaceTimeVariogram: stVariogram,
     seed: 1n,
-  });
+  }) as BinomialSimulationResult;
 
 const _oneShotBinomial: InterpolateBinomialToGridResult = interpolateBinomialToGrid({
   lats: Array.from(lats),

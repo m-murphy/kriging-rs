@@ -13,8 +13,10 @@ import {
   mapOrdinaryPredictionArray,
 } from "../internal/mappers.js";
 import { requireLoadedModule } from "../internal/module.js";
-import type { WasmSimpleInstance } from "../internal/wasm-shapes.js";
+import { modelKFold, modelLeaveOneOut } from "../internal/model-cv.js";
+import type { WasmKrigingModelHandle } from "../internal/wasm-shapes.js";
 import type {
+  CvResult,
   NumericArrayInput,
   OrdinaryBatchArrayOutput,
   OrdinaryPrediction,
@@ -29,7 +31,7 @@ const SIMPLE_FREED = "SimpleKriging model has been freed";
  * externally or known from domain knowledge.
  */
 export class SimpleKriging {
-  private inner: WasmSimpleInstance | null;
+  private inner: WasmKrigingModelHandle | null;
 
   /**
    * Build a simple kriging model from sample data, variogram parameters, and a known mean.
@@ -41,15 +43,16 @@ export class SimpleKriging {
    */
   constructor(options: SimpleKrigingOptions) {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmSimpleKriging;
-    if (!ctor) {
+    const factory = mod.WasmKrigingModel?.simpleGeoFromArrays;
+    if (!factory) {
       throw new KrigingError(
         "SimpleKriging is not available; rebuild the WASM package",
         { code: "backend_unavailable" }
       );
     }
     try {
-      this.inner = ctor.fromArrays(
+      this.inner = factory.call(
+        mod.WasmKrigingModel,
         toFloat64Array(options.lats),
         toFloat64Array(options.lons),
         toFloat64Array(options.values),
@@ -65,7 +68,7 @@ export class SimpleKriging {
     }
   }
 
-  private requireInner(): WasmSimpleInstance {
+  private requireInner(): WasmKrigingModelHandle {
     if (this.inner === null) {
       throw new KrigingError(SIMPLE_FREED, { code: "model_freed" });
     }
@@ -129,5 +132,13 @@ export class SimpleKriging {
       toFloat64Array(lons)
     );
     return mapOrdinaryBatchArrayOutput(out);
+  }
+
+  leaveOneOut(): CvResult {
+    return modelLeaveOneOut(this.requireInner(), "simple") as CvResult;
+  }
+
+  kFold(k: number): CvResult {
+    return modelKFold(this.requireInner(), k, "simple") as CvResult;
   }
 }

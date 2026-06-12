@@ -15,14 +15,16 @@ import {
   mapBinomialPredictionArray,
 } from "../internal/mappers.js";
 import { requireLoadedModule } from "../internal/module.js";
+import { modelKFold, modelLeaveOneOut } from "../internal/model-cv.js";
 import type {
   BinomialKrigingOptionsWasm,
   BinomialKrigingWithPriorOptionsWasm,
-  WasmBinomialInstance,
+  WasmKrigingModelHandle,
 } from "../internal/wasm-shapes.js";
 import type {
   BinomialBatchArrayOutput,
   BinomialBuildNotes,
+  BinomialCvResult,
   BinomialDiagnostics,
   BinomialFromPrecomputedLogitsOptions,
   BinomialFromPrecomputedLogitsWithVariancesOptions,
@@ -86,7 +88,7 @@ function toBinomialWithPriorOptionsWasm(
  * @throws {KrigingError} When the WASM module is not loaded, or when inputs are invalid.
  */
 export class BinomialKriging {
-  private inner: WasmBinomialInstance | null;
+  private inner: WasmKrigingModelHandle | null;
 
   /**
    * Build a binomial kriging model from locations, success/trial counts, and variogram parameters.
@@ -97,7 +99,7 @@ export class BinomialKriging {
   constructor(options: BinomialKrigingOptions) {
     const mod = requireLoadedModule();
     try {
-      this.inner = mod.WasmBinomialKriging.fromArrays(
+      this.inner = mod.WasmKrigingModel.binomialGeoFromArrays(
         toFloat64Array(options.lats),
         toFloat64Array(options.lons),
         toUint32Array(options.successes),
@@ -115,7 +117,7 @@ export class BinomialKriging {
     }
   }
 
-  private requireInner(): WasmBinomialInstance {
+  private requireInner(): WasmKrigingModelHandle {
     if (this.inner === null) {
       throw new KrigingError(BINOMIAL_FREED, { code: "model_freed" });
     }
@@ -134,13 +136,13 @@ export class BinomialKriging {
     options: BinomialFromPrecomputedLogitsOptions
   ): BinomialKriging {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmBinomialKriging;
+    const factory = mod.WasmKrigingModel;
     const instance = Object.create(
       BinomialKriging.prototype
     ) as BinomialKriging;
     try {
-      (instance as unknown as { inner: WasmBinomialInstance | null }).inner =
-        ctor.fromPrecomputedLogits(
+      (instance as unknown as { inner: WasmKrigingModelHandle | null }).inner =
+        factory.binomialGeoFromPrecomputedLogits(
           toFloat64Array(options.lats),
           toFloat64Array(options.lons),
           toFloat64Array(options.logits),
@@ -164,15 +166,15 @@ export class BinomialKriging {
     options: BinomialFromPrecomputedLogitsWithVariancesOptions
   ): BinomialKriging {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmBinomialKriging;
+    const factory = mod.WasmKrigingModel;
     const instance = Object.create(
       BinomialKriging.prototype
     ) as BinomialKriging;
     const priorAlpha = options.prior?.alpha;
     const priorBeta = options.prior?.beta;
     try {
-      (instance as unknown as { inner: WasmBinomialInstance | null }).inner =
-        ctor.fromPrecomputedLogitsWithVariances(
+      (instance as unknown as { inner: WasmKrigingModelHandle | null }).inner =
+        factory.binomialGeoFromPrecomputedLogitsWithVariances(
           toFloat64Array(options.lats),
           toFloat64Array(options.lons),
           toFloat64Array(options.logits),
@@ -209,8 +211,8 @@ export class BinomialKriging {
       BinomialKriging.prototype
     ) as BinomialKriging;
     try {
-      (instance as unknown as { inner: WasmBinomialInstance | null }).inner =
-        mod.WasmBinomialKriging.newWithPrior(
+      (instance as unknown as { inner: WasmKrigingModelHandle | null }).inner =
+        mod.WasmKrigingModel.binomialGeoNewWithPrior(
           toBinomialWithPriorOptionsWasm(options)
         );
     } catch (e) {
@@ -487,5 +489,13 @@ export class BinomialKriging {
       }
     }
     return this.predictBatch(latArr, lonArr);
+  }
+
+  leaveOneOut(): BinomialCvResult {
+    return modelLeaveOneOut(this.requireInner(), "binomial") as BinomialCvResult;
+  }
+
+  kFold(k: number): BinomialCvResult {
+    return modelKFold(this.requireInner(), k, "binomial") as BinomialCvResult;
   }
 }

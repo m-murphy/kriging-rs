@@ -22,10 +22,12 @@ import {
   mapBinomialPredictionArray,
 } from "../internal/mappers.js";
 import { requireLoadedModule } from "../internal/module.js";
-import type { WasmBinomialProjectedInstance } from "../internal/wasm-shapes.js";
+import { modelKFold, modelLeaveOneOut } from "../internal/model-cv.js";
+import type { WasmKrigingModelHandle } from "../internal/wasm-shapes.js";
 import type {
   BinomialBatchArrayOutput,
   BinomialBuildNotes,
+  BinomialCvResult,
   BinomialDiagnostics,
   BinomialGridOutput,
   BinomialPrediction,
@@ -51,7 +53,7 @@ const PROJECTED_BINOMIAL_FREED =
  * range matters.
  */
 export class BinomialProjectedKriging {
-  private inner: WasmBinomialProjectedInstance | null;
+  private inner: WasmKrigingModelHandle | null;
 
   /**
    * Build a projected binomial kriging model with default Beta(1, 1) prior.
@@ -66,15 +68,16 @@ export class BinomialProjectedKriging {
    */
   constructor(options: BinomialProjectedKrigingOptions) {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmBinomialProjectedKriging;
-    if (!ctor) {
+    const factory = mod.WasmKrigingModel?.binomialProjectedFromArrays;
+    if (!factory) {
       throw new KrigingError(
         "BinomialProjectedKriging is not available; rebuild the WASM package",
         { code: "backend_unavailable" }
       );
     }
     try {
-      this.inner = ctor.fromArrays(
+      this.inner = factory.call(
+        mod.WasmKrigingModel,
         toFloat64Array(options.xs),
         toFloat64Array(options.ys),
         toUint32Array(options.successes),
@@ -94,7 +97,7 @@ export class BinomialProjectedKriging {
     }
   }
 
-  private requireInner(): WasmBinomialProjectedInstance {
+  private requireInner(): WasmKrigingModelHandle {
     if (this.inner === null) {
       throw new KrigingError(PROJECTED_BINOMIAL_FREED, { code: "model_freed" });
     }
@@ -109,8 +112,8 @@ export class BinomialProjectedKriging {
     options: BinomialProjectedKrigingWithPriorOptions
   ): BinomialProjectedKriging {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmBinomialProjectedKriging;
-    if (!ctor) {
+    const factory = mod.WasmKrigingModel?.binomialProjectedFromArraysWithPrior;
+    if (!factory) {
       throw new KrigingError(
         "BinomialProjectedKriging is not available; rebuild the WASM package",
         { code: "backend_unavailable" }
@@ -122,9 +125,10 @@ export class BinomialProjectedKriging {
     try {
       (
         instance as unknown as {
-          inner: WasmBinomialProjectedInstance | null;
+          inner: WasmKrigingModelHandle | null;
         }
-      ).inner = ctor.fromArraysWithPrior(
+      ).inner = factory.call(
+        mod.WasmKrigingModel,
         toFloat64Array(options.xs),
         toFloat64Array(options.ys),
         toUint32Array(options.successes),
@@ -155,8 +159,8 @@ export class BinomialProjectedKriging {
     options: BinomialProjectedFromPrecomputedLogitsOptions
   ): BinomialProjectedKriging {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmBinomialProjectedKriging;
-    if (!ctor) {
+    const factory = mod.WasmKrigingModel?.binomialProjectedFromPrecomputedLogits;
+    if (!factory) {
       throw new KrigingError(
         "BinomialProjectedKriging is not available; rebuild the WASM package",
         { code: "backend_unavailable" }
@@ -168,9 +172,10 @@ export class BinomialProjectedKriging {
     try {
       (
         instance as unknown as {
-          inner: WasmBinomialProjectedInstance | null;
+          inner: WasmKrigingModelHandle | null;
         }
-      ).inner = ctor.fromPrecomputedLogits(
+      ).inner = factory.call(
+        mod.WasmKrigingModel,
         toFloat64Array(options.xs),
         toFloat64Array(options.ys),
         toFloat64Array(options.logits),
@@ -196,8 +201,9 @@ export class BinomialProjectedKriging {
     options: BinomialProjectedFromPrecomputedLogitsWithVariancesOptions
   ): BinomialProjectedKriging {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmBinomialProjectedKriging;
-    if (!ctor) {
+    const factory =
+      mod.WasmKrigingModel?.binomialProjectedFromPrecomputedLogitsWithVariances;
+    if (!factory) {
       throw new KrigingError(
         "BinomialProjectedKriging is not available; rebuild the WASM package",
         { code: "backend_unavailable" }
@@ -211,9 +217,10 @@ export class BinomialProjectedKriging {
     try {
       (
         instance as unknown as {
-          inner: WasmBinomialProjectedInstance | null;
+          inner: WasmKrigingModelHandle | null;
         }
-      ).inner = ctor.fromPrecomputedLogitsWithVariances(
+      ).inner = factory.call(
+        mod.WasmKrigingModel,
         toFloat64Array(options.xs),
         toFloat64Array(options.ys),
         toFloat64Array(options.logits),
@@ -409,5 +416,13 @@ export class BinomialProjectedKriging {
       logitVariances: reshapeFlatToGrid(lvFlat, nRows, nCols),
       prevalenceVariances: reshapeFlatToGrid(pvFlat, nRows, nCols),
     };
+  }
+
+  leaveOneOut(): BinomialCvResult {
+    return modelLeaveOneOut(this.requireInner(), "binomial") as BinomialCvResult;
+  }
+
+  kFold(k: number): BinomialCvResult {
+    return modelKFold(this.requireInner(), k, "binomial") as BinomialCvResult;
   }
 }
