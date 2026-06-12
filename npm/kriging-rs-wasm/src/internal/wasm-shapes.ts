@@ -61,7 +61,16 @@ export interface WasmBinomialProjectedInstance {
   predict(x: number, y: number): unknown;
   predictBatch(xs: Float64Array, ys: Float64Array): unknown;
   predictBatchArrays(xs: Float64Array, ys: Float64Array): unknown;
+  predictGridArrays(
+    xMin: number,
+    xMax: number,
+    yMin: number,
+    yMax: number,
+    xCells: number,
+    yCells: number
+  ): unknown;
   getBuildNotes(): unknown;
+  getDiagnostics?(options?: unknown): unknown;
   free?: () => void;
 }
 
@@ -71,6 +80,7 @@ export interface WasmBinomialInstance {
   predictBatch(lats: Float64Array, lons: Float64Array): unknown;
   predictBatchArrays(lats: Float64Array, lons: Float64Array): unknown;
   getBuildNotes(): unknown;
+  getDiagnostics?(options?: unknown): unknown;
   predictGridArrays(
     xMin: number,
     xMax: number,
@@ -113,9 +123,38 @@ export interface BinomialKrigingOptionsWasm {
     range: number;
     shape?: number;
   };
+  /** Maps to Rust `BinomialStability` preset (`default` | `strict` | `permissive`). */
+  stability?: string;
+  /** When true, enables one-step Laplace logit observation variance (calibration version 3). */
+  oneStepLaplaceObservationVariance?: boolean;
 }
 
 export interface BinomialKrigingWithPriorOptionsWasm extends BinomialKrigingOptionsWasm {
+  prior: { alpha: number; beta: number };
+}
+
+export interface BinomialTangentPlaneKrigingOptionsWasm {
+  lats: number[];
+  lons: number[];
+  successes: number[];
+  trials: number[];
+  variogram: {
+    variogramType: string;
+    nugget: number;
+    sill: number;
+    range: number;
+    shape?: number;
+  };
+  majorAngleDeg: number;
+  rangeRatio: number;
+  tangentPlaneRefLat?: number;
+  tangentPlaneRefLon?: number;
+  stability?: string;
+  oneStepLaplaceObservationVariance?: boolean;
+}
+
+export interface BinomialTangentPlaneKrigingWithPriorOptionsWasm
+  extends BinomialTangentPlaneKrigingOptionsWasm {
   prior: { alpha: number; beta: number };
 }
 
@@ -149,7 +188,9 @@ export type RawModule = {
       nugget: number,
       sill: number,
       range: number,
-      shape?: number
+      shape?: number,
+      stability?: string,
+      oneStepLaplaceObservationVariance?: boolean
     ): WasmBinomialInstance;
     fromPrecomputedLogits(
       lats: Float64Array,
@@ -160,6 +201,44 @@ export type RawModule = {
       sill: number,
       range: number,
       shape?: number
+    ): WasmBinomialInstance;
+    fromPrecomputedLogitsWithVariances(
+      lats: Float64Array,
+      lons: Float64Array,
+      logits: Float64Array,
+      logitObservationVariance: Float64Array,
+      variogramType: string,
+      nugget: number,
+      sill: number,
+      range: number,
+      shape: number | undefined,
+      priorAlpha: number | undefined,
+      priorBeta: number | undefined,
+      stability?: string,
+      oneStepLaplaceObservationVariance?: boolean
+    ): WasmBinomialInstance;
+  };
+  WasmBinomialTangentPlaneKriging?: {
+    new (options: BinomialTangentPlaneKrigingOptionsWasm): WasmBinomialInstance;
+    newWithPrior(
+      options: BinomialTangentPlaneKrigingWithPriorOptionsWasm
+    ): WasmBinomialInstance;
+    fromArrays(
+      lats: Float64Array,
+      lons: Float64Array,
+      successes: Uint32Array,
+      trials: Uint32Array,
+      variogramType: string,
+      nugget: number,
+      sill: number,
+      range: number,
+      shape: number | undefined,
+      majorAngleDeg: number,
+      rangeRatio: number,
+      tangentPlaneRefLat: number | undefined,
+      tangentPlaneRefLon: number | undefined,
+      stability?: string,
+      oneStepLaplaceObservationVariance?: boolean
     ): WasmBinomialInstance;
   };
   WasmSimpleKriging?: {
@@ -214,7 +293,9 @@ export type RawModule = {
       range: number,
       shape: number | undefined,
       majorAngleDeg: number,
-      rangeRatio: number
+      rangeRatio: number,
+      stability?: string,
+      oneStepLaplaceObservationVariance?: boolean
     ): WasmBinomialProjectedInstance;
     fromArraysWithPrior(
       xs: Float64Array,
@@ -229,7 +310,9 @@ export type RawModule = {
       majorAngleDeg: number,
       rangeRatio: number,
       priorAlpha: number,
-      priorBeta: number
+      priorBeta: number,
+      stability?: string,
+      oneStepLaplaceObservationVariance?: boolean
     ): WasmBinomialProjectedInstance;
     fromPrecomputedLogits(
       xs: Float64Array,
@@ -242,6 +325,23 @@ export type RawModule = {
       shape: number | undefined,
       majorAngleDeg: number,
       rangeRatio: number
+    ): WasmBinomialProjectedInstance;
+    fromPrecomputedLogitsWithVariances(
+      xs: Float64Array,
+      ys: Float64Array,
+      logits: Float64Array,
+      logitObservationVariance: Float64Array,
+      variogramType: string,
+      nugget: number,
+      sill: number,
+      range: number,
+      shape: number | undefined,
+      majorAngleDeg: number,
+      rangeRatio: number,
+      priorAlpha: number | undefined,
+      priorBeta: number | undefined,
+      stability?: string,
+      oneStepLaplaceObservationVariance?: boolean
     ): WasmBinomialProjectedInstance;
   };
   WasmVariogramType: {
@@ -262,6 +362,23 @@ export type RawModule = {
     nBins: number,
     variogramType: number,
     estimator?: string
+  ) => unknown;
+  fitBinomialVariogram: (
+    sampleLats: Float64Array,
+    sampleLons: Float64Array,
+    successes: Uint32Array,
+    trials: Uint32Array,
+    maxDistance: number | undefined,
+    nBins: number,
+    variogramType: number,
+    estimator: string | undefined,
+    priorAlpha: number | undefined,
+    priorBeta: number | undefined,
+    relWeightEps: number | undefined
+  ) => unknown;
+  estimateBinomialPrior: (
+    successes: Uint32Array,
+    trials: Uint32Array
   ) => unknown;
   computeEmpiricalVariogram: (
     lats: Float64Array,
@@ -1015,7 +1132,79 @@ export type RawModule = {
       temporalShape: number | undefined,
       k1: number | undefined,
       k2: number | undefined,
+      k3: number | undefined,
+      stability?: string,
+      oneStepLaplaceObservationVariance?: boolean
+    ): WasmSpaceTimeBinomialInstance;
+    fromArraysWithPrior(
+      lats: Float64Array,
+      lons: Float64Array,
+      times: Float64Array,
+      successes: Uint32Array,
+      trials: Uint32Array,
+      priorAlpha: number,
+      priorBeta: number,
+      family: string,
+      spatialType: string,
+      spatialNugget: number,
+      spatialSill: number,
+      spatialRange: number,
+      spatialShape: number | undefined,
+      temporalType: string,
+      temporalNugget: number,
+      temporalSill: number,
+      temporalRange: number,
+      temporalShape: number | undefined,
+      k1: number | undefined,
+      k2: number | undefined,
+      k3: number | undefined,
+      stability?: string,
+      oneStepLaplaceObservationVariance?: boolean
+    ): WasmSpaceTimeBinomialInstance;
+    fromPrecomputedLogits(
+      lats: Float64Array,
+      lons: Float64Array,
+      times: Float64Array,
+      logits: Float64Array,
+      family: string,
+      spatialType: string,
+      spatialNugget: number,
+      spatialSill: number,
+      spatialRange: number,
+      spatialShape: number | undefined,
+      temporalType: string,
+      temporalNugget: number,
+      temporalSill: number,
+      temporalRange: number,
+      temporalShape: number | undefined,
+      k1: number | undefined,
+      k2: number | undefined,
       k3: number | undefined
+    ): WasmSpaceTimeBinomialInstance;
+    fromPrecomputedLogitsWithVariances(
+      lats: Float64Array,
+      lons: Float64Array,
+      times: Float64Array,
+      logits: Float64Array,
+      logitObservationVariance: Float64Array,
+      family: string,
+      spatialType: string,
+      spatialNugget: number,
+      spatialSill: number,
+      spatialRange: number,
+      spatialShape: number | undefined,
+      temporalType: string,
+      temporalNugget: number,
+      temporalSill: number,
+      temporalRange: number,
+      temporalShape: number | undefined,
+      k1: number | undefined,
+      k2: number | undefined,
+      k3: number | undefined,
+      priorAlpha: number | undefined,
+      priorBeta: number | undefined,
+      stability?: string,
+      oneStepLaplaceObservationVariance?: boolean
     ): WasmSpaceTimeBinomialInstance;
   };
   WasmSpaceTimeOrdinaryProjectedKriging?: {
@@ -1095,5 +1284,6 @@ export interface WasmSpaceTimeBinomialInstance {
     times: Float64Array
   ): unknown;
   getBuildNotes(): unknown;
+  getDiagnostics?(options?: unknown): unknown;
   free?: () => void;
 }

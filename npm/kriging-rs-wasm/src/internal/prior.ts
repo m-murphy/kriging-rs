@@ -8,7 +8,12 @@
  * @module
  */
 
-import type { BinomialPriorParams } from "../types.js";
+import { estimateBinomialPrior } from "../estimate-binomial-prior.js";
+import type {
+  BinomialPriorInput,
+  BinomialPriorParams,
+  IntegerArrayInput,
+} from "../types.js";
 
 /** Default Beta(α, β) used when the caller omits a prior — matches Rust's `BinomialPrior::default()` (Beta(1, 1)). */
 export const DEFAULT_BINOMIAL_PRIOR: Readonly<BinomialPriorParams> = Object.freeze({
@@ -37,6 +42,24 @@ export function resolveBinomialPriorOrDefault(
   prior: BinomialPriorParams | undefined
 ): BinomialPriorParams {
   return prior ?? DEFAULT_BINOMIAL_PRIOR;
+}
+
+/**
+ * Turn optional {@link BinomialPriorInput} into a concrete `{ alpha, beta }` or
+ * `undefined` for WASM default Beta(1, 1). Resolves `"auto"` via
+ * {@link estimateBinomialPrior} on the given count arrays.
+ */
+export function resolveBinomialPriorInput(
+  prior: BinomialPriorInput | undefined,
+  context: { successes: IntegerArrayInput; trials: IntegerArrayInput }
+): BinomialPriorParams | undefined {
+  if (prior === undefined) {
+    return undefined;
+  }
+  if (prior === "auto") {
+    return estimateBinomialPrior(context);
+  }
+  return prior;
 }
 
 /**

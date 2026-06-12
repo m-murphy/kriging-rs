@@ -14,6 +14,7 @@ declare module "../pkg/kriging_rs.js" {
     newWithPrior(options: unknown): unknown;
     fromArrays(...args: unknown[]): unknown;
     fromPrecomputedLogits(...args: unknown[]): unknown;
+    fromPrecomputedLogitsWithVariances(...args: unknown[]): unknown;
   };
   export const WasmVariogramType: {
     readonly Spherical: number;
@@ -29,7 +30,25 @@ declare module "../pkg/kriging_rs.js" {
     values: Float64Array,
     maxDistance: number | undefined,
     nBins: number,
-    variogramType: number
+    variogramType: number,
+    estimator?: string
+  ) => unknown;
+  export const fitBinomialVariogram: (
+    sampleLats: Float64Array,
+    sampleLons: Float64Array,
+    successes: Uint32Array,
+    trials: Uint32Array,
+    maxDistance: number | undefined,
+    nBins: number,
+    variogramType: number,
+    estimator: string | undefined,
+    priorAlpha: number | undefined,
+    priorBeta: number | undefined,
+    relWeightEps: number | undefined
+  ) => unknown;
+  export const estimateBinomialPrior: (
+    successes: Uint32Array,
+    trials: Uint32Array
   ) => unknown;
   export const webgpuAvailable: (...args: unknown[]) => Promise<unknown>;
 }

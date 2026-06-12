@@ -8,6 +8,7 @@ import {
   KrigingError,
   OrdinaryKriging,
   BinomialKriging,
+  BinomialTangentPlaneKriging,
   SimpleKriging,
   UniversalKriging,
   ProjectedKriging,
@@ -19,7 +20,9 @@ import {
   SpaceTimeProjectedOrdinaryKriging,
   computeEmpiricalSpaceTimeVariogram,
   fitSpaceTimeVariogram,
+  fitBinomialVariogram,
   fitVariogram,
+  estimateBinomialPrior,
   interpolateOrdinaryToGrid,
   interpolateBinomialToGrid,
   computeEmpiricalVariogram,
@@ -74,12 +77,15 @@ import {
   simulateBinomialSpaceTimeGridEnsembleAtDate,
   simulateBinomialSpaceTimeGridSummary,
   simulateBinomialSpaceTimeGridSummaryAtDate,
+  smoothedLogits,
   aggregatePrevalenceByPolygon,
+  binomialPreprocess,
   polygonCellsFromMask,
   evaluateNestedVariogram,
   VariogramType,
   type OrdinaryPrediction,
   type BinomialPrediction,
+  type FittedVariogram,
   type VariogramTypeName,
 } from "../dist/index.js";
 
@@ -400,7 +406,24 @@ describe("Binomial kriging", () => {
   const sill = 1.0;
   const range = 100;
 
-  test("BinomialKriging predict returns prevalence, logitValue, variance", () => {
+  test("binomialPreprocess logits match smoothedLogits; variances positive", () => {
+    const successes = [2, 4, 3, 5];
+    const trials = [10, 10, 10, 10];
+    const prior = { alpha: 1, beta: 1 };
+    const { logits, logitVariances } = binomialPreprocess({
+      successes,
+      trials,
+      prior,
+    });
+    const direct = smoothedLogits(successes, trials, prior);
+    expect(logits.length).toBe(direct.length);
+    for (let i = 0; i < logits.length; i++) {
+      expect(logits[i]).toBeCloseTo(direct[i]!, 12);
+      expect(logitVariances[i]).toBeGreaterThan(0);
+    }
+  });
+
+  test("BinomialKriging predict returns prevalence median/mean, logit, logitVariance", () => {
     const model = new BinomialKriging({
       lats,
       lons,
@@ -410,14 +433,131 @@ describe("Binomial kriging", () => {
     });
     const pred = model.predict(0.5, 0.5);
     expect(pred).toMatchObject({
-      prevalence: expect.any(Number),
-      logitValue: expect.any(Number),
-      variance: expect.any(Number),
+      prevalenceMedian: expect.any(Number),
+      prevalenceMean: expect.any(Number),
+      logit: expect.any(Number),
+      logitVariance: expect.any(Number),
+      prevalenceVariance: expect.any(Number),
     });
-    expect(pred.prevalence).toBeGreaterThanOrEqual(0);
-    expect(pred.prevalence).toBeLessThanOrEqual(1);
-    expect(pred.variance).toBeGreaterThanOrEqual(0);
+    expect(pred.prevalenceMedian).toBeGreaterThanOrEqual(0);
+    expect(pred.prevalenceMedian).toBeLessThanOrEqual(1);
+    expect(pred.logitVariance).toBeGreaterThanOrEqual(0);
     model.free();
+  });
+
+  test("BinomialKriging diagnostics bundles variogram, buildNotes, optional LOO MSDR", () => {
+    const model = new BinomialKriging({
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram: { variogramType, nugget, sill, range },
+    });
+    try {
+      const d0 = model.diagnostics();
+      expect(d0.variogram.variogramType).toBe("exponential");
+      expect(d0.variogram.nugget).toBeCloseTo(nugget, 5);
+      expect(d0.variogram.sill).toBeCloseTo(sill, 5);
+      expect(d0.variogram.range).toBeCloseTo(range, 5);
+      expect(d0.buildNotes.logitInflation).toBe(model.buildNotes.logitInflation);
+      expect(d0.logitLooMsdr).toBeUndefined();
+      const d1 = model.diagnostics({ lats, lons, successes, trials });
+      expect(typeof d1.logitLooMsdr).toBe("number");
+      expect(Number.isFinite(d1.logitLooMsdr!)).toBe(true);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("BinomialKriging accepts stability permissive preset", () => {
+    const model = new BinomialKriging({
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram: { variogramType, nugget, sill, range },
+      stability: "permissive",
+    });
+    try {
+      expect(
+        Number.isFinite(model.predict(0.5, 0.5).prevalenceMedian)
+      ).toBe(true);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("BinomialKriging oneStepLaplaceObservationVariance sets calibrationVersion 3", () => {
+    const model = new BinomialKriging({
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram: { variogramType, nugget, sill, range },
+      oneStepLaplaceObservationVariance: true,
+    });
+    try {
+      expect(model.buildNotes.calibrationVersion).toBe(3);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("BinomialTangentPlaneKriging builds with isotropic tangent plane", () => {
+    const model = new BinomialTangentPlaneKriging({
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram: { variogramType, nugget, sill, range },
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+    });
+    try {
+      expect(
+        model.buildNotes.warnings.some((w) =>
+          w.includes("tangent_plane_equirectangular")
+        )
+      ).toBe(true);
+      expect(Number.isFinite(model.predict(0.5, 0.5).prevalenceMedian)).toBe(true);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("BinomialTangentPlaneKriging diagnostics bundles variogram, buildNotes, optional LOO MSDR", () => {
+    const model = new BinomialTangentPlaneKriging({
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram: { variogramType, nugget, sill, range },
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+    });
+    try {
+      const d0 = model.diagnostics();
+      expect(d0.variogram.variogramType).toBe("exponential");
+      expect(d0.buildNotes.logitInflation).toBe(model.buildNotes.logitInflation);
+      expect(d0.logitLooMsdr).toBeUndefined();
+      const d1 = model.diagnostics({ lats, lons, successes, trials });
+      expect(typeof d1.logitLooMsdr).toBe("number");
+      expect(Number.isFinite(d1.logitLooMsdr!)).toBe(true);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("BinomialKriging rejects unknown stability preset", () => {
+    const bad = {
+      lats,
+      lons,
+      successes,
+      trials,
+      variogram: { variogramType, nugget, sill, range },
+      stability: "nope",
+    } as unknown as import("../dist/index.js").BinomialKrigingOptions;
+    expect(() => new BinomialKriging(bad)).toThrow(KrigingError);
   });
 
   test("BinomialKriging predictBatch returns array of predictions", () => {
@@ -432,9 +572,9 @@ describe("Binomial kriging", () => {
     expect(Array.isArray(out)).toBe(true);
     expect(out.length).toBe(2);
     out.forEach((p: BinomialPrediction) => {
-      expect(p.prevalence).toBeGreaterThanOrEqual(0);
-      expect(p.prevalence).toBeLessThanOrEqual(1);
-      expect(p.variance).toBeGreaterThanOrEqual(0);
+      expect(p.prevalenceMedian).toBeGreaterThanOrEqual(0);
+      expect(p.prevalenceMedian).toBeLessThanOrEqual(1);
+      expect(p.logitVariance).toBeGreaterThanOrEqual(0);
     });
     model.free();
   });
@@ -448,10 +588,12 @@ describe("Binomial kriging", () => {
       variogram: { variogramType, nugget, sill, range },
     });
     const out = model.predictBatchArrays([0.25, 0.5], [0.25, 0.5]);
-    expect(out.prevalences).toBeInstanceOf(Float64Array);
+    expect(out.prevalenceMedians).toBeInstanceOf(Float64Array);
+    expect(out.prevalenceMeans).toBeInstanceOf(Float64Array);
     expect(out.logitValues).toBeInstanceOf(Float64Array);
-    expect(out.variances).toBeInstanceOf(Float64Array);
-    expect(out.prevalences.length).toBe(2);
+    expect(out.logitVariances).toBeInstanceOf(Float64Array);
+    expect(out.prevalenceVariances).toBeInstanceOf(Float64Array);
+    expect(out.prevalenceMedians.length).toBe(2);
     model.free();
   });
 
@@ -467,9 +609,9 @@ describe("Binomial kriging", () => {
       prior: { alpha, beta },
     });
     const pred = model.predict(0.5, 0.5);
-    expect(Number.isFinite(pred.prevalence)).toBe(true);
-    expect(pred.prevalence).toBeGreaterThanOrEqual(0);
-    expect(pred.prevalence).toBeLessThanOrEqual(1);
+    expect(Number.isFinite(pred.prevalenceMedian)).toBe(true);
+    expect(pred.prevalenceMedian).toBeGreaterThanOrEqual(0);
+    expect(pred.prevalenceMedian).toBeLessThanOrEqual(1);
     model.free();
   });
 
@@ -502,9 +644,9 @@ describe("Binomial kriging", () => {
       xCells: 2,
       yCells: 2,
     });
-    expect(out.prevalences.length).toBe(2);
-    expect(out.prevalences[0].length).toBe(2);
-    expect(out.variances.length).toBe(2);
+    expect(out.prevalenceMedians.length).toBe(2);
+    expect(out.prevalenceMedians[0].length).toBe(2);
+    expect(out.logitVariances.length).toBe(2);
     model.free();
   });
 
@@ -523,19 +665,27 @@ describe("Binomial kriging", () => {
       variogramType: "exponential",
       nBins: 12,
     });
-    expect(out.prevalences.length).toBe(2);
-    expect(out.prevalences[0].length).toBe(2);
-    expect(out.variances.length).toBe(2);
-    expect(Number.isFinite(out.prevalences[0][0])).toBe(true);
+    expect(out.prevalenceMedians.length).toBe(2);
+    expect(out.prevalenceMedians[0].length).toBe(2);
+    expect(out.logitVariances.length).toBe(2);
+    expect(Number.isFinite(out.prevalenceMedians[0][0])).toBe(true);
     expect(out.fittedVariogram.variogramType).toBe("exponential");
     expect(Number.isFinite(out.fittedVariogram.range)).toBe(true);
     expect(out.cv).toBeUndefined();
-    expect(out.buildNotes.calibrationVersion).toBeGreaterThanOrEqual(1);
+    expect(Array.isArray(out.buildNotes.warnings)).toBe(true);
     expect(out.buildNotes.prior.alpha).toBe(1);
     expect(out.buildNotes.prior.beta).toBe(1);
   });
 
-  test("interpolateBinomialToGrid fits on smoothed logits (matches manual pipeline)", () => {
+  test("interpolateBinomialToGrid matches fitBinomialVariogram + fromFittedVariogram pipeline", () => {
+    const fitted = fitBinomialVariogram({
+      sampleLats: lats,
+      sampleLons: lons,
+      successes,
+      trials,
+      variogramType: "exponential",
+      nBins: 12,
+    });
     const out = interpolateBinomialToGrid({
       lats,
       lons,
@@ -551,25 +701,12 @@ describe("Binomial kriging", () => {
       nBins: 12,
     });
 
-    const ALPHA = 1;
-    const BETA = 1;
-    const manualLogits = successes.map((s, i) => {
-      const p = (s + ALPHA) / (trials[i] + ALPHA + BETA);
-      return Math.log(p / (1 - p));
-    });
-    const manualFit = fitVariogram({
-      sampleLats: lats,
-      sampleLons: lons,
-      values: manualLogits,
-      variogramType: "exponential",
-      nBins: 12,
-    });
     const manualModel = BinomialKriging.fromFittedVariogram({
       lats,
       lons,
       successes,
       trials,
-      fittedVariogram: manualFit,
+      fittedVariogram: fitted,
     });
     try {
       const manualGrid = manualModel.predictGrid({
@@ -582,8 +719,8 @@ describe("Binomial kriging", () => {
       });
       for (let j = 0; j < 2; j++) {
         for (let i = 0; i < 2; i++) {
-          expect(out.prevalences[j][i]).toBeCloseTo(
-            manualGrid.prevalences[j][i],
+          expect(out.prevalenceMedians[j][i]).toBeCloseTo(
+            manualGrid.prevalenceMedians[j][i],
             12
           );
           expect(out.logitValues[j][i]).toBeCloseTo(
@@ -592,9 +729,9 @@ describe("Binomial kriging", () => {
           );
         }
       }
-      expect(out.fittedVariogram.nugget).toBeCloseTo(manualFit.nugget, 12);
-      expect(out.fittedVariogram.sill).toBeCloseTo(manualFit.sill, 12);
-      expect(out.fittedVariogram.range).toBeCloseTo(manualFit.range, 12);
+      expect(out.fittedVariogram.nugget).toBeCloseTo(fitted.nugget, 12);
+      expect(out.fittedVariogram.sill).toBeCloseTo(fitted.sill, 12);
+      expect(out.fittedVariogram.range).toBeCloseTo(fitted.range, 12);
       expect(out.buildNotes.prior.alpha).toBe(1);
       expect(out.buildNotes.prior.beta).toBe(1);
     } finally {
@@ -602,8 +739,17 @@ describe("Binomial kriging", () => {
     }
   });
 
-  test("interpolateBinomialToGrid honors estimator option", () => {
-    const classical = interpolateBinomialToGrid({
+  test("estimateBinomialPrior returns finite positive alpha and beta", () => {
+    const est = estimateBinomialPrior({ successes, trials });
+    expect(est.alpha).toBeGreaterThan(0);
+    expect(est.beta).toBeGreaterThan(0);
+    expect(Number.isFinite(est.alpha)).toBe(true);
+    expect(Number.isFinite(est.beta)).toBe(true);
+  });
+
+  test("interpolateBinomialToGrid prior auto matches estimateBinomialPrior", () => {
+    const expected = estimateBinomialPrior({ successes, trials });
+    const out = interpolateBinomialToGrid({
       lats,
       lons,
       successes,
@@ -616,24 +762,24 @@ describe("Binomial kriging", () => {
       yCells: 2,
       variogramType: "exponential",
       nBins: 12,
+      prior: "auto",
     });
-    const robust = interpolateBinomialToGrid({
-      lats,
-      lons,
-      successes,
-      trials,
-      west: 0,
-      south: 0,
-      east: 1,
-      north: 1,
-      xCells: 2,
-      yCells: 2,
-      variogramType: "exponential",
-      nBins: 12,
-      estimator: "cressie-hawkins",
-    });
-    expect(Number.isFinite(robust.fittedVariogram.range)).toBe(true);
-    expect(Number.isFinite(classical.fittedVariogram.range)).toBe(true);
+    expect(out.buildNotes.prior.alpha).toBeCloseTo(expected.alpha, 12);
+    expect(out.buildNotes.prior.beta).toBeCloseTo(expected.beta, 12);
+  });
+
+  test("fitBinomialVariogram rejects non-classical estimator", () => {
+    expect(() =>
+      fitBinomialVariogram({
+        sampleLats: lats,
+        sampleLons: lons,
+        successes,
+        trials,
+        variogramType: "exponential",
+        nBins: 12,
+        estimator: "cressie-hawkins",
+      })
+    ).toThrow(KrigingError);
   });
 
   test("interpolateBinomialToGrid with withCv returns CV summary on both scales", () => {
@@ -657,6 +803,9 @@ describe("Binomial kriging", () => {
     expect(out.cv?.nEvaluated).toBeLessThanOrEqual(lats.length);
     expect(Number.isFinite(out.cv?.logit.rmse)).toBe(true);
     expect(Number.isFinite(out.cv?.prevalence.rmse)).toBe(true);
+    expect(out.cv?.calibrationBins.length).toBe(10);
+    expect(Number.isFinite(out.cv?.brier)).toBe(true);
+    expect(Number.isFinite(out.cv?.logScorePerTrial)).toBe(true);
   });
 
   test("interpolateBinomialToGrid with withCv {k} runs k-fold CV", () => {
@@ -695,9 +844,9 @@ describe("Binomial kriging", () => {
       fittedVariogram: fit,
     });
     const pred = model.predict(0.5, 0.5);
-    expect(Number.isFinite(pred.prevalence)).toBe(true);
-    expect(pred.prevalence).toBeGreaterThanOrEqual(0);
-    expect(pred.prevalence).toBeLessThanOrEqual(1);
+    expect(Number.isFinite(pred.prevalenceMedian)).toBe(true);
+    expect(pred.prevalenceMedian).toBeGreaterThanOrEqual(0);
+    expect(pred.prevalenceMedian).toBeLessThanOrEqual(1);
     model.free();
   });
 
@@ -718,9 +867,9 @@ describe("Binomial kriging", () => {
       prior: { alpha: 1, beta: 1 },
     });
     const pred = model.predict(0.5, 0.5);
-    expect(Number.isFinite(pred.prevalence)).toBe(true);
-    expect(pred.prevalence).toBeGreaterThanOrEqual(0);
-    expect(pred.prevalence).toBeLessThanOrEqual(1);
+    expect(Number.isFinite(pred.prevalenceMedian)).toBe(true);
+    expect(pred.prevalenceMedian).toBeGreaterThanOrEqual(0);
+    expect(pred.prevalenceMedian).toBeLessThanOrEqual(1);
     model.free();
   });
 });
@@ -967,11 +1116,35 @@ describe("Projected binomial kriging", () => {
     });
     try {
       const pred = model.predict(500, 500);
-      expect(Number.isFinite(pred.prevalence)).toBe(true);
-      expect(Number.isFinite(pred.logitValue)).toBe(true);
-      expect(pred.prevalence).toBeGreaterThanOrEqual(0);
-      expect(pred.prevalence).toBeLessThanOrEqual(1);
-      expect(pred.variance).toBeGreaterThanOrEqual(0);
+      expect(Number.isFinite(pred.prevalenceMedian)).toBe(true);
+      expect(Number.isFinite(pred.logit)).toBe(true);
+      expect(pred.prevalenceMedian).toBeGreaterThanOrEqual(0);
+      expect(pred.prevalenceMedian).toBeLessThanOrEqual(1);
+      expect(pred.logitVariance).toBeGreaterThanOrEqual(0);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("BinomialProjectedKriging diagnostics bundles variogram, buildNotes, optional LOO MSDR", () => {
+    const model = new BinomialProjectedKriging({
+      xs,
+      ys,
+      successes,
+      trials,
+      variogram,
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+    });
+    try {
+      const d0 = model.diagnostics();
+      expect(d0.variogram.variogramType).toBe("exponential");
+      expect(d0.variogram.range).toBeCloseTo(variogram.range, 5);
+      expect(d0.buildNotes.logitInflation).toBe(model.buildNotes.logitInflation);
+      expect(d0.logitLooMsdr).toBeUndefined();
+      const d1 = model.diagnostics({ xs, ys, successes, trials });
+      expect(typeof d1.logitLooMsdr).toBe("number");
+      expect(Number.isFinite(d1.logitLooMsdr!)).toBe(true);
     } finally {
       model.free();
     }
@@ -992,14 +1165,77 @@ describe("Projected binomial kriging", () => {
       const batch = model.predictBatch(targets.xs, targets.ys);
       const arrays = model.predictBatchArrays(targets.xs, targets.ys);
       expect(batch).toHaveLength(2);
-      expect(arrays.prevalences).toBeInstanceOf(Float64Array);
+      expect(arrays.prevalenceMedians).toBeInstanceOf(Float64Array);
       expect(arrays.logitValues).toBeInstanceOf(Float64Array);
-      expect(arrays.variances).toBeInstanceOf(Float64Array);
+      expect(arrays.logitVariances).toBeInstanceOf(Float64Array);
       for (let i = 0; i < 2; i++) {
-        expect(arrays.prevalences[i]).toBeCloseTo(batch[i].prevalence, 6);
-        expect(arrays.logitValues[i]).toBeCloseTo(batch[i].logitValue, 6);
-        expect(arrays.variances[i]).toBeCloseTo(batch[i].variance, 6);
+        expect(arrays.prevalenceMedians[i]).toBeCloseTo(batch[i].prevalenceMedian, 6);
+        expect(arrays.logitValues[i]).toBeCloseTo(batch[i].logit, 6);
+        expect(arrays.logitVariances[i]).toBeCloseTo(batch[i].logitVariance, 6);
       }
+    } finally {
+      model.free();
+    }
+  });
+
+  test("BinomialProjectedKriging.fromFittedVariogram matches explicit variogram params", () => {
+    const fitted: FittedVariogram = {
+      variogramType: "exponential",
+      nugget: variogram.nugget,
+      sill: variogram.sill,
+      range: variogram.range,
+      residuals: 0.01,
+    };
+    const fromFitted = BinomialProjectedKriging.fromFittedVariogram({
+      xs,
+      ys,
+      successes,
+      trials,
+      fittedVariogram: fitted,
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+    });
+    const baseline = new BinomialProjectedKriging({
+      xs,
+      ys,
+      successes,
+      trials,
+      variogram,
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+    });
+    try {
+      const a = fromFitted.predict(500, 500);
+      const b = baseline.predict(500, 500);
+      expect(a.prevalenceMedian).toBeCloseTo(b.prevalenceMedian, 10);
+    } finally {
+      fromFitted.free();
+      baseline.free();
+    }
+  });
+
+  test("BinomialProjectedKriging.predictGrid returns shaped prevalence grids", () => {
+    const model = new BinomialProjectedKriging({
+      xs,
+      ys,
+      successes,
+      trials,
+      variogram,
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+    });
+    try {
+      const grid = model.predictGrid({
+        xMin: 0,
+        xMax: 1000,
+        yMin: 0,
+        yMax: 1000,
+        xCells: 4,
+        yCells: 3,
+      });
+      expect(grid.prevalenceMedians.length).toBe(3);
+      expect(grid.prevalenceMedians[0].length).toBe(4);
+      expect(Number.isFinite(grid.prevalenceMedians[1][2])).toBe(true);
     } finally {
       model.free();
     }
@@ -1027,12 +1263,30 @@ describe("Projected binomial kriging", () => {
     try {
       for (const m of [withPrior, fromLogits]) {
         const pred = m.predict(500, 500);
-        expect(pred.prevalence).toBeGreaterThanOrEqual(0);
-        expect(pred.prevalence).toBeLessThanOrEqual(1);
+        expect(pred.prevalenceMedian).toBeGreaterThanOrEqual(0);
+        expect(pred.prevalenceMedian).toBeLessThanOrEqual(1);
       }
     } finally {
       withPrior.free();
       fromLogits.free();
+    }
+  });
+
+  test("BinomialProjectedKriging.fromPrecomputedLogitsWithVariances builds", () => {
+    const fromFcVar = BinomialProjectedKriging.fromPrecomputedLogitsWithVariances({
+      xs,
+      ys,
+      logits: [-1.2, 0.3, -0.9, 0.6],
+      logitObservationVariance: [0.05, 0.05, 0.05, 0.05],
+      variogram,
+      majorAngleDeg: 0,
+      rangeRatio: 1,
+    });
+    try {
+      const pred = fromFcVar.predict(500, 500);
+      expect(Number.isFinite(pred.prevalenceMedian)).toBe(true);
+    } finally {
+      fromFcVar.free();
     }
   });
 
@@ -1954,8 +2208,8 @@ describe("Binomial kriging: fromPrecomputedLogits", () => {
     });
     try {
       const pred = model.predict(0.5, 0.5);
-      expect(pred.prevalence).toBeGreaterThanOrEqual(0);
-      expect(pred.prevalence).toBeLessThanOrEqual(1);
+      expect(pred.prevalenceMedian).toBeGreaterThanOrEqual(0);
+      expect(pred.prevalenceMedian).toBeLessThanOrEqual(1);
     } finally {
       model.free();
     }
@@ -1967,6 +2221,53 @@ describe("Binomial kriging: fromPrecomputedLogits", () => {
         lats: [0, 0, 1],
         lons: [0, 1, 0],
         logits: [0, Number.POSITIVE_INFINITY, 1],
+        variogram: {
+          variogramType: "exponential",
+          nugget: 0.05,
+          sill: 1,
+          range: 500,
+        },
+      })
+    ).toThrow(KrigingError);
+  });
+});
+
+describe("Binomial kriging: fromPrecomputedLogitsWithVariances", () => {
+  test("builds and records optional prior on build notes", () => {
+    const lats = [0, 0, 1, 1];
+    const lons = [0, 1, 0, 1];
+    const logits = [-1.5, 0.0, 0.5, 1.5];
+    const logitObservationVariance = [0.02, 0.02, 0.02, 0.02];
+    const model = BinomialKriging.fromPrecomputedLogitsWithVariances({
+      lats,
+      lons,
+      logits,
+      logitObservationVariance,
+      variogram: {
+        variogramType: "exponential",
+        nugget: 0.05,
+        sill: 1,
+        range: 500,
+      },
+      prior: { alpha: 2, beta: 5 },
+    });
+    try {
+      expect(model.buildNotes.prior.alpha).toBe(2);
+      expect(model.buildNotes.prior.beta).toBe(5);
+      const pred = model.predict(0.5, 0.5);
+      expect(Number.isFinite(pred.prevalenceMedian)).toBe(true);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("rejects logitObservationVariance length mismatch", () => {
+    expect(() =>
+      BinomialKriging.fromPrecomputedLogitsWithVariances({
+        lats: [0, 0, 1],
+        lons: [0, 1, 0],
+        logits: [0, 1, 0],
+        logitObservationVariance: [0.1, 0.1],
         variogram: {
           variogramType: "exponential",
           nugget: 0.05,
@@ -2149,13 +2450,110 @@ describe("Space-time kriging", () => {
       variogram,
     });
     try {
-      const { prevalence, logitValue, variance, prevalenceVariance } =
-        model.predict(0.5, 0.5, 0.5);
-      expect(prevalence).toBeGreaterThan(0);
-      expect(prevalence).toBeLessThan(1);
-      expect(Number.isFinite(logitValue)).toBe(true);
-      expect(variance).toBeGreaterThanOrEqual(0);
+      const {
+        prevalenceMedian,
+        prevalenceMean,
+        logit,
+        logitVariance,
+        prevalenceVariance,
+      } = model.predict(0.5, 0.5, 0.5);
+      expect(prevalenceMedian).toBeGreaterThan(0);
+      expect(prevalenceMedian).toBeLessThan(1);
+      expect(Number.isFinite(prevalenceMean)).toBe(true);
+      expect(Number.isFinite(logit)).toBe(true);
+      expect(logitVariance).toBeGreaterThanOrEqual(0);
       expect(prevalenceVariance).toBeGreaterThanOrEqual(0);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("SpaceTimeBinomialKriging diagnostics bundles space-time variogram, buildNotes, optional LOO MSDR", () => {
+    const model = new SpaceTimeBinomialKriging({
+      lats,
+      lons,
+      times,
+      successes,
+      trials,
+      variogram,
+    });
+    try {
+      const d0 = model.diagnostics();
+      expect(d0.variogram.family).toBe("separable");
+      expect(d0.variogram.spatial.variogramType).toBe("exponential");
+      expect(d0.buildNotes.logitInflation).toBe(model.buildNotes.logitInflation);
+      expect(d0.logitLooMsdr).toBeUndefined();
+      const d1 = model.diagnostics({
+        lats,
+        lons,
+        times,
+        successes,
+        trials,
+      });
+      expect(typeof d1.logitLooMsdr).toBe("number");
+      expect(Number.isFinite(d1.logitLooMsdr!)).toBe(true);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("SpaceTimeBinomialKriging.newWithPrior records prior on buildNotes", () => {
+    const model = SpaceTimeBinomialKriging.newWithPrior({
+      lats,
+      lons,
+      times,
+      successes,
+      trials,
+      variogram,
+      prior: { alpha: 3, beta: 7 },
+    });
+    try {
+      expect(model.buildNotes.prior.alpha).toBe(3);
+      expect(model.buildNotes.prior.beta).toBe(7);
+      const p = model.predict(0.5, 0.5, 0.5);
+      expect(Number.isFinite(p.prevalenceMedian)).toBe(true);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("SpaceTimeBinomialKriging.fromPrecomputedLogits builds and flags notes", () => {
+    const prior = { alpha: 1, beta: 1 };
+    const logits = smoothedLogits(successes, trials, prior);
+    const model = SpaceTimeBinomialKriging.fromPrecomputedLogits({
+      lats,
+      lons,
+      times,
+      logits,
+      variogram,
+    });
+    try {
+      expect(model.buildNotes.fromPrecomputedLogitsOnly).toBe(true);
+      const p = model.predict(0.5, 0.5, 0.5);
+      expect(Number.isFinite(p.prevalenceMedian)).toBe(true);
+      expect(p.prevalenceMedian).toBeGreaterThan(0);
+      expect(p.prevalenceMedian).toBeLessThan(1);
+    } finally {
+      model.free();
+    }
+  });
+
+  test("SpaceTimeBinomialKriging.fromPrecomputedLogitsWithVariances builds", () => {
+    const prior = { alpha: 1, beta: 1 };
+    const logits = smoothedLogits(successes, trials, prior);
+    const logitObservationVariance = logits.map(() => 0.04);
+    const model = SpaceTimeBinomialKriging.fromPrecomputedLogitsWithVariances({
+      lats,
+      lons,
+      times,
+      logits,
+      logitObservationVariance,
+      variogram,
+    });
+    try {
+      expect(model.buildNotes.fromPrecomputedLogitsOnly).toBe(false);
+      const p = model.predict(0.5, 0.5, 0.5);
+      expect(Number.isFinite(p.prevalenceMedian)).toBe(true);
     } finally {
       model.free();
     }
@@ -2364,16 +2762,16 @@ describe("Space-time kriging", () => {
         yCells: 2,
         time: 0.5,
       });
-      expect(grid.prevalences.length).toBe(2);
-      expect(grid.prevalences[0].length).toBe(2);
+      expect(grid.prevalenceMedians.length).toBe(2);
+      expect(grid.prevalenceMedians[0].length).toBe(2);
       expect(grid.logitValues.length).toBe(2);
-      expect(grid.variances.length).toBe(2);
+      expect(grid.logitVariances.length).toBe(2);
       expect(grid.prevalenceVariances.length).toBe(2);
       for (let j = 0; j < 2; j++) {
         for (let i = 0; i < 2; i++) {
-          expect(grid.prevalences[j][i]).toBeGreaterThanOrEqual(0);
-          expect(grid.prevalences[j][i]).toBeLessThanOrEqual(1);
-          expect(grid.variances[j][i]).toBeGreaterThanOrEqual(0);
+          expect(grid.prevalenceMedians[j][i]).toBeGreaterThanOrEqual(0);
+          expect(grid.prevalenceMedians[j][i]).toBeLessThanOrEqual(1);
+          expect(grid.logitVariances[j][i]).toBeGreaterThanOrEqual(0);
         }
       }
     } finally {
@@ -2396,9 +2794,9 @@ describe("Space-time kriging", () => {
       const date = new Date(12 * 3_600_000); // 0.5 days after epoch
       const fromDate = model.predictAtDate(0.5, 0.5, date);
       const fromTime = model.predict(0.5, 0.5, 0.5);
-      expect(fromDate.prevalence).toBeCloseTo(fromTime.prevalence, 12);
-      expect(fromDate.logitValue).toBeCloseTo(fromTime.logitValue, 12);
-      expect(fromDate.variance).toBeCloseTo(fromTime.variance, 12);
+      expect(fromDate.prevalenceMedian).toBeCloseTo(fromTime.prevalenceMedian, 12);
+      expect(fromDate.logit).toBeCloseTo(fromTime.logit, 12);
+      expect(fromDate.logitVariance).toBeCloseTo(fromTime.logitVariance, 12);
     } finally {
       model.free();
     }
@@ -2431,9 +2829,9 @@ describe("Space-time kriging", () => {
       );
       const direct = model.predictBatchArrays([0.5, 0.5], [0.5, 0.5], [12, 12]);
       for (let i = 0; i < 2; i++) {
-        expect(fromDates[i].prevalence).toBeCloseTo(direct.prevalences[i], 12);
-        expect(fromArrays.prevalences[i]).toBeCloseTo(
-          direct.prevalences[i],
+        expect(fromDates[i].prevalenceMedian).toBeCloseTo(direct.prevalenceMedians[i], 12);
+        expect(fromArrays.prevalenceMedians[i]).toBeCloseTo(
+          direct.prevalenceMedians[i],
           12
         );
         expect(fromArrays.logitValues[i]).toBeCloseTo(
@@ -2477,8 +2875,8 @@ describe("Space-time kriging", () => {
       });
       for (let j = 0; j < 2; j++) {
         for (let i = 0; i < 2; i++) {
-          expect(fromDate.prevalences[j][i]).toBeCloseTo(
-            fromTime.prevalences[j][i],
+          expect(fromDate.prevalenceMedians[j][i]).toBeCloseTo(
+            fromTime.prevalenceMedians[j][i],
             12
           );
           expect(fromDate.logitValues[j][i]).toBeCloseTo(

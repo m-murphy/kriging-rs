@@ -6,13 +6,11 @@
 
 import { KrigingError, wrapThrown } from "../errors.js";
 import { toFloat64Array, toUint32Array } from "../internal/convert.js";
-import {
-  fittedToVariogramParamsWithNuggetOverride,
-  reshapeFlatToGrid,
-} from "../internal/grid.js";
+import { reshapeFlatToGrid } from "../internal/grid.js";
 import {
   mapBinomialBatchArrayOutput,
   mapBinomialBuildNotes,
+  mapBinomialDiagnostics,
   mapBinomialPrediction,
   mapBinomialPredictionArray,
 } from "../internal/mappers.js";
@@ -25,13 +23,16 @@ import type {
 import type {
   BinomialBatchArrayOutput,
   BinomialBuildNotes,
+  BinomialDiagnostics,
   BinomialFromPrecomputedLogitsOptions,
+  BinomialFromPrecomputedLogitsWithVariancesOptions,
   BinomialGridOutput,
   BinomialKrigingFromFittedVariogramOptions,
   BinomialKrigingFromFittedVariogramWithPriorOptions,
   BinomialKrigingOptions,
   BinomialKrigingWithPriorOptions,
   BinomialPrediction,
+  IntegerArrayInput,
   NumericArrayInput,
   PredictGridOptions,
 } from "../types.js";
@@ -53,6 +54,10 @@ function toBinomialOptionsWasm(
       range: opts.variogram.range,
       shape: opts.variogram.shape,
     },
+    ...(opts.stability !== undefined ? { stability: opts.stability } : {}),
+    ...(opts.oneStepLaplaceObservationVariance === true
+      ? { oneStepLaplaceObservationVariance: true }
+      : {}),
   };
 }
 
@@ -66,6 +71,7 @@ function toBinomialWithPriorOptionsWasm(
       successes: opts.successes,
       trials: opts.trials,
       variogram: opts.variogram,
+      stability: opts.stability,
     }),
     prior: { alpha: opts.prior.alpha, beta: opts.prior.beta },
   };
@@ -100,7 +106,9 @@ export class BinomialKriging {
         options.variogram.nugget,
         options.variogram.sill,
         options.variogram.range,
-        options.variogram.shape
+        options.variogram.shape,
+        options.stability,
+        options.oneStepLaplaceObservationVariance
       );
     } catch (e) {
       throw wrapThrown(e);
@@ -149,6 +157,43 @@ export class BinomialKriging {
   }
 
   /**
+   * Like {@link BinomialKriging.fromPrecomputedLogits}, with a per-site **logit observation
+   * variance** vector (diagonal). Optional `prior` sets the Beta prior recorded in build notes.
+   */
+  static fromPrecomputedLogitsWithVariances(
+    options: BinomialFromPrecomputedLogitsWithVariancesOptions
+  ): BinomialKriging {
+    const mod = requireLoadedModule();
+    const ctor = mod.WasmBinomialKriging;
+    const instance = Object.create(
+      BinomialKriging.prototype
+    ) as BinomialKriging;
+    const priorAlpha = options.prior?.alpha;
+    const priorBeta = options.prior?.beta;
+    try {
+      (instance as unknown as { inner: WasmBinomialInstance | null }).inner =
+        ctor.fromPrecomputedLogitsWithVariances(
+          toFloat64Array(options.lats),
+          toFloat64Array(options.lons),
+          toFloat64Array(options.logits),
+          toFloat64Array(options.logitObservationVariance),
+          options.variogram.variogramType,
+          options.variogram.nugget,
+          options.variogram.sill,
+          options.variogram.range,
+          options.variogram.shape,
+          priorAlpha,
+          priorBeta,
+          options.stability,
+          options.oneStepLaplaceObservationVariance
+        );
+    } catch (e) {
+      throw wrapThrown(e);
+    }
+    return instance;
+  }
+
+  /**
    * Create a binomial kriging model with a Beta(alpha, beta) prior on prevalence.
    * Useful when counts are small or some locations have zero trials.
    *
@@ -175,9 +220,10 @@ export class BinomialKriging {
   }
 
   /**
-   * Build a binomial kriging model from count data and a fitted variogram (e.g. from
-   * fitting on logits or reusing ordinary-fit params). Avoids manually spreading
-   * variogram fields.
+   * Build a binomial kriging model from count data and a fitted variogram. Prefer
+   * {@link fitBinomialVariogram} on the same `successes` / `trials` (and matching
+   * `prior` when using {@link BinomialKriging.fromFittedVariogramWithPrior}) so the
+   * fit uses the calibrated binomial empirical variogram aligned with this model.
    *
    * @param options - Sample lats, lons, successes, trials, and a {@link FittedVariogram}.
    * @returns A new BinomialKriging instance.
@@ -191,15 +237,24 @@ export class BinomialKriging {
       lons: options.lons,
       successes: options.successes,
       trials: options.trials,
-      variogram: fittedToVariogramParamsWithNuggetOverride(
-        options.fittedVariogram,
-        options.nuggetOverride
-      ),
+      variogram: {
+        variogramType: options.fittedVariogram.variogramType,
+        nugget: options.fittedVariogram.nugget,
+        sill: options.fittedVariogram.sill,
+        range: options.fittedVariogram.range,
+        shape: options.fittedVariogram.shape,
+      },
+      ...(options.stability !== undefined ? { stability: options.stability } : {}),
+      ...(options.oneStepLaplaceObservationVariance === true
+        ? { oneStepLaplaceObservationVariance: true }
+        : {}),
     });
   }
 
   /**
    * Build a binomial kriging model with a Beta prior from count data and a fitted variogram.
+   * Prefer {@link fitBinomialVariogram} with the same `prior` as here so variogram
+   * fitting matches the kriger’s shrinkage and observation variances.
    *
    * @param options - Sample lats, lons, successes, trials, a {@link FittedVariogram}, and prior { alpha, beta }.
    * @returns A new BinomialKriging instance.
@@ -213,11 +268,18 @@ export class BinomialKriging {
       lons: options.lons,
       successes: options.successes,
       trials: options.trials,
-      variogram: fittedToVariogramParamsWithNuggetOverride(
-        options.fittedVariogram,
-        options.nuggetOverride
-      ),
+      variogram: {
+        variogramType: options.fittedVariogram.variogramType,
+        nugget: options.fittedVariogram.nugget,
+        sill: options.fittedVariogram.sill,
+        range: options.fittedVariogram.range,
+        shape: options.fittedVariogram.shape,
+      },
       prior: options.prior,
+      ...(options.stability !== undefined ? { stability: options.stability } : {}),
+      ...(options.oneStepLaplaceObservationVariance === true
+        ? { oneStepLaplaceObservationVariance: true }
+        : {}),
     });
   }
 
@@ -239,12 +301,48 @@ export class BinomialKriging {
   }
 
   /**
-   * Build-time diagnostics (prior, dropped zero-trial rows, logit inflation, …).
-   * Matches the JSON from WASM `getBuildNotes`.
+   * Build-time diagnostics (prior, dropped zero-trial rows, logit inflation, warnings, …).
+   * Backed by WASM `getBuildNotes` JSON (camelCase).
    */
-  getBuildNotes(): BinomialBuildNotes {
+  get buildNotes(): BinomialBuildNotes {
     try {
       return mapBinomialBuildNotes(this.requireInner().getBuildNotes());
+    } catch (e) {
+      throw wrapThrown(e);
+    }
+  }
+
+  /**
+   * Variogram parameters, {@link BinomialBuildNotes}, and optional leave-one-out logit MSDR.
+   *
+   * Pass the same `lats` / `lons` / `successes` / `trials` used to construct the model (after
+   * any zero-trial drops) to populate `logitLooMsdr`; omit to skip LOO.
+   */
+  diagnostics(counts?: {
+    lats: NumericArrayInput;
+    lons: NumericArrayInput;
+    successes: IntegerArrayInput;
+    trials: IntegerArrayInput;
+  }): BinomialDiagnostics {
+    try {
+      const inner = this.requireInner();
+      const getDiagnostics = inner.getDiagnostics;
+      if (typeof getDiagnostics !== "function") {
+        throw new KrigingError(
+          "BinomialKriging.diagnostics requires WASM getDiagnostics (geographic binomial)",
+          { code: "internal_error" }
+        );
+      }
+      const opts: unknown =
+        counts === undefined
+          ? undefined
+          : {
+              lats: toFloat64Array(counts.lats),
+              lons: toFloat64Array(counts.lons),
+              successes: toUint32Array(counts.successes),
+              trials: toUint32Array(counts.trials),
+            };
+      return mapBinomialDiagnostics(getDiagnostics.call(inner, opts));
     } catch (e) {
       throw wrapThrown(e);
     }
@@ -286,7 +384,8 @@ export class BinomialKriging {
    *
    * @param lats - Latitudes in degrees (same length as lons).
    * @param lons - Longitudes in degrees (same length as lats).
-   * @returns Object with `prevalences`, `logitValues`, and `variances` Float64Arrays.
+   * @returns Object with `prevalenceMedians`, `prevalenceMeans`, `logitValues`, `logitVariances`,
+   *   and `prevalenceVariances` Float64Arrays.
    */
   predictBatchArrays(
     lats: NumericArrayInput,
@@ -304,7 +403,8 @@ export class BinomialKriging {
    * but returns prevalences and logit values. Grid shape [yCells][xCells].
    *
    * @param options - west, south, east, north (degrees), xCells, yCells
-   * @returns Object with `prevalences`, `logitValues`, and `variances` as number[][]
+   * @returns Object with prevalence median/mean grids, logits, logit variances, and prevalence
+   *   variance grids as number[][] (shape [yCells][xCells]).
    */
   predictGrid(options: PredictGridOptions): BinomialGridOutput {
     const inner = this.requireInner();
@@ -319,15 +419,17 @@ export class BinomialKriging {
       nRows
     );
     const {
-      prevalences: pFlat,
+      prevalenceMedians: pmFlat,
+      prevalenceMeans: pmeanFlat,
       logitValues: lFlat,
-      variances: vFlat,
+      logitVariances: lvFlat,
       prevalenceVariances: pvFlat,
     } = mapBinomialBatchArrayOutput(out);
     return {
-      prevalences: reshapeFlatToGrid(pFlat, nRows, nCols),
+      prevalenceMedians: reshapeFlatToGrid(pmFlat, nRows, nCols),
+      prevalenceMeans: reshapeFlatToGrid(pmeanFlat, nRows, nCols),
       logitValues: reshapeFlatToGrid(lFlat, nRows, nCols),
-      variances: reshapeFlatToGrid(vFlat, nRows, nCols),
+      logitVariances: reshapeFlatToGrid(lvFlat, nRows, nCols),
       prevalenceVariances: reshapeFlatToGrid(pvFlat, nRows, nCols),
     };
   }

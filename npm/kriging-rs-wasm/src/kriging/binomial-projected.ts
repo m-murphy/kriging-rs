@@ -13,9 +13,11 @@
  */
 import { KrigingError, wrapThrown } from "../errors.js";
 import { toFloat64Array, toUint32Array } from "../internal/convert.js";
+import { reshapeFlatToGrid } from "../internal/grid.js";
 import {
   mapBinomialBatchArrayOutput,
   mapBinomialBuildNotes,
+  mapBinomialDiagnostics,
   mapBinomialPrediction,
   mapBinomialPredictionArray,
 } from "../internal/mappers.js";
@@ -24,11 +26,18 @@ import type { WasmBinomialProjectedInstance } from "../internal/wasm-shapes.js";
 import type {
   BinomialBatchArrayOutput,
   BinomialBuildNotes,
+  BinomialDiagnostics,
+  BinomialGridOutput,
   BinomialPrediction,
   BinomialProjectedFromPrecomputedLogitsOptions,
+  BinomialProjectedFromPrecomputedLogitsWithVariancesOptions,
+  BinomialProjectedKrigingFromFittedVariogramOptions,
+  BinomialProjectedKrigingFromFittedVariogramWithPriorOptions,
   BinomialProjectedKrigingOptions,
   BinomialProjectedKrigingWithPriorOptions,
+  IntegerArrayInput,
   NumericArrayInput,
+  PredictProjectedGridOptions,
 } from "../types.js";
 
 const PROJECTED_BINOMIAL_FREED =
@@ -76,7 +85,9 @@ export class BinomialProjectedKriging {
         options.variogram.range,
         options.variogram.shape,
         options.majorAngleDeg,
-        options.rangeRatio
+        options.rangeRatio,
+        options.stability,
+        options.oneStepLaplaceObservationVariance
       );
     } catch (e) {
       throw wrapThrown(e);
@@ -126,7 +137,9 @@ export class BinomialProjectedKriging {
         options.majorAngleDeg,
         options.rangeRatio,
         options.prior.alpha,
-        options.prior.beta
+        options.prior.beta,
+        options.stability,
+        options.oneStepLaplaceObservationVariance
       );
     } catch (e) {
       throw wrapThrown(e);
@@ -175,6 +188,113 @@ export class BinomialProjectedKriging {
     return instance;
   }
 
+  /**
+   * Like {@link BinomialProjectedKriging.fromPrecomputedLogits}, with per-site logit observation
+   * variances on the diagonal.
+   */
+  static fromPrecomputedLogitsWithVariances(
+    options: BinomialProjectedFromPrecomputedLogitsWithVariancesOptions
+  ): BinomialProjectedKriging {
+    const mod = requireLoadedModule();
+    const ctor = mod.WasmBinomialProjectedKriging;
+    if (!ctor) {
+      throw new KrigingError(
+        "BinomialProjectedKriging is not available; rebuild the WASM package",
+        { code: "backend_unavailable" }
+      );
+    }
+    const instance = Object.create(
+      BinomialProjectedKriging.prototype
+    ) as BinomialProjectedKriging;
+    const priorAlpha = options.prior?.alpha;
+    const priorBeta = options.prior?.beta;
+    try {
+      (
+        instance as unknown as {
+          inner: WasmBinomialProjectedInstance | null;
+        }
+      ).inner = ctor.fromPrecomputedLogitsWithVariances(
+        toFloat64Array(options.xs),
+        toFloat64Array(options.ys),
+        toFloat64Array(options.logits),
+        toFloat64Array(options.logitObservationVariance),
+        options.variogram.variogramType,
+        options.variogram.nugget,
+        options.variogram.sill,
+        options.variogram.range,
+        options.variogram.shape,
+        options.majorAngleDeg,
+        options.rangeRatio,
+        priorAlpha,
+        priorBeta,
+        options.stability,
+        options.oneStepLaplaceObservationVariance
+      );
+    } catch (e) {
+      throw wrapThrown(e);
+    }
+    return instance;
+  }
+
+  /**
+   * Build from count data and a {@link FittedVariogram} (e.g. from {@link fitVariogram} on
+   * planar sample coordinates and logits), without manually spreading nugget/sill/range.
+   */
+  static fromFittedVariogram(
+    options: BinomialProjectedKrigingFromFittedVariogramOptions
+  ): BinomialProjectedKriging {
+    const v = options.fittedVariogram;
+    return new BinomialProjectedKriging({
+      xs: options.xs,
+      ys: options.ys,
+      successes: options.successes,
+      trials: options.trials,
+      variogram: {
+        variogramType: v.variogramType,
+        nugget: v.nugget,
+        sill: v.sill,
+        range: v.range,
+        shape: v.shape,
+      },
+      majorAngleDeg: options.majorAngleDeg,
+      rangeRatio: options.rangeRatio,
+      ...(options.stability !== undefined ? { stability: options.stability } : {}),
+      ...(options.oneStepLaplaceObservationVariance === true
+        ? { oneStepLaplaceObservationVariance: true }
+        : {}),
+    });
+  }
+
+  /**
+   * Like {@link BinomialProjectedKriging.fromFittedVariogram} with an explicit Beta prior
+   * on prevalence.
+   */
+  static fromFittedVariogramWithPrior(
+    options: BinomialProjectedKrigingFromFittedVariogramWithPriorOptions
+  ): BinomialProjectedKriging {
+    const v = options.fittedVariogram;
+    return BinomialProjectedKriging.newWithPrior({
+      xs: options.xs,
+      ys: options.ys,
+      successes: options.successes,
+      trials: options.trials,
+      variogram: {
+        variogramType: v.variogramType,
+        nugget: v.nugget,
+        sill: v.sill,
+        range: v.range,
+        shape: v.shape,
+      },
+      majorAngleDeg: options.majorAngleDeg,
+      rangeRatio: options.rangeRatio,
+      prior: options.prior,
+      ...(options.stability !== undefined ? { stability: options.stability } : {}),
+      ...(options.oneStepLaplaceObservationVariance === true
+        ? { oneStepLaplaceObservationVariance: true }
+        : {}),
+    });
+  }
+
   /** Release WASM-held resources. Safe to call multiple times. */
   free(): void {
     if (this.inner === null) return;
@@ -187,10 +307,44 @@ export class BinomialProjectedKriging {
     this.free();
   }
 
-  /** Build-time diagnostics (prior, dropped rows, logit inflation, …). */
-  getBuildNotes(): BinomialBuildNotes {
+  /** Build-time diagnostics (prior, dropped rows, inflation, warnings, …). */
+  get buildNotes(): BinomialBuildNotes {
     try {
       return mapBinomialBuildNotes(this.requireInner().getBuildNotes());
+    } catch (e) {
+      throw wrapThrown(e);
+    }
+  }
+
+  /**
+   * Variogram, {@link BinomialBuildNotes}, and optional LOO logit MSDR. LOO counts use
+   * `{ xs, ys, successes, trials }` in the same planar units as the fit.
+   */
+  diagnostics(counts?: {
+    xs: NumericArrayInput;
+    ys: NumericArrayInput;
+    successes: IntegerArrayInput;
+    trials: IntegerArrayInput;
+  }): BinomialDiagnostics {
+    try {
+      const inner = this.requireInner();
+      const getDiagnostics = inner.getDiagnostics;
+      if (typeof getDiagnostics !== "function") {
+        throw new KrigingError(
+          "BinomialProjectedKriging.diagnostics requires WASM getDiagnostics",
+          { code: "internal_error" }
+        );
+      }
+      const opts: unknown =
+        counts === undefined
+          ? undefined
+          : {
+              xs: toFloat64Array(counts.xs),
+              ys: toFloat64Array(counts.ys),
+              successes: toUint32Array(counts.successes),
+              trials: toUint32Array(counts.trials),
+            };
+      return mapBinomialDiagnostics(getDiagnostics.call(inner, opts));
     } catch (e) {
       throw wrapThrown(e);
     }
@@ -223,5 +377,37 @@ export class BinomialProjectedKriging {
       toFloat64Array(ys)
     );
     return mapBinomialBatchArrayOutput(out);
+  }
+
+  /**
+   * Predict prevalence on a rectangular `(x, y)` grid in projected units. Result arrays have
+   * shape `[yCells][xCells]` (row = low to high `y`, column = low to high `x`).
+   */
+  predictGrid(options: PredictProjectedGridOptions): BinomialGridOutput {
+    const inner = this.requireInner();
+    const nRows = Math.max(1, Math.floor(options.yCells));
+    const nCols = Math.max(1, Math.floor(options.xCells));
+    const out = inner.predictGridArrays(
+      options.xMin,
+      options.xMax,
+      options.yMin,
+      options.yMax,
+      nCols,
+      nRows
+    );
+    const {
+      prevalenceMedians: pmFlat,
+      prevalenceMeans: pmeanFlat,
+      logitValues: lFlat,
+      logitVariances: lvFlat,
+      prevalenceVariances: pvFlat,
+    } = mapBinomialBatchArrayOutput(out);
+    return {
+      prevalenceMedians: reshapeFlatToGrid(pmFlat, nRows, nCols),
+      prevalenceMeans: reshapeFlatToGrid(pmeanFlat, nRows, nCols),
+      logitValues: reshapeFlatToGrid(lFlat, nRows, nCols),
+      logitVariances: reshapeFlatToGrid(lvFlat, nRows, nCols),
+      prevalenceVariances: reshapeFlatToGrid(pvFlat, nRows, nCols),
+    };
   }
 }

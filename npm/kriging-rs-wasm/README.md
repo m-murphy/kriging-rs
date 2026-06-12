@@ -168,8 +168,8 @@ const batch = fittedModel.predictBatch(lats, lons);
 **Convenience factories (fit → model):** To avoid manually spreading `fitted` fields, use the static factories:
 
 - **Ordinary:** `OrdinaryKriging.fromFitted({ lats, lons, values, fittedVariogram: fitted })`. Optional `nuggetOverride` overrides the fitted nugget (e.g. for a UI-tuned sigma²).
-- **Binomial:** `BinomialKriging.fromFittedVariogram({ lats, lons, successes, trials, fittedVariogram })`. Optional `nuggetOverride` overrides the fitted nugget.
-- **Binomial with prior:** `BinomialKriging.fromFittedVariogramWithPrior({ lats, lons, successes, trials, fittedVariogram, prior: { alpha, beta } })`. Optional `nuggetOverride` overrides the fitted nugget.
+- **Binomial:** `BinomialKriging.fromFittedVariogram({ lats, lons, successes, trials, fittedVariogram })`. Fit counts with `fitBinomialVariogram` so the empirical variogram matches the binomial kriger’s calibrated logit path; then pass that `FittedVariogram` here.
+- **Binomial with prior:** `BinomialKriging.fromFittedVariogramWithPrior({ lats, lons, successes, trials, fittedVariogram, prior: { alpha, beta } })`. Use the same `prior` in `fitBinomialVariogram` as in the model when fitting externally.
 
 Example:
 
@@ -225,9 +225,10 @@ const model = BinomialKriging.newWithPrior({
 
 **Model contract (Rust / wasm consumers):** The default `BinomialKriging` path is
 empirical-Bayes–smoothed logit + **ordinary kriging with per-site logit observation
-variance** (calibrated default) + `logistic`, not a full binomial-likelihood field
-model. `getBuildNotes()` returns `BinomialBuildNotes` (version, prior, logit
-inflation, etc.); rows with `trials === 0` are dropped. See
+variance** (Laplace / Fisher on the smoothed proportion by default) + predictive
+prevalence summaries, not a full binomial-likelihood field model. The `buildNotes`
+getter returns `BinomialBuildNotes` (calibration version, prior, logit inflation,
+`warnings[]`, etc.); rows with `trials === 0` are dropped. See
 `benches/BROWSER_BENCHMARKS.md` in the repository for large-grid prediction
 benchmarks.
 
@@ -240,7 +241,7 @@ const { values, variances } = model.predictBatchArrays(gridLats, gridLons);
 // values.length === gridLats.length; same for variances
 ```
 
-For ordinary kriging the result is `{ values, variances }`; for binomial it is `{ prevalences, logitValues, variances }`.
+For ordinary kriging the result is `{ values, variances }`; for binomial it is `{ prevalenceMedians, prevalenceMeans, logitValues, logitVariances, prevalenceVariances }`.
 
 ### Grid prediction (bounds + resolution)
 
@@ -257,7 +258,7 @@ const { values, variances } = model.predictGrid({
 });
 ```
 
-**Grid layout:** Results are 2D arrays (not flat). Row index = latitude index, column index = longitude index. First row (`j = 0`) = south, last row = north; first column (`i = 0`) = west, last column = east. So `values[j][i]` is the prediction at the cell with latitude row `j` and longitude column `i`. Internally the library uses row-major order (south to north, then west to east within each row). Ordinary kriging returns `{ values, variances }`; binomial returns `{ prevalences, logitValues, variances }`, all with shape `[yCells][xCells]`.
+**Grid layout:** Results are 2D arrays (not flat). Row index = latitude index, column index = longitude index. First row (`j = 0`) = south, last row = north; first column (`i = 0`) = west, last column = east. So `values[j][i]` is the prediction at the cell with latitude row `j` and longitude column `i`. Internally the library uses row-major order (south to north, then west to east within each row). Ordinary kriging returns `{ values, variances }`; binomial returns `{ prevalenceMedians, prevalenceMeans, logitValues, logitVariances, prevalenceVariances }`, all with shape `[yCells][xCells]`.
 
 ### Search neighborhoods (ordinary kriging)
 
@@ -541,12 +542,20 @@ const { values, variances } = interpolateOrdinaryToGrid({
 });
 
 // Binomial: count data + grid spec + variogram type; optional prior
-const { prevalences, variances } = interpolateBinomialToGrid({
+const {
+  prevalenceMedians,
+  prevalenceMeans,
+  logitValues,
+  logitVariances,
+  prevalenceVariances,
+} = interpolateBinomialToGrid({
   lats, lons, successes, trials,
   west: -122.5, south: 37.6, east: -122.3, north: 37.8,
   xCells: 50, yCells: 40,
   variogramType: "exponential",
+  nBins: 12,
   prior: { alpha: 1, beta: 1 },  // optional
+  relWeightEps: 1e-12,  // optional; calibrated pair-weight ε
 });
 ```
 
@@ -774,7 +783,7 @@ const result = interpolateBinomialToGrid({
   estimator: "cressie-hawkins",            // robust empirical variogram
   withCv: { k: 5 },                        // optional 5-fold CV summary
 });
-result.prevalences;       // [yCells][xCells]
+result.prevalenceMedians; // [yCells][xCells] predictive medians
 result.fittedVariogram;   // re-usable for simulation
 result.buildNotes;        // prior, dropped zero-trial rows, calibration version, …
 result.cv?.prevalence.rmse; // calibration on the prevalence scale

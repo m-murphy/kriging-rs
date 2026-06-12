@@ -1,5 +1,7 @@
 import {
   BinomialKriging,
+  BinomialProjectedKriging,
+  binomialPreprocess,
   OrdinaryKriging,
   SpaceTimeBinomialKriging,
   SpaceTimeOrdinaryKriging,
@@ -12,7 +14,9 @@ import {
   conditionalSimulateSpaceTimeSimple,
   conditionalSimulateSpaceTimeUniversal,
   fitSpaceTimeVariogram,
+  fitBinomialVariogram,
   fitVariogram,
+  estimateBinomialPrior,
   init,
   interpolateOrdinaryToGrid,
   interpolateBinomialToGrid,
@@ -28,17 +32,24 @@ import {
   type BinomialBatchArrayOutput,
   type BinomialBuildNotes,
   type BinomialCvResult,
+  type BinomialCvSummary,
   type BinomialPrediction,
+  type BinomialPreprocessResult,
   type BinomialGridOutput,
+  type BinomialPriorInput,
+  type BinomialPriorParams,
   type InterpolateBinomialToGridResult,
   type BinomialSimulationResult,
   type CvResult,
   type EmpiricalSpaceTimeVariogramResult,
   type FitSpaceTimeVariogramResult,
+  type FittedVariogram,
   type OrdinaryBatchArrayOutput,
   type OrdinaryPrediction,
   type OrdinaryGridOutput,
   type PredictGridOptions,
+  type PredictProjectedGridOptions,
+  type PrevalenceCalibrationBin,
   type SpaceTimeVariogramParams,
   type VariogramTypeName,
 } from "../src/index.js";
@@ -139,12 +150,38 @@ const binomial = new BinomialKriging({
     sill: 1.0,
     range: 100,
   },
+  stability: "strict",
 });
 const bPred = binomial.predict(0.4, 0.4);
 const _bPredType: BinomialPrediction = bPred;
 const _bPredNotAny: AssertNotAny<typeof bPred> = true;
 const bArrayOut = binomial.predictBatchArrays(lats, lons);
 const _bArrayType: BinomialBatchArrayOutput = bArrayOut;
+
+const fitBinomial = fitBinomialVariogram({
+  sampleLats: lats,
+  sampleLons: lons,
+  successes,
+  trials,
+  variogramType: VariogramType.Exponential,
+  nBins: 12,
+});
+const _autoPrior: BinomialPriorInput = "auto";
+const _priorFromCounts: BinomialPriorParams = estimateBinomialPrior({
+  successes,
+  trials,
+});
+const fitBinomialAutoPrior = fitBinomialVariogram({
+  sampleLats: lats,
+  sampleLons: lons,
+  successes,
+  trials,
+  variogramType: VariogramType.Exponential,
+  nBins: 12,
+  prior: "auto",
+});
+const _fitBinomialAutoPrior: FittedVariogram = fitBinomialAutoPrior;
+const _fitBinomialFitted: FittedVariogram = fitBinomial;
 
 const binomialFromFitted = BinomialKriging.fromFittedVariogram({
   lats,
@@ -165,10 +202,26 @@ const binomialFromFittedPrior = BinomialKriging.fromFittedVariogramWithPrior({
   trials,
   fittedVariogram: fit,
   prior: { alpha: 1, beta: 1 },
-  nuggetOverride: 0.02,
 });
 const _binomialFromFittedPriorPred: BinomialPrediction =
   binomialFromFittedPrior.predict(0.4, 0.4);
+const binomialFromFcVar = BinomialKriging.fromPrecomputedLogitsWithVariances({
+  lats,
+  lons,
+  logits: new Float64Array([0, 0.1, -0.1]),
+  logitObservationVariance: new Float64Array([0.05, 0.05, 0.05]),
+  variogram: {
+    variogramType: "exponential",
+    nugget: 0.05,
+    sill: 1.0,
+    range: 100,
+  },
+  prior: { alpha: 1, beta: 2 },
+});
+const _binomialFromFcVarPred: BinomialPrediction = binomialFromFcVar.predict(
+  0.5,
+  0.5
+);
 const binomialGrid: BinomialGridOutput =
   binomialFromFittedPrior.predictGrid(gridOpts);
 const _binomialGridType: BinomialGridOutput = binomialGrid;
@@ -186,6 +239,48 @@ const _oneShotOrdinary: OrdinaryGridOutput = interpolateOrdinaryToGrid({
   variogramType: "exponential",
   nBins: 12,
 });
+
+const fittedProjectedBinomial: FittedVariogram = {
+  variogramType: "exponential",
+  nugget: 0.05,
+  sill: 1.0,
+  range: 200,
+  residuals: 0.02,
+};
+const bpFromFitted = BinomialProjectedKriging.fromFittedVariogram({
+  xs: lats,
+  ys: lons,
+  successes,
+  trials,
+  fittedVariogram: fittedProjectedBinomial,
+  majorAngleDeg: 0,
+  rangeRatio: 1,
+});
+const _projGridOpts: PredictProjectedGridOptions = {
+  xMin: 0,
+  xMax: 2,
+  yMin: 0,
+  yMax: 2,
+  xCells: 3,
+  yCells: 3,
+};
+const _bpProjGrid: BinomialGridOutput = bpFromFitted.predictGrid(_projGridOpts);
+
+const bpFromFcVar = BinomialProjectedKriging.fromPrecomputedLogitsWithVariances({
+  xs: lats,
+  ys: lons,
+  logits: new Float64Array([0, 0.1, -0.05]),
+  logitObservationVariance: new Float64Array([0.02, 0.02, 0.02]),
+  variogram: {
+    variogramType: "gaussian",
+    nugget: 0.01,
+    sill: 1.0,
+    range: 50,
+  },
+  majorAngleDeg: 0,
+  rangeRatio: 1,
+});
+const _bpFromFcVarPred: BinomialPrediction = bpFromFcVar.predict(0.5, 0.5);
 
 // ---------- Space-time contracts ----------
 
@@ -250,9 +345,51 @@ const stBinomial = new SpaceTimeBinomialKriging({
   variogram: stVariogram,
 });
 const _stBinomialPred: BinomialPrediction = stBinomial.predict(0.5, 0.5, 1.0);
-const _stBinNotes: BinomialBuildNotes = stBinomial.getBuildNotes();
+const _stBinNotes: BinomialBuildNotes = stBinomial.buildNotes;
+const _pre: BinomialPreprocessResult = binomialPreprocess({
+  successes: [2, 3],
+  trials: [10, 10],
+});
 const _stBinomialBatchArrays: BinomialBatchArrayOutput =
   stBinomial.predictBatchArrays(lats, lons, times);
+
+const stBinomialPrior = SpaceTimeBinomialKriging.newWithPrior({
+  lats,
+  lons,
+  times,
+  successes,
+  trials,
+  variogram: stVariogram,
+  prior: { alpha: 2, beta: 2 },
+});
+const _stBinomialPriorPred: BinomialPrediction = stBinomialPrior.predict(
+  0.5,
+  0.5,
+  1.0
+);
+
+const stBinomialFc = SpaceTimeBinomialKriging.fromPrecomputedLogits({
+  lats,
+  lons,
+  times,
+  logits: [0.05, 0.12, -0.03],
+  variogram: stVariogram,
+});
+const _stBinomialFcPred: BinomialPrediction = stBinomialFc.predict(0.5, 0.5, 1.0);
+
+const stBinomialFcVar = SpaceTimeBinomialKriging.fromPrecomputedLogitsWithVariances({
+  lats,
+  lons,
+  times,
+  logits: [0.01, 0.02, -0.01],
+  logitObservationVariance: [0.05, 0.05, 0.05],
+  variogram: stVariogram,
+});
+const _stBinomialFcVarPred: BinomialPrediction = stBinomialFcVar.predict(
+  0.5,
+  0.5,
+  1.0
+);
 
 const stProjected = new SpaceTimeProjectedOrdinaryKriging({
   xs: lats,
@@ -418,6 +555,26 @@ const _oneShotBinomial: InterpolateBinomialToGridResult = interpolateBinomialToG
   variogramType: "exponential",
   prior: { alpha: 1, beta: 1 },
 });
+
+const _calBinShape: PrevalenceCalibrationBin = {
+  binIndex: 0,
+  predictedLo: 0,
+  predictedHi: 0.1,
+  nStations: 0,
+  sumTrials: 0,
+  sumSuccesses: 0,
+  meanPredicted: NaN,
+  pooledObservedPrevalence: NaN,
+};
+const _binomialCvSummaryShape: BinomialCvSummary = {
+  n: 0,
+  nEvaluated: 0,
+  logit: { n: 0, meanError: 0, rmse: 0, msdr: 0 },
+  prevalence: { n: 0, meanError: 0, rmse: 0, msdr: 0 },
+  brier: NaN,
+  logScorePerTrial: NaN,
+  calibrationBins: [_calBinShape],
+};
 
 // ---------- SpaceTimeVariogramParams discriminated-union contracts ----------
 

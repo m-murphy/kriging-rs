@@ -7,22 +7,20 @@
  */
 
 import { kFoldBinomial, leaveOneOutBinomial } from "./cv.js";
-import {
-  resolveBinomialPriorOrDefault,
-  smoothedLogits,
-} from "./internal/prior.js";
+import { resolveBinomialPriorInput } from "./internal/prior.js";
 import { BinomialKriging } from "./kriging/binomial.js";
 import { OrdinaryKriging } from "./kriging/ordinary.js";
 import type {
   BinomialBuildNotes,
   BinomialCvSummary,
   BinomialGridOutput,
+  BinomialPriorParams,
   InterpolateBinomialToGridOptions,
   InterpolateBinomialToGridResult,
   InterpolateOrdinaryToGridOptions,
   OrdinaryGridOutput,
 } from "./types.js";
-import { fitVariogram } from "./variogram.js";
+import { fitBinomialVariogram, fitVariogram } from "./variogram.js";
 
 /**
  * One-shot ordinary kriging: fit variogram from sample data, build model, predict on a
@@ -69,11 +67,10 @@ export function interpolateOrdinaryToGrid(
  * a rectangular grid, then free the model. Returns 2D prevalence, logit, and
  * variance grids.
  *
- * The variogram fit and the kriging system both see
- * `logit((sᵢ + α)/(nᵢ + α + β))` per station, with `α/β` from the supplied
- * `prior` (default Beta(1, 1)) — so the fitted nugget/sill/range are calibrated
- * for the field the model actually solves on. Pass `estimator: "cressie-hawkins"`
- * for a robust fit when counts are small / heavy-tailed.
+ * The variogram is fit with {@link fitBinomialVariogram}: noise-calibrated empirical
+ * variogram on EB-smoothed logits with the same `prior` (default Beta(1, 1)) as the
+ * kriging model. Pass `prior: { alpha, beta }` for a fixed prior, or `prior: "auto"`
+ * to estimate **α**, **β** from counts ({@link estimateBinomialPrior}).
  *
  * Pass `withCv` (boolean, `"loo"`, or `{ k }`) to additionally run binomial
  * cross-validation against the fitted variogram and include a
@@ -86,39 +83,48 @@ export function interpolateOrdinaryToGrid(
 export function interpolateBinomialToGrid(
   options: InterpolateBinomialToGridOptions
 ): InterpolateBinomialToGridResult {
-  const successesArr = Array.from(options.successes as ArrayLike<number>);
-  const trialsArr = Array.from(options.trials as ArrayLike<number>);
-  const prior = resolveBinomialPriorOrDefault(options.prior);
-  const logits = smoothedLogits(successesArr, trialsArr, prior);
+  const priorResolved = resolveBinomialPriorInput(options.prior, {
+    successes: options.successes,
+    trials: options.trials,
+  });
 
-  const fitted = fitVariogram({
+  const fitted = fitBinomialVariogram({
     sampleLats: options.lats,
     sampleLons: options.lons,
-    values: logits,
+    successes: options.successes,
+    trials: options.trials,
     variogramType: options.variogramType,
     nBins: options.nBins,
     maxDistance: options.maxDistance,
-    estimator: options.estimator,
+    prior: priorResolved,
+    relWeightEps: options.relWeightEps,
   });
 
-  const model = options.prior
-    ? BinomialKriging.fromFittedVariogramWithPrior({
-        lats: options.lats,
-        lons: options.lons,
-        successes: options.successes,
-        trials: options.trials,
-        fittedVariogram: fitted,
-        nuggetOverride: options.nuggetOverride,
-        prior: options.prior,
-      })
-    : BinomialKriging.fromFittedVariogram({
-        lats: options.lats,
-        lons: options.lons,
-        successes: options.successes,
-        trials: options.trials,
-        fittedVariogram: fitted,
-        nuggetOverride: options.nuggetOverride,
-      });
+  const model =
+    priorResolved !== undefined
+      ? BinomialKriging.fromFittedVariogramWithPrior({
+          lats: options.lats,
+          lons: options.lons,
+          successes: options.successes,
+          trials: options.trials,
+          fittedVariogram: fitted,
+          prior: priorResolved,
+          ...(options.stability !== undefined ? { stability: options.stability } : {}),
+          ...(options.oneStepLaplaceObservationVariance === true
+            ? { oneStepLaplaceObservationVariance: true }
+            : {}),
+        })
+      : BinomialKriging.fromFittedVariogram({
+          lats: options.lats,
+          lons: options.lons,
+          successes: options.successes,
+          trials: options.trials,
+          fittedVariogram: fitted,
+          ...(options.stability !== undefined ? { stability: options.stability } : {}),
+          ...(options.oneStepLaplaceObservationVariance === true
+            ? { oneStepLaplaceObservationVariance: true }
+            : {}),
+        });
 
   let grids: BinomialGridOutput;
   let buildNotes: BinomialBuildNotes;
@@ -131,7 +137,7 @@ export function interpolateBinomialToGrid(
       xCells: options.xCells,
       yCells: options.yCells,
     });
-    buildNotes = model.getBuildNotes();
+    buildNotes = model.buildNotes;
   } finally {
     model.free();
   }
@@ -142,7 +148,7 @@ export function interpolateBinomialToGrid(
     buildNotes,
   };
 
-  const cvSummary = runBinomialCvIfRequested(options, fitted);
+  const cvSummary = runBinomialCvIfRequested(options, fitted, priorResolved);
   if (cvSummary !== undefined) {
     result.cv = cvSummary;
   }
@@ -151,14 +157,15 @@ export function interpolateBinomialToGrid(
 
 function runBinomialCvIfRequested(
   options: InterpolateBinomialToGridOptions,
-  fittedVariogram: InterpolateBinomialToGridResult["fittedVariogram"]
+  fittedVariogram: InterpolateBinomialToGridResult["fittedVariogram"],
+  priorResolved: BinomialPriorParams | undefined
 ): BinomialCvSummary | undefined {
   const withCv = options.withCv;
   if (!withCv) return undefined;
 
   const variogram = {
     variogramType: fittedVariogram.variogramType,
-    nugget: options.nuggetOverride ?? fittedVariogram.nugget,
+    nugget: fittedVariogram.nugget,
     sill: fittedVariogram.sill,
     range: fittedVariogram.range,
     shape: fittedVariogram.shape,
@@ -171,7 +178,7 @@ function runBinomialCvIfRequested(
       successes: options.successes,
       trials: options.trials,
       variogram,
-      prior: options.prior,
+      prior: priorResolved,
     }).summary;
   }
   return kFoldBinomial({
@@ -181,6 +188,6 @@ function runBinomialCvIfRequested(
     trials: options.trials,
     variogram,
     k: withCv.k,
-    prior: options.prior,
+    prior: priorResolved,
   }).summary;
 }

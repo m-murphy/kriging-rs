@@ -26,12 +26,15 @@ export { UniversalKriging } from "./kriging/universal.js";
 export { ProjectedKriging } from "./kriging/projected.js";
 export { BinomialKriging } from "./kriging/binomial.js";
 export { BinomialProjectedKriging } from "./kriging/binomial-projected.js";
+export { BinomialTangentPlaneKriging } from "./kriging/binomial-tangent-plane.js";
 export {
   computeDirectionalEmpiricalVariogram,
   computeEmpiricalVariogram,
   evaluateNestedVariogram,
+  fitBinomialVariogram,
   fitVariogram,
 } from "./variogram.js";
+export { estimateBinomialPrior } from "./estimate-binomial-prior.js";
 export {
   kFold,
   kFoldBinomial,
@@ -118,7 +121,10 @@ export type {
   BinomialCvResidual,
   BinomialCvResult,
   BinomialCvSummary,
+  BinomialDiagnostics,
   BinomialFromPrecomputedLogitsOptions,
+  PrevalenceCalibrationBin,
+  BinomialFromPrecomputedLogitsWithVariancesOptions,
   BinomialGridEnsemble,
   BinomialGridOutput,
   BinomialGridSimulation,
@@ -127,9 +133,16 @@ export type {
   BinomialKrigingFromFittedVariogramWithPriorOptions,
   BinomialKrigingOptions,
   BinomialKrigingWithPriorOptions,
+  BinomialTangentPlaneKrigingOptions,
+  BinomialTangentPlaneKrigingWithPriorOptions,
   BinomialPrediction,
+  BinomialPriorInput,
   BinomialPriorParams,
+  BinomialStabilityPreset,
   BinomialProjectedFromPrecomputedLogitsOptions,
+  BinomialProjectedFromPrecomputedLogitsWithVariancesOptions,
+  BinomialProjectedKrigingFromFittedVariogramOptions,
+  BinomialProjectedKrigingFromFittedVariogramWithPriorOptions,
   BinomialProjectedKrigingOptions,
   BinomialProjectedKrigingWithPriorOptions,
   BinomialSimulationManyResult,
@@ -157,6 +170,7 @@ export type {
   CvSummary,
   EmpiricalEstimator,
   EmpiricalVariogramResult,
+  FitBinomialVariogramOptions,
   FitVariogramOptions,
   FittedVariogram,
   GeoGridBounds,
@@ -200,6 +214,7 @@ export type {
   PredictGridAtDateOptions,
   PredictGridAtTimeOptions,
   PredictGridOptions,
+  PredictProjectedGridOptions,
   ProjectedKrigingOptions,
   SimpleKrigingOptions,
   SimulateBinomialGridEnsembleOptions,
@@ -220,8 +235,12 @@ export type {
   FitSpaceTimeVariogramOptions,
   FitSpaceTimeVariogramResult,
   FittedSpaceTimeVariogram,
+  SpaceTimeBinomialDiagnostics,
   SpaceTimeBinomialKrigingFromFittedOptions,
+  SpaceTimeBinomialFromPrecomputedLogitsOptions,
+  SpaceTimeBinomialFromPrecomputedLogitsWithVariancesOptions,
   SpaceTimeBinomialKrigingOptions,
+  SpaceTimeBinomialKrigingWithPriorOptions,
   SpaceTimeOrdinaryKrigingFromFittedOptions,
   SpaceTimeOrdinaryKrigingOptions,
   SpaceTimeProjectedOrdinaryKrigingFromFittedOptions,
@@ -235,6 +254,18 @@ export type {
   SpaceTimeVariogramParams,
 } from "./types.js";
 export type { TimeUnit } from "./time.js";
+
+export { binomialPreprocess } from "./binomial-preprocess.js";
+export type {
+  BinomialPreprocessOptions,
+  BinomialPreprocessResult,
+} from "./binomial-preprocess.js";
+export {
+  DEFAULT_BINOMIAL_PRIOR,
+  resolveBinomialPriorOrDefault,
+  smoothedLogit,
+  smoothedLogits,
+} from "./internal/prior.js";
 
 import { init } from "./internal/module.js";
 
