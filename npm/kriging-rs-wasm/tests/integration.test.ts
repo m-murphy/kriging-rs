@@ -2097,6 +2097,75 @@ describe("Conditional simulation (per-variant)", () => {
     expect(Array.from(a)).toEqual(Array.from(b));
     for (const v of a) expect(Number.isFinite(v)).toBe(true);
   });
+
+  test.each([
+    {
+      name: "geo simple",
+      options: {
+        geometry: "geo",
+        family: "simple",
+        conditioningLats: condLats,
+        conditioningLons: condLons,
+        conditioningValues: condValues,
+        targetLats,
+        targetLons,
+        variogram,
+        mean: 11.5,
+      },
+    },
+    {
+      name: "geo universal",
+      options: {
+        geometry: "geo",
+        family: "universal",
+        conditioningLats: condLats,
+        conditioningLons: condLons,
+        conditioningValues: condValues,
+        targetLats,
+        targetLons,
+        variogram,
+        trend: "constant",
+      },
+    },
+    {
+      name: "projected ordinary",
+      options: {
+        geometry: "projected",
+        family: "ordinary",
+        conditioningXs: [0, 0, 1, 1],
+        conditioningYs: [0, 1, 0, 1],
+        conditioningValues: condValues,
+        targetXs: [0.5, 0.25],
+        targetYs: [0.5, 0.75],
+        variogram: {
+          variogramType: "exponential",
+          nugget: 0.05,
+          sill: 1.0,
+          range: 2.0,
+        },
+        majorAngleDeg: 0,
+        rangeRatio: 1,
+      },
+    },
+  ])("$name simulateMany matches per-realization seeds", ({ options }) => {
+    const baseSeed = 17n;
+    const nRealizations = 2;
+    const many = conditionalSimulateMany({
+      ...options,
+      nRealizations,
+      baseSeed,
+    } as Parameters<typeof conditionalSimulateMany>[0]) as Float64Array;
+    const expected = Array.from({ length: nRealizations }, (_, k) =>
+      Array.from(
+        conditionalSimulate({
+          ...options,
+          seed: baseSeed + BigInt(k),
+        } as Parameters<typeof conditionalSimulate>[0]) as Float64Array,
+      ),
+    ).flat();
+
+    expect(Array.from(many)).toEqual(expected);
+  });
 });
 
 describe("Conditional simulation (binomial, both scales)", () => {
@@ -3483,6 +3552,62 @@ describe("Space-time conditional simulation", () => {
       expect(uk[i]).toBeCloseTo(ord[i], 5);
     }
   });
+
+  test.each([
+    {
+      name: "simple",
+      options: {
+        geometry: "spacetime",
+        family: "simple",
+        conditioningLats,
+        conditioningLons,
+        conditioningTimes,
+        conditioningValues,
+        targetLats,
+        targetLons,
+        targetTimes,
+        variogram,
+        mean: 2,
+      },
+    },
+    {
+      name: "universal",
+      options: {
+        geometry: "spacetime",
+        family: "universal",
+        conditioningLats,
+        conditioningLons,
+        conditioningTimes,
+        conditioningValues,
+        targetLats,
+        targetLons,
+        targetTimes,
+        variogram,
+        trend: "constant",
+      },
+    },
+  ])(
+    "conditionalSimulateManySpaceTime $name matches per-realization seeds",
+    ({ options }) => {
+      const baseSeed = 23n;
+      const nRealizations = 2;
+      const many = conditionalSimulateMany({
+        ...options,
+        nRealizations,
+        baseSeed,
+      } as Parameters<typeof conditionalSimulateMany>[0]) as Float64Array;
+      const expected = Array.from({ length: nRealizations }, (_, k) =>
+        Array.from(
+          conditionalSimulate({
+            ...options,
+            seed: baseSeed + BigInt(k),
+          } as Parameters<typeof conditionalSimulate>[0]) as Float64Array,
+        ),
+      ).flat();
+
+      expect(Array.from(many)).toEqual(expected);
+    },
+  );
 
   test("conditionalSimulateSpaceTimeBinomial returns logit and prevalence samples", () => {
     const out = conditionalSimulate({ geometry: "spacetime", family: "binomial", 
