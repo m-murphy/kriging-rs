@@ -107,10 +107,6 @@ pub mod geo_dataset;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod kriging;
-/// Dense linear-system helpers used internally by kriging models. Not part of the stable
-/// public API — use the higher-level `*KrigingModel` types to predict values; direct solver
-/// access is a crate-internal detail that may be removed in a future release.
-pub(crate) mod matrix;
 pub mod predictor;
 pub mod projected;
 pub mod simulation;
@@ -127,7 +123,7 @@ pub use distance::GeoCoord;
 pub use error::KrigingError;
 pub use geo_dataset::GeoDataset;
 #[cfg(feature = "gpu")]
-pub use gpu::{GpuBackend, GpuSupport, build_rhs_covariances_gpu, detect_gpu_support, gpu_square};
+pub use gpu::{GpuBackend, GpuSupport, build_rhs_covariances_gpu, detect_gpu_support};
 pub use kriging::binomial::{
     BINOMIAL_CALIBRATION_VERSION, BINOMIAL_CALIBRATION_VERSION_ONE_STEP_LAPLACE_OBS_VAR,
     BinomialBuildNotes, BinomialCalibratedResult, BinomialCounts, BinomialDiagnostics, BinomialFit,

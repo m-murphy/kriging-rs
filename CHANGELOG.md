@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking Rust API:** `KrigingSimulator`, `BinomialKrigingSimulator`, the ten
   model/domain-specific `*Simulator` structs, and the duplicate `predictor::simulation` route.
   Use a fitted model's `.into_conditioner()` and the functions in `simulation` instead.
+- **Breaking Rust API:** unused `distance_matrix`, `distance_matrix_flat`, and `gpu_square`
+  helpers. Use `haversine_distance` for direct geographic distance calculations or the fitted
+  model APIs for pairwise covariance and GPU prediction.
+- Orphaned internal matrix and Cholesky rank-one update utilities that had no production callers.
 
 ## [0.4.0] - 2026-06-12
 
