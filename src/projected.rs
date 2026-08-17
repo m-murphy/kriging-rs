@@ -26,6 +26,7 @@ use crate::predictor::cv::BinomialProjectedPredictor;
 
 use crate::kriging::engine::OrdinaryKrigingEngine;
 use crate::kriging::ordinary::Prediction;
+use crate::kriging::pairwise::SpatialPairwiseCovariance;
 use crate::spacetime::metric::ProjectedMetric;
 use crate::utils::{Probability, logit};
 use crate::variogram::empirical::{EmpiricalVariogram, PositiveReal};
@@ -280,7 +281,7 @@ impl ProjectedDataset {
 /// coordinates (e.g. km, m).
 #[derive(Debug, Clone)]
 pub struct ProjectedKrigingModel {
-    engine: OrdinaryKrigingEngine<ProjectedMetric>,
+    engine: OrdinaryKrigingEngine<SpatialPairwiseCovariance<ProjectedMetric>>,
 }
 
 impl ProjectedKrigingModel {
@@ -327,17 +328,16 @@ impl ProjectedKrigingModel {
         let coords = dataset.coords;
         let values = dataset.values;
         let engine = OrdinaryKrigingEngine::fit_with_extra_diagonal(
-            ProjectedMetric::with_anisotropy(anisotropy),
+            SpatialPairwiseCovariance::new(ProjectedMetric::with_anisotropy(anisotropy), variogram),
             coords,
             values,
-            variogram,
             extra,
         )?;
         Ok(Self { engine })
     }
 
     pub fn anisotropy(&self) -> Anisotropy2D {
-        self.engine.metric().anisotropy
+        self.engine.pairwise_covariance().metric().anisotropy
     }
 
     pub fn coords(&self) -> &[ProjectedCoord] {
@@ -349,7 +349,7 @@ impl ProjectedKrigingModel {
     }
 
     pub fn variogram(&self) -> VariogramModel {
-        self.engine.variogram()
+        self.engine.pairwise_covariance().variogram()
     }
 
     pub fn len(&self) -> usize {

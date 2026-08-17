@@ -6,6 +6,7 @@
 use crate::Real;
 use crate::error::KrigingError;
 use crate::kriging::ordinary::Prediction;
+use crate::kriging::pairwise::SpaceTimePairwiseCovariance;
 use crate::spacetime::coord::SpaceTimeCoord;
 use crate::spacetime::dataset::SpaceTimeDataset;
 use crate::spacetime::kriging::engine::SpaceTimeOrdinaryKrigingEngine;
@@ -65,14 +66,17 @@ impl<M: SpatialMetric> SpaceTimeOrdinaryKrigingModel<M> {
     ) -> Result<Self, KrigingError> {
         let (coords, values) = dataset.into_parts();
         let engine = SpaceTimeOrdinaryKrigingEngine::fit_with_extra_diagonal(
-            metric, coords, values, variogram, extra,
+            SpaceTimePairwiseCovariance::new(metric, variogram),
+            coords,
+            values,
+            extra,
         )?;
         Ok(Self { engine })
     }
 
     /// Metric used to measure spatial distances.
     pub fn metric(&self) -> M {
-        self.engine.metric()
+        self.engine.pairwise_covariance().metric()
     }
 
     /// Number of training points.
@@ -88,7 +92,7 @@ impl<M: SpatialMetric> SpaceTimeOrdinaryKrigingModel<M> {
 
     /// Space–time variogram used by the model.
     pub fn variogram(&self) -> SpaceTimeVariogram {
-        self.engine.variogram()
+        self.engine.pairwise_covariance().variogram()
     }
 
     /// Training space–time coordinates in station order.
@@ -96,7 +100,7 @@ impl<M: SpatialMetric> SpaceTimeOrdinaryKrigingModel<M> {
     where
         M::Coord: Copy,
     {
-        self.engine.coords()
+        self.engine.coords().to_vec()
     }
 
     /// Single-target prediction.
@@ -113,18 +117,6 @@ impl<M: SpatialMetric> SpaceTimeOrdinaryKrigingModel<M> {
     ) -> Result<Vec<Prediction>, KrigingError> {
         self.engine.predict(targets)
     }
-}
-
-/// Diagonal regularization added to the covariance block of a space–time kriging matrix to
-/// keep it solvable under `f32`. Picks the stronger of the spatial and temporal marginal
-/// jitters (Gaussian and Cubic marginals are the ill-conditioning cases) and scales by the
-/// ST `C(0, 0)` so the absolute magnitude matches the matrix entries.
-pub(crate) fn spacetime_diagonal_jitter(variogram: SpaceTimeVariogram) -> Real {
-    let c0 = variogram.c_at_zero();
-    let worst_frac = crate::kriging::numerics::worst_variogram_type_jitter_fraction(
-        &variogram.marginal_variogram_types(),
-    );
-    crate::kriging::numerics::covariance_diagonal_jitter(worst_frac, c0, 1e-10 * c0)
 }
 
 #[cfg(test)]

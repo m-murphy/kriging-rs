@@ -13,7 +13,7 @@ Predictions are mathematically equivalent in exact arithmetic; floating-point re
 - **One factorization path.** Cholesky on `C` replaces LU on the bordered system. The current `cholesky_update.rs` primitive (orphaned today) becomes load-bearing.
 - **Incremental conditioning.** Adding a new conditioning site is a rank-1 / bordered SPD extension in O(n²) via `cholesky_extend_spd_lower`. Sequential Gaussian simulation stops rebuilding the full model per target.
 - **Numerical conditioning.** The bordered system's zero corner couples to the magnitude of `C`; the SPD block alone has tighter spectral bounds.
-- **Unification.** With the spacetime `SpatialMetric` promoted to the universal 2-D seam, one engine — `OrdinaryKrigingEngine<M: SpatialMetric>` — replaces the three parallel solvers in `src/kriging/ordinary.rs`, `src/projected.rs`, and `src/spacetime/kriging/ordinary.rs`.
+- **Unification.** One dual-SPD engine replaces the three parallel solvers in `src/kriging/ordinary.rs`, `src/projected.rs`, and `src/spacetime/kriging/ordinary.rs`. ADR-0001 parameterized that engine by `SpatialMetric`; [ADR-0003](0003-pairwise-covariance-ordinary-engine.md) moved the seam to **pairwise covariance**.
 
 ## Considered alternatives
 
@@ -24,5 +24,5 @@ Predictions are mathematically equivalent in exact arithmetic; floating-point re
 
 - **Breaking release.** 0.4 → 0.5. CHANGELOG must call out small numerical drift in `f32` predictions and document the formulation switch.
 - **Side-by-side validation phase recommended** in CI for one release cycle: dual and bordered run on the same inputs and the max relative drift is asserted within a documented bound.
-- The `matrix.rs::solve_linear_system` LU path becomes test-only or deletable.
+- The LU path in `matrix.rs` was deleted; bordered LU remains only as `predict_bordered_lu` for ADR-0001 regression tests.
 - **Prediction wrappers** (`SimpleKrigingModel`, `UniversalKrigingModel`, space–time analogues) now delegate to the Cholesky engines; bordered LU is removed from these paths.

@@ -14,6 +14,7 @@ use crate::kriging::binomial::{
 };
 use crate::kriging::engine::OrdinaryKrigingEngine;
 use crate::kriging::ordinary::OrdinaryKrigingModel;
+use crate::kriging::pairwise::{SpaceTimePairwiseCovariance, SpatialPairwiseCovariance};
 use crate::kriging::simple::SimpleKrigingModel;
 use crate::kriging::simple_engine::SimpleKrigingEngine;
 use crate::kriging::universal::{UniversalKrigingModel, UniversalTrend};
@@ -291,10 +292,9 @@ impl KrigingPredictor for OrdinaryGeoPredictor<'_> {
     fn leave_one_out(&self) -> Result<Vec<CvResidual>, KrigingError> {
         self.validate()?;
         let engine = OrdinaryKrigingEngine::fit(
-            GeoMetric,
+            SpatialPairwiseCovariance::new(GeoMetric, self.variogram),
             self.coords.to_vec(),
             self.values.to_vec(),
-            self.variogram,
         )?;
         let preds = engine.leave_one_out_predictions()?;
         Ok(preds
@@ -355,10 +355,9 @@ impl KrigingPredictor for SimpleGeoPredictor<'_> {
     fn leave_one_out(&self) -> Result<Vec<CvResidual>, KrigingError> {
         self.validate()?;
         let engine = SimpleKrigingEngine::fit(
-            GeoMetric,
+            SpatialPairwiseCovariance::new(GeoMetric, self.variogram),
             self.coords.to_vec(),
             self.values.to_vec(),
-            self.variogram,
             self.mean,
         )?;
         let preds = engine.leave_one_out_predictions()?;
@@ -475,10 +474,12 @@ impl KrigingPredictor for ProjectedOrdinaryPredictor<'_> {
     fn leave_one_out(&self) -> Result<Vec<CvResidual>, KrigingError> {
         self.validate()?;
         let engine = OrdinaryKrigingEngine::fit(
-            ProjectedMetric::with_anisotropy(self.anisotropy),
+            SpatialPairwiseCovariance::new(
+                ProjectedMetric::with_anisotropy(self.anisotropy),
+                self.variogram,
+            ),
             self.coords.to_vec(),
             self.values.to_vec(),
-            self.variogram,
         )?;
         let preds = engine.leave_one_out_predictions()?;
         Ok(preds
@@ -658,10 +659,9 @@ impl<M: SpatialMetric> KrigingPredictor for SpacetimeOrdinaryPredictor<'_, M> {
     fn leave_one_out(&self) -> Result<Vec<CvResidual>, KrigingError> {
         self.validate()?;
         let engine = SpaceTimeOrdinaryKrigingEngine::fit_with_extra_diagonal(
-            self.metric,
+            SpaceTimePairwiseCovariance::new(self.metric, self.variogram),
             self.coords.to_vec(),
             self.values.to_vec(),
-            self.variogram,
             &[],
         )?;
         let preds = engine.leave_one_out_predictions()?;

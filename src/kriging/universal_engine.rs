@@ -1,4 +1,6 @@
-//! Dual-SPD universal kriging engine (geographic polynomial drift).
+//! Dual-SPD universal kriging engine, generic over [`PairwiseCovariance`] and [`TrendBasis`].
+//!
+//! Single solver behind geographic and space-time universal kriging. See ADR-0003.
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -6,50 +8,47 @@ use rayon::prelude::*;
 use nalgebra::{DMatrix, DVector};
 
 use crate::Real;
-use crate::cholesky_update::cholesky_extend_spd_lower;
-use crate::distance::{GeoCoord, PreparedGeoCoord};
+use crate::cholesky_update::{cholesky_extend_spd_lower, forward_solve_lower};
 use crate::error::KrigingError;
 use crate::kriging::engine::{build_covariance, factor_spd, solve_spd_lower};
-use crate::kriging::numerics::{extend_beta_column, kriging_diagonal_jitter};
+use crate::kriging::numerics::extend_beta_column;
 use crate::kriging::ordinary::Prediction;
-use crate::kriging::universal::UniversalTrend;
-use crate::spacetime::metric::{GeoMetric, SpatialMetric};
-use crate::variogram::models::VariogramModel;
+use crate::kriging::pairwise::PairwiseCovariance;
+use crate::kriging::universal::TrendBasis;
 
-/// Fitted universal kriging engine: Cholesky on `C` plus precomputed `β = C⁻¹F` and Schur `Fᵀβ`.
+/// Fitted universal kriging engine: Cholesky on `C` plus `β = C⁻¹F` and Schur `Fᵀβ`.
 #[derive(Debug, Clone)]
-pub struct UniversalKrigingEngine {
-    coords: Vec<GeoCoord>,
-    prepared: Vec<PreparedGeoCoord>,
+pub struct UniversalKrigingEngine<K: PairwiseCovariance, T: TrendBasis<Site = K::Site>> {
+    cov: K,
+    trend: T,
+    sites: Vec<K::Site>,
+    prepared: Vec<K::Prepared>,
     values: Vec<Real>,
-    variogram: VariogramModel,
-    trend: UniversalTrend,
     cov_at_zero: Real,
-    observation_diagonal: Vec<Real>,
     design: DMatrix<Real>,
     chol_l: DMatrix<Real>,
     beta: DMatrix<Real>,
     schur_l: DMatrix<Real>,
 }
 
-impl UniversalKrigingEngine {
+impl<K: PairwiseCovariance, T: TrendBasis<Site = K::Site>> UniversalKrigingEngine<K, T> {
     pub fn fit(
-        coords: Vec<GeoCoord>,
+        cov: K,
+        sites: Vec<K::Site>,
         values: Vec<Real>,
-        variogram: VariogramModel,
-        trend: UniversalTrend,
+        trend: T,
     ) -> Result<Self, KrigingError> {
-        Self::fit_with_extra_diagonal(coords, values, variogram, trend, &[])
+        Self::fit_with_extra_diagonal(cov, sites, values, trend, &[])
     }
 
     pub fn fit_with_extra_diagonal(
-        coords: Vec<GeoCoord>,
+        cov: K,
+        sites: Vec<K::Site>,
         values: Vec<Real>,
-        variogram: VariogramModel,
-        trend: UniversalTrend,
+        trend: T,
         extra_diagonal: &[Real],
     ) -> Result<Self, KrigingError> {
-        let n = coords.len();
+        let n = sites.len();
         let p = trend.n_basis();
         if n != values.len() {
             return Err(KrigingError::DimensionMismatch(format!(
@@ -66,22 +65,21 @@ impl UniversalKrigingEngine {
             ));
         }
 
-        let prepared: Vec<_> = coords.iter().map(|&c| GeoMetric.prepare(c)).collect();
-        let design = build_design(&coords, trend, n, p);
-        let c = build_covariance(&GeoMetric, &prepared, variogram, extra_diagonal)?;
+        let prepared: Vec<K::Prepared> = sites.iter().map(|&s| cov.prepare(s)).collect();
+        let design = build_design(&sites, trend, n, p);
+        let c = build_covariance(&cov, &prepared, extra_diagonal)?;
         let chol_l = factor_spd(c)?;
         let beta = solve_beta_columns(&chol_l, &design, n, p)?;
         let schur = design.transpose() * &beta;
         let schur_l = factor_spd(schur)?;
 
         Ok(Self {
-            coords,
+            cov,
+            trend,
+            sites,
             prepared,
             values,
-            variogram,
-            trend,
-            cov_at_zero: variogram.covariance(0.0),
-            observation_diagonal: extra_diagonal.to_vec(),
+            cov_at_zero: cov.cov_at_zero(),
             design,
             chol_l,
             beta,
@@ -89,19 +87,19 @@ impl UniversalKrigingEngine {
         })
     }
 
-    pub fn coords(&self) -> &[GeoCoord] {
-        &self.coords
+    pub fn pairwise_covariance(&self) -> K {
+        self.cov
+    }
+
+    pub fn coords(&self) -> &[K::Site] {
+        &self.sites
     }
 
     pub fn values(&self) -> &[Real] {
         &self.values
     }
 
-    pub fn variogram(&self) -> VariogramModel {
-        self.variogram
-    }
-
-    pub fn predict(&self, targets: &[GeoCoord]) -> Result<Vec<Prediction>, KrigingError> {
+    pub fn predict(&self, targets: &[K::Site]) -> Result<Vec<Prediction>, KrigingError> {
         if targets.is_empty() {
             return Ok(Vec::new());
         }
@@ -120,10 +118,20 @@ impl UniversalKrigingEngine {
 
     pub fn condition(
         mut self,
-        site: GeoCoord,
+        site: K::Site,
         value: Real,
         obs_var: Real,
     ) -> Result<Self, KrigingError> {
+        self.append_condition(site, value, obs_var)?;
+        Ok(self)
+    }
+
+    pub(crate) fn append_condition(
+        &mut self,
+        site: K::Site,
+        value: Real,
+        obs_var: Real,
+    ) -> Result<(), KrigingError> {
         if !obs_var.is_finite() || obs_var < 0.0 {
             return Err(KrigingError::InvalidInput(
                 "observation variance must be finite and non-negative".to_string(),
@@ -131,28 +139,21 @@ impl UniversalKrigingEngine {
         }
         let n = self.prepared.len();
         let p = self.trend.n_basis();
-        let prepared_site = GeoMetric.prepare(site);
+        let prepared_site = self.cov.prepare(site);
         let mut cross = DVector::zeros(n);
         for i in 0..n {
-            cross[i] = self
-                .variogram
-                .covariance(GeoMetric.distance(self.prepared[i], prepared_site));
+            cross[i] = self.cov.covariance(self.prepared[i], prepared_site);
         }
-        let diag_eps = kriging_diagonal_jitter(self.variogram);
-        let new_diag = self.cov_at_zero + diag_eps + obs_var;
+        let new_diag = self.cov.diagonal() + obs_var;
 
         let gamma_v = solve_spd_lower(&self.chol_l, &cross)?;
-        let w_fwd = crate::cholesky_update::forward_solve_lower(&self.chol_l, &cross)?;
+        let w_fwd = forward_solve_lower(&self.chol_l, &cross)?;
         let schur = new_diag - w_fwd.dot(&w_fwd);
 
-        self.chol_l = cholesky_extend_spd_lower(&self.chol_l, &cross, new_diag)?;
-        self.coords.push(site);
-        self.prepared.push(prepared_site);
-        self.values.push(value);
-        self.observation_diagonal.push(obs_var);
+        let chol_l = cholesky_extend_spd_lower(&self.chol_l, &cross, new_diag)?;
 
         let mut f_row = vec![0.0 as Real; p];
-        self.trend.eval_basis(site, &mut f_row);
+        self.trend.eval(site, &mut f_row);
 
         let mut new_beta = DMatrix::zeros(n + 1, p);
         for l in 0..p {
@@ -165,7 +166,6 @@ impl UniversalKrigingEngine {
                 new_beta[(i, l)] = col_new[i];
             }
         }
-        self.beta = new_beta;
 
         let mut new_design = DMatrix::zeros(n + 1, p);
         for i in 0..n {
@@ -176,24 +176,29 @@ impl UniversalKrigingEngine {
         for l in 0..p {
             new_design[(n, l)] = f_row[l];
         }
-        self.design = new_design;
 
-        let schur_mat = self.design.transpose() * &self.beta;
-        self.schur_l = factor_spd(schur_mat)?;
-        Ok(self)
+        let schur_mat = new_design.transpose() * &new_beta;
+        let schur_l = factor_spd(schur_mat)?;
+
+        self.chol_l = chol_l;
+        self.beta = new_beta;
+        self.design = new_design;
+        self.schur_l = schur_l;
+        self.sites.push(site);
+        self.prepared.push(prepared_site);
+        self.values.push(value);
+        Ok(())
     }
 
-    fn predict_one(&self, target: GeoCoord) -> Result<Prediction, KrigingError> {
+    fn predict_one(&self, target: K::Site) -> Result<Prediction, KrigingError> {
         let n = self.prepared.len();
-        let prepared_target = GeoMetric.prepare(target);
+        let prepared_target = self.cov.prepare(target);
         let mut c0 = DVector::zeros(n);
         for i in 0..n {
-            c0[i] = self
-                .variogram
-                .covariance(GeoMetric.distance(self.prepared[i], prepared_target));
+            c0[i] = self.cov.covariance(self.prepared[i], prepared_target);
         }
         let mut f0 = vec![0.0 as Real; self.trend.n_basis()];
-        self.trend.eval_basis(target, &mut f0);
+        self.trend.eval(target, &mut f0);
         self.predict_from_cross_cov(&c0, &f0)
     }
 
@@ -237,11 +242,11 @@ impl UniversalKrigingEngine {
     }
 }
 
-fn build_design(coords: &[GeoCoord], trend: UniversalTrend, n: usize, p: usize) -> DMatrix<Real> {
+fn build_design<T: TrendBasis>(sites: &[T::Site], trend: T, n: usize, p: usize) -> DMatrix<Real> {
     let mut design = DMatrix::zeros(n, p);
     let mut buf = vec![0.0 as Real; p];
     for i in 0..n {
-        trend.eval_basis(coords[i], &mut buf);
+        trend.eval(sites[i], &mut buf);
         for l in 0..p {
             design[(i, l)] = buf[l];
         }
@@ -267,4 +272,49 @@ fn solve_beta_columns(
         }
     }
     Ok(beta)
+}
+
+#[cfg(test)]
+mod golden_tests {
+    use super::*;
+    use crate::distance::GeoCoord;
+    use crate::geo_dataset::GeoDataset;
+    use crate::kriging::pairwise::SpatialPairwiseCovariance;
+    use crate::kriging::universal::{UniversalKrigingModel, UniversalTrend};
+    use crate::spacetime::metric::GeoMetric;
+    use crate::variogram::models::{VariogramModel, VariogramType};
+
+    #[test]
+    fn geographic_linear_prediction_matches_universal_kriging_model() {
+        let coords = vec![
+            GeoCoord::try_new(0.0, 0.0).unwrap(),
+            GeoCoord::try_new(0.0, 1.0).unwrap(),
+            GeoCoord::try_new(1.0, 0.0).unwrap(),
+            GeoCoord::try_new(1.0, 1.0).unwrap(),
+        ];
+        let values = vec![10.0, 20.0, 12.0, 22.0];
+        let variogram = VariogramModel::new(0.01, 5.0, 300.0, VariogramType::Exponential).unwrap();
+        let trend = UniversalTrend::Linear;
+        let target = GeoCoord::try_new(0.25, 0.25).unwrap();
+
+        let golden = UniversalKrigingModel::new(
+            GeoDataset::new(coords.clone(), values.clone()).unwrap(),
+            variogram,
+            trend,
+        )
+        .expect("golden model");
+        let golden_pred = golden.predict(target).expect("golden predict");
+
+        let engine = UniversalKrigingEngine::fit(
+            SpatialPairwiseCovariance::new(GeoMetric, variogram),
+            coords,
+            values,
+            trend,
+        )
+        .expect("engine fit");
+        let engine_pred = engine.predict(&[target]).expect("engine predict")[0];
+
+        assert!((engine_pred.value - golden_pred.value).abs() < 1e-3);
+        assert!((engine_pred.variance - golden_pred.variance).abs() < 1e-3);
+    }
 }

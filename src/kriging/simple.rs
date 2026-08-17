@@ -19,6 +19,7 @@ use crate::distance::GeoCoord;
 use crate::error::KrigingError;
 use crate::geo_dataset::GeoDataset;
 use crate::kriging::ordinary::Prediction;
+use crate::kriging::pairwise::SpatialPairwiseCovariance;
 use crate::kriging::simple_engine::SimpleKrigingEngine;
 use crate::spacetime::metric::GeoMetric;
 use crate::variogram::models::VariogramModel;
@@ -26,7 +27,7 @@ use crate::variogram::models::VariogramModel;
 /// Fitted simple kriging model.
 #[derive(Debug, Clone)]
 pub struct SimpleKrigingModel {
-    engine: SimpleKrigingEngine<GeoMetric>,
+    engine: SimpleKrigingEngine<SpatialPairwiseCovariance<GeoMetric>>,
 }
 
 impl SimpleKrigingModel {
@@ -37,7 +38,12 @@ impl SimpleKrigingModel {
         mean: Real,
     ) -> Result<Self, KrigingError> {
         let (coords, values) = dataset.into_parts();
-        let engine = SimpleKrigingEngine::fit(GeoMetric, coords, values, variogram, mean)?;
+        let engine = SimpleKrigingEngine::fit(
+            SpatialPairwiseCovariance::new(GeoMetric, variogram),
+            coords,
+            values,
+            mean,
+        )?;
         Ok(Self { engine })
     }
 
@@ -55,7 +61,7 @@ impl SimpleKrigingModel {
     }
 
     pub fn variogram(&self) -> VariogramModel {
-        self.engine.variogram()
+        self.engine.pairwise_covariance().variogram()
     }
 
     /// Predict at a single target.

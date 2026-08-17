@@ -8,10 +8,13 @@
 use crate::Real;
 use crate::error::KrigingError;
 use crate::kriging::ordinary::Prediction;
+use crate::kriging::pairwise::SpaceTimePairwiseCovariance;
 use crate::spacetime::coord::SpaceTimeCoord;
 use crate::spacetime::dataset::SpaceTimeDataset;
 use crate::spacetime::kriging::engine::SpaceTimeOrdinaryKrigingEngine;
-use crate::spacetime::kriging::universal_engine::SpaceTimeUniversalKrigingEngine;
+use crate::spacetime::kriging::universal_engine::{
+    SpaceTimeTrendEval, SpaceTimeUniversalKrigingEngine,
+};
 use crate::spacetime::metric::SpatialBasis;
 use crate::spacetime::variogram::SpaceTimeVariogram;
 
@@ -115,16 +118,18 @@ impl<M: SpatialBasis> SpaceTimeUniversalKrigingModel<M> {
         let inner = if trend == SpaceTimeUniversalTrend::Constant {
             SpaceTimeUniversalInner::Constant(
                 SpaceTimeOrdinaryKrigingEngine::fit_with_extra_diagonal(
-                    metric,
+                    SpaceTimePairwiseCovariance::new(metric, variogram),
                     coords,
                     values,
-                    variogram,
                     &[],
                 )?,
             )
         } else {
             SpaceTimeUniversalInner::Drift(SpaceTimeUniversalKrigingEngine::fit(
-                metric, coords, values, variogram, trend,
+                SpaceTimePairwiseCovariance::new(metric, variogram),
+                coords,
+                values,
+                SpaceTimeTrendEval::new(metric, trend),
             )?)
         };
         Ok(Self { trend, inner })
@@ -136,8 +141,8 @@ impl<M: SpatialBasis> SpaceTimeUniversalKrigingModel<M> {
 
     pub fn variogram(&self) -> SpaceTimeVariogram {
         match &self.inner {
-            SpaceTimeUniversalInner::Constant(engine) => engine.variogram(),
-            SpaceTimeUniversalInner::Drift(engine) => engine.variogram(),
+            SpaceTimeUniversalInner::Constant(engine) => engine.pairwise_covariance().variogram(),
+            SpaceTimeUniversalInner::Drift(engine) => engine.pairwise_covariance().variogram(),
         }
     }
 

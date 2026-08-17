@@ -7,6 +7,7 @@
 use crate::Real;
 use crate::error::KrigingError;
 use crate::kriging::ordinary::Prediction;
+use crate::kriging::pairwise::SpaceTimePairwiseCovariance;
 use crate::spacetime::coord::SpaceTimeCoord;
 use crate::spacetime::dataset::SpaceTimeDataset;
 use crate::spacetime::kriging::simple_engine::SpaceTimeSimpleKrigingEngine;
@@ -28,7 +29,12 @@ impl<M: SpatialMetric> SpaceTimeSimpleKrigingModel<M> {
         mean: Real,
     ) -> Result<Self, KrigingError> {
         let (coords, values) = dataset.into_parts();
-        let engine = SpaceTimeSimpleKrigingEngine::fit(metric, coords, values, variogram, mean)?;
+        let engine = SpaceTimeSimpleKrigingEngine::fit(
+            SpaceTimePairwiseCovariance::new(metric, variogram),
+            coords,
+            values,
+            mean,
+        )?;
         Ok(Self { engine })
     }
 
@@ -39,7 +45,7 @@ impl<M: SpatialMetric> SpaceTimeSimpleKrigingModel<M> {
 
     /// Space–time variogram used by the model.
     pub fn variogram(&self) -> SpaceTimeVariogram {
-        self.engine.variogram()
+        self.engine.pairwise_covariance().variogram()
     }
 
     pub fn predict(&self, target: SpaceTimeCoord<M::Coord>) -> Result<Prediction, KrigingError> {

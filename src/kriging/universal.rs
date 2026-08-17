@@ -19,9 +19,22 @@ use crate::error::KrigingError;
 use crate::geo_dataset::GeoDataset;
 use crate::kriging::engine::OrdinaryKrigingEngine;
 use crate::kriging::ordinary::Prediction;
+use crate::kriging::pairwise::SpatialPairwiseCovariance;
 use crate::kriging::universal_engine::UniversalKrigingEngine;
 use crate::spacetime::metric::GeoMetric;
 use crate::variogram::models::VariogramModel;
+
+/// Map from a site to the columns of the universal-kriging design matrix `F`.
+///
+/// Two adapters justify the seam: [`UniversalTrend`] (geographic polynomial) and
+/// space–time [`SpaceTimeTrendEval`](crate::spacetime::kriging::universal_engine::SpaceTimeTrendEval).
+pub(crate) trait TrendBasis: Copy + Clone + std::fmt::Debug + Send + Sync {
+    type Site: Copy + Send + Sync + std::fmt::Debug + PartialEq;
+
+    fn n_basis(self) -> usize;
+
+    fn eval(self, site: Self::Site, out: &mut [Real]);
+}
 
 /// Polynomial trend used by [`UniversalKrigingModel`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,10 +82,22 @@ impl UniversalTrend {
     }
 }
 
+impl TrendBasis for UniversalTrend {
+    type Site = GeoCoord;
+
+    fn n_basis(self) -> usize {
+        UniversalTrend::n_basis(self)
+    }
+
+    fn eval(self, site: Self::Site, out: &mut [Real]) {
+        self.eval_basis(site, out);
+    }
+}
+
 #[derive(Debug, Clone)]
 enum UniversalKrigingInner {
-    Constant(OrdinaryKrigingEngine<GeoMetric>),
-    Drift(UniversalKrigingEngine),
+    Constant(OrdinaryKrigingEngine<SpatialPairwiseCovariance<GeoMetric>>),
+    Drift(UniversalKrigingEngine<SpatialPairwiseCovariance<GeoMetric>, UniversalTrend>),
 }
 
 /// Fitted universal kriging model.
@@ -91,11 +116,16 @@ impl UniversalKrigingModel {
         let (coords, values) = dataset.into_parts();
         let inner = if trend == UniversalTrend::Constant {
             UniversalKrigingInner::Constant(OrdinaryKrigingEngine::fit(
-                GeoMetric, coords, values, variogram,
+                SpatialPairwiseCovariance::new(GeoMetric, variogram),
+                coords,
+                values,
             )?)
         } else {
             UniversalKrigingInner::Drift(UniversalKrigingEngine::fit(
-                coords, values, variogram, trend,
+                SpatialPairwiseCovariance::new(GeoMetric, variogram),
+                coords,
+                values,
+                trend,
             )?)
         };
         Ok(Self { trend, inner })
@@ -121,8 +151,8 @@ impl UniversalKrigingModel {
 
     pub fn variogram(&self) -> VariogramModel {
         match &self.inner {
-            UniversalKrigingInner::Constant(engine) => engine.variogram(),
-            UniversalKrigingInner::Drift(engine) => engine.variogram(),
+            UniversalKrigingInner::Constant(engine) => engine.pairwise_covariance().variogram(),
+            UniversalKrigingInner::Drift(engine) => engine.pairwise_covariance().variogram(),
         }
     }
 

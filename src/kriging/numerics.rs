@@ -7,6 +7,7 @@ use crate::Real;
 use crate::error::KrigingError;
 use crate::kriging::ordinary::{Neighborhood, Prediction};
 use crate::spacetime::metric::SpatialMetric;
+use crate::spacetime::variogram::SpaceTimeVariogram;
 use crate::variogram::models::{VariogramModel, VariogramType};
 
 /// Diagonal regularization for an SPD covariance block: variogram-type fraction × `scale_at_zero`,
@@ -36,6 +37,14 @@ pub fn kriging_diagonal_jitter(variogram: VariogramModel) -> Real {
     let (nugget, sill, _) = variogram.params();
     let frac = variogram_type_jitter_fraction(variogram.variogram_type());
     covariance_diagonal_jitter(frac, sill, (0.01 * nugget).max(1e-10))
+}
+
+/// Diagonal jitter for a space–time covariance block: stronger of the spatial and temporal
+/// marginal type fractions, scaled by `C(0, 0)`.
+pub fn spacetime_diagonal_jitter(variogram: SpaceTimeVariogram) -> Real {
+    let c0 = variogram.c_at_zero();
+    let worst_frac = worst_variogram_type_jitter_fraction(&variogram.marginal_variogram_types());
+    covariance_diagonal_jitter(worst_frac, c0, 1e-10 * c0)
 }
 
 /// Worst-case variogram-type fraction across a list (space–time marginals).
@@ -218,6 +227,7 @@ mod contract_tests {
         OrdinaryKrigingEngine, build_covariance, factor_spd, solve_spd_lower,
     };
     use crate::kriging::ordinary::{Neighborhood, OrdinaryKrigingModel};
+    use crate::kriging::pairwise::{PairwiseCovariance, SpatialPairwiseCovariance};
     use crate::kriging::universal::UniversalTrend;
     use crate::kriging::universal_engine::UniversalKrigingEngine;
     use crate::spacetime::metric::GeoMetric;
@@ -266,18 +276,19 @@ mod contract_tests {
     fn dual_spd_matches_bordered_lu() {
         let (coords, values, variogram) = fixture();
         let target = GeoCoord::try_new(0.5, 0.5).unwrap();
-        let prepared: Vec<_> = coords.iter().map(|&c| GeoMetric.prepare(c)).collect();
-        let c = build_covariance(&GeoMetric, &prepared, variogram, &[]).expect("cov");
+        let cov = SpatialPairwiseCovariance::new(GeoMetric, variogram);
+        let prepared: Vec<_> = coords.iter().map(|&c| cov.prepare(c)).collect();
+        let c = build_covariance(&cov, &prepared, &[]).expect("cov");
         let chol_l = factor_spd(c.clone()).expect("factor");
         let beta =
             solve_spd_lower(&chol_l, &DVector::from_element(coords.len(), 1.0)).expect("beta");
         let one_t_beta = beta.sum();
-        let prepared_target = GeoMetric.prepare(target);
+        let prepared_target = cov.prepare(target);
         let mut c0 = DVector::zeros(coords.len());
         for i in 0..coords.len() {
-            c0[i] = variogram.covariance(GeoMetric.distance(prepared[i], prepared_target));
+            c0[i] = cov.covariance(prepared[i], prepared_target);
         }
-        let cov_at_zero = variogram.covariance(0.0);
+        let cov_at_zero = cov.cov_at_zero();
         let dual =
             predict_dual_spd(&chol_l, &beta, one_t_beta, &c0, &values, cov_at_zero).expect("dual");
         let bordered = predict_bordered_lu(&c, &c0, &values, cov_at_zero).expect("bordered");
@@ -301,7 +312,12 @@ mod contract_tests {
     #[test]
     fn leave_one_out_matches_fold_refit() {
         let (coords, values, variogram) = fixture();
-        let engine = OrdinaryKrigingEngine::fit(GeoMetric, coords, values, variogram).expect("fit");
+        let engine = OrdinaryKrigingEngine::fit(
+            SpatialPairwiseCovariance::new(GeoMetric, variogram),
+            coords,
+            values,
+        )
+        .expect("fit");
         let loo = engine.leave_one_out_predictions().expect("loo");
         let n = loo.len();
         for (i, loo_pred) in loo.iter().enumerate() {
@@ -324,11 +340,15 @@ mod contract_tests {
         let new_site = GeoCoord::try_new(0.2, 0.2).unwrap();
         let target = GeoCoord::try_new(0.4, 0.4).unwrap();
 
-        let conditioned =
-            OrdinaryKrigingEngine::fit(GeoMetric, coords.clone(), values.clone(), variogram)
-                .expect("fit")
-                .condition(new_site, 17.5, 0.25)
-                .expect("condition");
+        let mut conditioned = OrdinaryKrigingEngine::fit(
+            SpatialPairwiseCovariance::new(GeoMetric, variogram),
+            coords.clone(),
+            values.clone(),
+        )
+        .expect("fit");
+        conditioned
+            .append_condition(new_site, 17.5, 0.25)
+            .expect("condition");
         let cond_pred = conditioned
             .predict(&[target])
             .expect("predict")
@@ -340,10 +360,9 @@ mod contract_tests {
         all_coords.push(new_site);
         all_values.push(17.5);
         let refit = OrdinaryKrigingEngine::fit_with_extra_diagonal(
-            GeoMetric,
+            SpatialPairwiseCovariance::new(GeoMetric, variogram),
             all_coords,
             all_values,
-            variogram,
             &[0.0, 0.0, 0.0, 0.0, 0.25],
         )
         .expect("refit");
@@ -358,11 +377,16 @@ mod contract_tests {
         let new_site = GeoCoord::try_new(0.2, 0.2).unwrap();
         let target = GeoCoord::try_new(0.4, 0.4).unwrap();
 
-        let conditioned =
-            UniversalKrigingEngine::fit(coords.clone(), values.clone(), variogram, trend)
-                .expect("fit")
-                .condition(new_site, 17.5, 0.25)
-                .expect("condition");
+        let mut conditioned = UniversalKrigingEngine::fit(
+            SpatialPairwiseCovariance::new(GeoMetric, variogram),
+            coords.clone(),
+            values.clone(),
+            trend,
+        )
+        .expect("fit");
+        conditioned
+            .append_condition(new_site, 17.5, 0.25)
+            .expect("condition");
         let cond_pred = conditioned.predict(&[target]).expect("predict")[0];
 
         let mut all_coords = coords;
@@ -370,9 +394,9 @@ mod contract_tests {
         all_coords.push(new_site);
         all_values.push(17.5);
         let refit = UniversalKrigingEngine::fit_with_extra_diagonal(
+            SpatialPairwiseCovariance::new(GeoMetric, variogram),
             all_coords,
             all_values,
-            variogram,
             trend,
             &[0.0, 0.0, 0.0, 0.0, 0.25],
         )

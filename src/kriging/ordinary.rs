@@ -8,7 +8,9 @@ use crate::distance::GeoCoord;
 use crate::error::KrigingError;
 use crate::geo_dataset::GeoDataset;
 use crate::kriging::engine::OrdinaryKrigingEngine;
-use crate::spacetime::metric::GeoMetric;
+use crate::kriging::numerics::select_neighborhood_indices;
+use crate::kriging::pairwise::SpatialPairwiseCovariance;
+use crate::spacetime::metric::{GeoMetric, SpatialMetric};
 use crate::variogram::models::VariogramModel;
 
 /// Result of a single kriging prediction: the interpolated value and the kriging variance.
@@ -76,7 +78,7 @@ impl Neighborhood {
 /// [`new_with_extra_diagonal`](Self::new_with_extra_diagonal).
 #[derive(Debug, Clone)]
 pub struct OrdinaryKrigingModel {
-    engine: OrdinaryKrigingEngine<GeoMetric>,
+    engine: OrdinaryKrigingEngine<SpatialPairwiseCovariance<GeoMetric>>,
     neighborhood: Option<Neighborhood>,
 }
 
@@ -120,7 +122,10 @@ impl OrdinaryKrigingModel {
     ) -> Result<Self, KrigingError> {
         let (coords, values) = dataset.into_parts();
         let engine = OrdinaryKrigingEngine::fit_with_extra_diagonal(
-            GeoMetric, coords, values, variogram, extra,
+            SpatialPairwiseCovariance::new(GeoMetric, variogram),
+            coords,
+            values,
+            extra,
         )?;
         Ok(Self {
             engine,
@@ -151,7 +156,7 @@ impl OrdinaryKrigingModel {
 
     /// Variogram used when fitting this model.
     pub fn variogram(&self) -> VariogramModel {
-        self.engine.variogram()
+        self.engine.pairwise_covariance().variogram()
     }
 
     pub fn coords(&self) -> &[GeoCoord] {
@@ -173,7 +178,7 @@ impl OrdinaryKrigingModel {
 
     pub fn predict(&self, coord: GeoCoord) -> Result<Prediction, KrigingError> {
         if let Some(neighborhood) = self.neighborhood {
-            return self.engine.predict_neighborhood(coord, neighborhood);
+            return self.predict_neighborhood(coord, neighborhood);
         }
         self.engine
             .predict(&[coord])
@@ -186,19 +191,39 @@ impl OrdinaryKrigingModel {
             {
                 return coords
                     .par_iter()
-                    .map(|coord| self.engine.predict_neighborhood(*coord, neighborhood))
+                    .map(|coord| self.predict_neighborhood(*coord, neighborhood))
                     .collect();
             }
             #[cfg(target_arch = "wasm32")]
             {
                 let mut out = Vec::with_capacity(coords.len());
                 for &coord in coords {
-                    out.push(self.engine.predict_neighborhood(coord, neighborhood)?);
+                    out.push(self.predict_neighborhood(coord, neighborhood)?);
                 }
                 return Ok(out);
             }
         }
         self.engine.predict(coords)
+    }
+
+    fn predict_neighborhood(
+        &self,
+        coord: GeoCoord,
+        neighborhood: Neighborhood,
+    ) -> Result<Prediction, KrigingError> {
+        let metric = GeoMetric;
+        let indices = select_neighborhood_indices(
+            &metric,
+            self.engine.prepared(),
+            metric.prepare(coord),
+            neighborhood,
+        );
+        if indices.is_empty() {
+            return Err(KrigingError::InvalidInput(
+                "no stations in search neighborhood for target point".to_string(),
+            ));
+        }
+        self.engine.predict_subset(&indices, coord)
     }
 
     /// GPU-accelerated batch prediction. Returns [`KrigingError::BackendUnavailable`] if the GPU
@@ -212,7 +237,7 @@ impl OrdinaryKrigingModel {
         let covariances = crate::gpu::build_rhs_covariances_gpu(
             self.engine.coords(),
             coords,
-            self.engine.variogram(),
+            self.engine.pairwise_covariance().variogram(),
         )
         .await
         .map_err(KrigingError::BackendUnavailable)?;
@@ -230,7 +255,7 @@ impl OrdinaryKrigingModel {
         match crate::gpu::build_rhs_covariances_gpu(
             self.engine.coords(),
             coords,
-            self.engine.variogram(),
+            self.engine.pairwise_covariance().variogram(),
         )
         .await
         {
@@ -249,7 +274,7 @@ impl OrdinaryKrigingModel {
         let covariances = crate::gpu::build_rhs_covariances_gpu_blocking(
             self.engine.coords(),
             coords,
-            self.engine.variogram(),
+            self.engine.pairwise_covariance().variogram(),
         )
         .map_err(KrigingError::BackendUnavailable)?;
         self.predict_batch_with_covariances(coords, &covariances)
@@ -265,7 +290,7 @@ impl OrdinaryKrigingModel {
         match crate::gpu::build_rhs_covariances_gpu_blocking(
             self.engine.coords(),
             coords,
-            self.engine.variogram(),
+            self.engine.pairwise_covariance().variogram(),
         ) {
             Ok(covariances) => self.predict_batch_with_covariances(coords, &covariances),
             Err(_) => self.predict_batch(coords),

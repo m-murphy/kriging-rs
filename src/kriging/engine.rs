@@ -1,7 +1,7 @@
-//! Dual-SPD ordinary kriging engine, generic over [`SpatialMetric`].
+//! Dual-SPD ordinary kriging engine, generic over [`PairwiseCovariance`].
 //!
-//! Single solver behind geographic, projected, and (via composition) binomial ordinary kriging.
-//! See ADR-0001.
+//! Single solver behind geographic, projected, and space-time ordinary kriging
+//! (and, by composition, binomial). See ADR-0001 and ADR-0003.
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -13,21 +13,17 @@ use crate::cholesky_update::{
     cholesky_delete_index, cholesky_extend_spd_lower, forward_solve_lower,
 };
 use crate::error::KrigingError;
-use crate::kriging::numerics::{
-    extend_constraint_beta, kriging_diagonal_jitter, predict_dual_spd, select_neighborhood_indices,
-};
-use crate::kriging::ordinary::{Neighborhood, Prediction};
-use crate::spacetime::metric::SpatialMetric;
-use crate::variogram::models::VariogramModel;
+use crate::kriging::numerics::{extend_constraint_beta, predict_dual_spd};
+use crate::kriging::ordinary::Prediction;
+use crate::kriging::pairwise::PairwiseCovariance;
 
 /// Fitted ordinary kriging engine: dual SPD factorization + constraint vector β = C⁻¹·1.
 #[derive(Debug, Clone)]
-pub struct OrdinaryKrigingEngine<M: SpatialMetric> {
-    metric: M,
-    coords: Vec<M::Coord>,
-    prepared: Vec<M::Prepared>,
+pub struct OrdinaryKrigingEngine<K: PairwiseCovariance> {
+    cov: K,
+    sites: Vec<K::Site>,
+    prepared: Vec<K::Prepared>,
     values: Vec<Real>,
-    variogram: VariogramModel,
     cov_at_zero: Real,
     observation_diagonal: Vec<Real>,
     chol_l: DMatrix<Real>,
@@ -35,26 +31,20 @@ pub struct OrdinaryKrigingEngine<M: SpatialMetric> {
     one_t_beta: Real,
 }
 
-impl<M: SpatialMetric> OrdinaryKrigingEngine<M> {
-    /// Build from station coordinates, values, and a variogram (homoscedastic path).
-    pub fn fit(
-        metric: M,
-        coords: Vec<M::Coord>,
-        values: Vec<Real>,
-        variogram: VariogramModel,
-    ) -> Result<Self, KrigingError> {
-        Self::fit_with_extra_diagonal(metric, coords, values, variogram, &[])
+impl<K: PairwiseCovariance> OrdinaryKrigingEngine<K> {
+    /// Build from pairwise covariance, sites, and values (homoscedastic path).
+    pub fn fit(cov: K, sites: Vec<K::Site>, values: Vec<Real>) -> Result<Self, KrigingError> {
+        Self::fit_with_extra_diagonal(cov, sites, values, &[])
     }
 
     /// Like [`fit`](Self::fit) but adds per-station observation variance on the covariance diagonal.
     pub fn fit_with_extra_diagonal(
-        metric: M,
-        coords: Vec<M::Coord>,
+        cov: K,
+        sites: Vec<K::Site>,
         values: Vec<Real>,
-        variogram: VariogramModel,
         extra_diagonal: &[Real],
     ) -> Result<Self, KrigingError> {
-        let n = coords.len();
+        let n = sites.len();
         if n != values.len() {
             return Err(KrigingError::DimensionMismatch(format!(
                 "coords ({n}) and values ({}) must have equal length",
@@ -77,20 +67,19 @@ impl<M: SpatialMetric> OrdinaryKrigingEngine<M> {
             }
         }
 
-        let prepared: Vec<M::Prepared> = coords.iter().map(|&c| metric.prepare(c)).collect();
-        let c = build_covariance(&metric, &prepared, variogram, extra_diagonal)?;
+        let prepared: Vec<K::Prepared> = sites.iter().map(|&s| cov.prepare(s)).collect();
+        let c = build_covariance(&cov, &prepared, extra_diagonal)?;
         let chol_l = factor_spd(c)?;
         let ones = DVector::from_element(n, 1.0);
         let beta = solve_spd_lower(&chol_l, &ones)?;
         let one_t_beta = beta.sum();
 
         Ok(Self {
-            metric,
-            coords,
+            cov,
+            sites,
             prepared,
             values,
-            variogram,
-            cov_at_zero: variogram.covariance(0.0),
+            cov_at_zero: cov.cov_at_zero(),
             observation_diagonal: extra_diagonal.to_vec(),
             chol_l,
             beta,
@@ -100,32 +89,30 @@ impl<M: SpatialMetric> OrdinaryKrigingEngine<M> {
 
     /// Number of training stations.
     pub fn len(&self) -> usize {
-        self.coords.len()
+        self.sites.len()
     }
 
-    /// Variogram used when fitting this engine.
-    pub fn variogram(&self) -> VariogramModel {
-        self.variogram
+    /// Pairwise covariance adapter used when fitting this engine.
+    pub fn pairwise_covariance(&self) -> K {
+        self.cov
     }
 
-    /// Training coordinates (same order as values).
-    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
-    pub fn coords(&self) -> &[M::Coord] {
-        &self.coords
+    /// Training sites (same order as values).
+    pub fn coords(&self) -> &[K::Site] {
+        &self.sites
     }
 
     /// Training values.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn values(&self) -> &[Real] {
         &self.values
     }
 
-    pub(crate) fn metric(&self) -> M {
-        self.metric
+    pub(crate) fn prepared(&self) -> &[K::Prepared] {
+        &self.prepared
     }
 
     /// Predict at one or more targets (batch API; single target = one-element slice).
-    pub fn predict(&self, targets: &[M::Coord]) -> Result<Vec<Prediction>, KrigingError> {
+    pub fn predict(&self, targets: &[K::Site]) -> Result<Vec<Prediction>, KrigingError> {
         if targets.is_empty() {
             return Ok(Vec::new());
         }
@@ -146,43 +133,54 @@ impl<M: SpatialMetric> OrdinaryKrigingEngine<M> {
     /// factorization via [`cholesky_extend_spd_lower`].
     pub fn condition(
         mut self,
-        site: M::Coord,
+        site: K::Site,
         value: Real,
         obs_var: Real,
     ) -> Result<Self, KrigingError> {
+        self.append_condition(site, value, obs_var)?;
+        Ok(self)
+    }
+
+    pub(crate) fn append_condition(
+        &mut self,
+        site: K::Site,
+        value: Real,
+        obs_var: Real,
+    ) -> Result<(), KrigingError> {
         if !obs_var.is_finite() || obs_var < 0.0 {
             return Err(KrigingError::InvalidInput(
                 "observation variance must be finite and non-negative".to_string(),
             ));
         }
         let n = self.prepared.len();
-        let prepared_site = self.metric.prepare(site);
+        let prepared_site = self.cov.prepare(site);
         let mut cross = DVector::zeros(n);
         for i in 0..n {
-            cross[i] = self
-                .variogram
-                .covariance(self.metric.distance(self.prepared[i], prepared_site));
+            cross[i] = self.cov.covariance(self.prepared[i], prepared_site);
         }
-        let diag_eps = kriging_diagonal_jitter(self.variogram);
-        let new_diag = self.cov_at_zero + diag_eps + obs_var;
+        let new_diag = self.cov.diagonal() + obs_var;
 
         let w_fwd = forward_solve_lower(&self.chol_l, &cross)?;
         let schur = new_diag - w_fwd.dot(&w_fwd);
         let gamma_v = solve_spd_lower(&self.chol_l, &cross)?;
-        self.chol_l = cholesky_extend_spd_lower(&self.chol_l, &cross, new_diag)?;
-        (self.beta, self.one_t_beta) = extend_constraint_beta(&self.beta, &cross, &gamma_v, schur)?;
-        self.coords.push(site);
+        let chol_l = cholesky_extend_spd_lower(&self.chol_l, &cross, new_diag)?;
+        let (beta, one_t_beta) = extend_constraint_beta(&self.beta, &cross, &gamma_v, schur)?;
+
+        self.chol_l = chol_l;
+        self.beta = beta;
+        self.one_t_beta = one_t_beta;
+        self.sites.push(site);
         self.prepared.push(prepared_site);
         self.values.push(value);
         self.observation_diagonal.push(obs_var);
-        Ok(self)
+        Ok(())
     }
 
     /// Predict using only a subset of training stations (dual SPD on the local block).
     pub fn predict_subset(
         &self,
         indices: &[usize],
-        target: M::Coord,
+        target: K::Site,
     ) -> Result<Prediction, KrigingError> {
         let k = indices.len();
         if k == 0 {
@@ -190,24 +188,24 @@ impl<M: SpatialMetric> OrdinaryKrigingEngine<M> {
                 "predict_subset requires at least one station index".to_string(),
             ));
         }
-        let prepared_target = self.metric.prepare(target);
-        let variogram = self.variogram;
+        let prepared_target = self.cov.prepare(target);
         let obs_diag = &self.observation_diagonal;
-        let diag_eps = kriging_diagonal_jitter(variogram);
+        let model_diag = self.cov.diagonal();
 
         let mut local_c = DMatrix::zeros(k, k);
         for ii in 0..k {
             let si = indices[ii];
             for jj in ii..k {
                 let sj = indices[jj];
-                let mut cov = variogram
-                    .covariance(self.metric.distance(self.prepared[si], self.prepared[sj]));
-                if ii == jj {
-                    cov += diag_eps;
-                    if let Some(&d) = obs_diag.get(si) {
-                        cov += d;
+                let cov = if ii == jj {
+                    let mut d = model_diag;
+                    if let Some(&obs) = obs_diag.get(si) {
+                        d += obs;
                     }
-                }
+                    d
+                } else {
+                    self.cov.covariance(self.prepared[si], self.prepared[sj])
+                };
                 local_c[(ii, jj)] = cov;
                 local_c[(jj, ii)] = cov;
             }
@@ -219,7 +217,7 @@ impl<M: SpatialMetric> OrdinaryKrigingEngine<M> {
 
         let mut c0 = DVector::zeros(k);
         for (ii, &si) in indices.iter().enumerate() {
-            c0[ii] = variogram.covariance(self.metric.distance(self.prepared[si], prepared_target));
+            c0[ii] = self.cov.covariance(self.prepared[si], prepared_target);
         }
         let mut local_values = Vec::with_capacity(k);
         for &si in indices {
@@ -235,27 +233,6 @@ impl<M: SpatialMetric> OrdinaryKrigingEngine<M> {
         )
     }
 
-    /// Predict at `target` using a search [`Neighborhood`] (local dual SPD per target).
-    pub fn predict_neighborhood(
-        &self,
-        target: M::Coord,
-        neighborhood: Neighborhood,
-    ) -> Result<Prediction, KrigingError> {
-        let prepared_target = self.metric.prepare(target);
-        let indices = select_neighborhood_indices(
-            &self.metric,
-            &self.prepared,
-            prepared_target,
-            neighborhood,
-        );
-        if indices.is_empty() {
-            return Err(KrigingError::InvalidInput(
-                "no stations in search neighborhood for target point".to_string(),
-            ));
-        }
-        self.predict_subset(&indices, target)
-    }
-
     /// Leave-one-out predictions in input order: O(n³) total via Cholesky downdate per hold-out.
     ///
     /// Fast approximate LOO: deletes station `i` from the full `n`-station factorization (same
@@ -269,7 +246,7 @@ impl<M: SpatialMetric> OrdinaryKrigingEngine<M> {
             let l_red = cholesky_delete_index(&self.chol_l, hold)?;
             let beta_red = solve_spd_lower(&l_red, &DVector::from_element(n - 1, 1.0))?;
             let one_t_beta = beta_red.sum();
-            let prepared_target = self.metric.prepare(self.coords[hold]);
+            let prepared_target = self.cov.prepare(self.sites[hold]);
             let mut c0 = DVector::zeros(n - 1);
             let mut values_red = Vec::with_capacity(n - 1);
             let mut out_i = 0;
@@ -277,9 +254,7 @@ impl<M: SpatialMetric> OrdinaryKrigingEngine<M> {
                 if i == hold {
                     continue;
                 }
-                c0[out_i] = self
-                    .variogram
-                    .covariance(self.metric.distance(self.prepared[i], prepared_target));
+                c0[out_i] = self.cov.covariance(self.prepared[i], prepared_target);
                 values_red.push(self.values[i]);
                 out_i += 1;
             }
@@ -317,14 +292,12 @@ impl<M: SpatialMetric> OrdinaryKrigingEngine<M> {
         self.predict_from_cross_cov_inner(&c0)
     }
 
-    fn predict_one(&self, target: M::Coord) -> Result<Prediction, KrigingError> {
+    fn predict_one(&self, target: K::Site) -> Result<Prediction, KrigingError> {
         let n = self.prepared.len();
-        let prepared_target = self.metric.prepare(target);
+        let prepared_target = self.cov.prepare(target);
         let mut c0 = DVector::zeros(n);
         for i in 0..n {
-            c0[i] = self
-                .variogram
-                .covariance(self.metric.distance(self.prepared[i], prepared_target));
+            c0[i] = self.cov.covariance(self.prepared[i], prepared_target);
         }
         self.predict_from_cross_cov_inner(&c0)
     }
@@ -341,26 +314,27 @@ impl<M: SpatialMetric> OrdinaryKrigingEngine<M> {
     }
 }
 
-pub(crate) fn build_covariance<M: SpatialMetric>(
-    metric: &M,
-    prepared: &[M::Prepared],
-    variogram: VariogramModel,
+pub(crate) fn build_covariance<K: PairwiseCovariance>(
+    cov: &K,
+    prepared: &[K::Prepared],
     obs_extra: &[Real],
 ) -> Result<DMatrix<Real>, KrigingError> {
     let n = prepared.len();
-    let diag_eps = kriging_diagonal_jitter(variogram);
+    let model_diag = cov.diagonal();
 
     let fill_row = |i: usize| -> Vec<Real> {
         let mut row = Vec::with_capacity(n - i);
         for j in i..n {
-            let mut cov = variogram.covariance(metric.distance(prepared[i], prepared[j]));
-            if i == j {
-                cov += diag_eps;
-                if let Some(&d) = obs_extra.get(i) {
-                    cov += d;
+            let c = if i == j {
+                let mut d = model_diag;
+                if let Some(&obs) = obs_extra.get(i) {
+                    d += obs;
                 }
-            }
-            row.push(cov);
+                d
+            } else {
+                cov.covariance(prepared[i], prepared[j])
+            };
+            row.push(c);
         }
         row
     };
@@ -372,10 +346,10 @@ pub(crate) fn build_covariance<M: SpatialMetric>(
 
     let mut c = DMatrix::zeros(n, n);
     for (i, row) in rows.into_iter().enumerate() {
-        for (off, cov) in row.into_iter().enumerate() {
+        for (off, val) in row.into_iter().enumerate() {
             let j = i + off;
-            c[(i, j)] = cov;
-            c[(j, i)] = cov;
+            c[(i, j)] = val;
+            c[(j, i)] = val;
         }
     }
     Ok(c)
@@ -430,8 +404,13 @@ mod golden_tests {
     use crate::distance::GeoCoord;
     use crate::geo_dataset::GeoDataset;
     use crate::kriging::ordinary::OrdinaryKrigingModel;
+    use crate::kriging::pairwise::{SpaceTimePairwiseCovariance, SpatialPairwiseCovariance};
+    use crate::spacetime::coord::SpaceTimeCoord;
+    use crate::spacetime::dataset::SpaceTimeDataset;
+    use crate::spacetime::kriging::ordinary::SpaceTimeOrdinaryKrigingModel;
     use crate::spacetime::metric::GeoMetric;
-    use crate::variogram::models::VariogramType;
+    use crate::spacetime::variogram::SpaceTimeVariogram;
+    use crate::variogram::models::{VariogramModel, VariogramType};
 
     fn sample_fixture() -> (Vec<GeoCoord>, Vec<Real>, VariogramModel) {
         let coords = vec![
@@ -442,6 +421,10 @@ mod golden_tests {
         let values = vec![10.0, 20.0, 15.0];
         let variogram = VariogramModel::new(0.01, 5.0, 300.0, VariogramType::Exponential).unwrap();
         (coords, values, variogram)
+    }
+
+    fn spatial(variogram: VariogramModel) -> SpatialPairwiseCovariance<GeoMetric> {
+        SpatialPairwiseCovariance::new(GeoMetric, variogram)
     }
 
     fn assert_prediction_close(engine: &Prediction, golden: &Prediction, label: &str) {
@@ -483,7 +466,7 @@ mod golden_tests {
         let golden_pred = golden.predict(target).expect("golden predict");
 
         let engine =
-            OrdinaryKrigingEngine::fit(GeoMetric, coords, values, variogram).expect("engine fit");
+            OrdinaryKrigingEngine::fit(spatial(variogram), coords, values).expect("engine fit");
         let engine_preds = engine.predict(&[target]).expect("engine predict");
 
         assert_eq!(engine_preds.len(), 1);
@@ -499,7 +482,7 @@ mod golden_tests {
         let golden_pred = golden.predict(target).expect("golden predict");
 
         let engine =
-            OrdinaryKrigingEngine::fit(GeoMetric, coords, values, variogram).expect("engine fit");
+            OrdinaryKrigingEngine::fit(spatial(variogram), coords, values).expect("engine fit");
         let engine_preds = engine.predict(&[target]).expect("engine predict");
 
         assert_prediction_close(&engine_preds[0], &golden_pred, "interior");
@@ -518,7 +501,7 @@ mod golden_tests {
         let golden_preds = golden.predict_batch(&targets).expect("golden batch");
 
         let engine =
-            OrdinaryKrigingEngine::fit(GeoMetric, coords, values, variogram).expect("engine fit");
+            OrdinaryKrigingEngine::fit(spatial(variogram), coords, values).expect("engine fit");
         let engine_preds = engine.predict(&targets).expect("engine batch");
 
         assert_eq!(engine_preds.len(), golden_preds.len());
@@ -537,7 +520,10 @@ mod golden_tests {
         let golden_pred = golden.predict(target).expect("golden predict");
 
         let engine = OrdinaryKrigingEngine::fit_with_extra_diagonal(
-            GeoMetric, coords, values, variogram, &extra,
+            spatial(variogram),
+            coords,
+            values,
+            &extra,
         )
         .expect("engine fit");
         let engine_preds = engine.predict(&[target]).expect("engine predict");
@@ -549,12 +535,12 @@ mod golden_tests {
     fn condition_extends_coords_and_values() {
         let (coords, values, variogram) = sample_fixture();
         let site = GeoCoord::try_new(0.5, 0.5).unwrap();
-        let engine =
-            OrdinaryKrigingEngine::fit(GeoMetric, coords, values, variogram).expect("engine fit");
-        let extended = engine.condition(site, 42.0, 0.0).expect("condition");
-        assert_eq!(extended.coords().len(), 4);
-        assert_eq!(extended.coords()[3], site);
-        assert_eq!(extended.values()[3], 42.0);
+        let mut engine =
+            OrdinaryKrigingEngine::fit(spatial(variogram), coords, values).expect("engine fit");
+        engine.append_condition(site, 42.0, 0.0).expect("condition");
+        assert_eq!(engine.coords().len(), 4);
+        assert_eq!(engine.coords()[3], site);
+        assert_eq!(engine.values()[3], 42.0);
     }
 
     #[test]
@@ -583,10 +569,9 @@ mod golden_tests {
         let golden_pred = golden.predict(target).expect("golden predict");
 
         let engine = OrdinaryKrigingEngine::fit(
-            ProjectedMetric::with_anisotropy(anisotropy),
+            SpatialPairwiseCovariance::new(ProjectedMetric::with_anisotropy(anisotropy), variogram),
             coords,
             values,
-            variogram,
         )
         .expect("engine fit");
         let engine_preds = engine.predict(&[target]).expect("engine predict");
@@ -617,12 +602,73 @@ mod golden_tests {
         );
         let golden_pred = golden.predict(target).expect("golden predict");
 
-        let engine = OrdinaryKrigingEngine::fit(GeoMetric, coords, values, variogram)
-            .expect("engine fit")
-            .condition(new_site, new_value, obs_var)
+        let mut engine =
+            OrdinaryKrigingEngine::fit(spatial(variogram), coords, values).expect("engine fit");
+        engine
+            .append_condition(new_site, new_value, obs_var)
             .expect("condition");
         let engine_preds = engine.predict(&[target]).expect("engine predict");
 
         assert_prediction_close(&engine_preds[0], &golden_pred, "after condition");
+    }
+
+    fn st_fixture() -> (Vec<SpaceTimeCoord<GeoCoord>>, Vec<Real>, SpaceTimeVariogram) {
+        let coords = vec![
+            SpaceTimeCoord::new(GeoCoord::try_new(0.0, 0.0).unwrap(), 0.0),
+            SpaceTimeCoord::new(GeoCoord::try_new(0.0, 1.0).unwrap(), 1.0),
+            SpaceTimeCoord::new(GeoCoord::try_new(1.0, 0.0).unwrap(), 2.0),
+        ];
+        let values = vec![10.0, 20.0, 15.0];
+        let spatial_v = VariogramModel::new(0.01, 1.0, 300.0, VariogramType::Exponential).unwrap();
+        let temporal = VariogramModel::new(0.01, 2.0, 5.0, VariogramType::Exponential).unwrap();
+        let variogram = SpaceTimeVariogram::new_separable(spatial_v, temporal).unwrap();
+        (coords, values, variogram)
+    }
+
+    #[test]
+    fn spacetime_prediction_matches_spacetime_ordinary_model_at_training_site() {
+        let (coords, values, variogram) = st_fixture();
+        let target = coords[1];
+        let dataset = SpaceTimeDataset::new(coords.clone(), values.clone()).unwrap();
+        let golden = SpaceTimeOrdinaryKrigingModel::new(GeoMetric, dataset, variogram)
+            .unwrap()
+            .predict(target)
+            .unwrap();
+        let engine = OrdinaryKrigingEngine::fit(
+            SpaceTimePairwiseCovariance::new(GeoMetric, variogram),
+            coords,
+            values,
+        )
+        .unwrap();
+        let pred = engine.predict(&[target]).unwrap().pop().unwrap();
+        assert_prediction_close(&pred, &golden, "training site");
+    }
+
+    #[test]
+    fn spacetime_condition_then_predict_matches_refit() {
+        let (coords, values, variogram) = st_fixture();
+        let append = SpaceTimeCoord::new(GeoCoord::try_new(0.5, 0.5).unwrap(), 1.5);
+        let append_value = 17.5;
+        let target = SpaceTimeCoord::new(GeoCoord::try_new(0.25, 0.75).unwrap(), 0.5);
+
+        let mut engine = OrdinaryKrigingEngine::fit(
+            SpaceTimePairwiseCovariance::new(GeoMetric, variogram),
+            coords.clone(),
+            values.clone(),
+        )
+        .unwrap();
+        engine.append_condition(append, append_value, 0.0).unwrap();
+        let engine_pred = engine.predict(&[target]).unwrap().pop().unwrap();
+
+        let mut all_coords = coords;
+        let mut all_values = values;
+        all_coords.push(append);
+        all_values.push(append_value);
+        let dataset = SpaceTimeDataset::new(all_coords, all_values).unwrap();
+        let golden = SpaceTimeOrdinaryKrigingModel::new(GeoMetric, dataset, variogram)
+            .unwrap()
+            .predict(target)
+            .unwrap();
+        assert_prediction_close(&engine_pred, &golden, "after condition");
     }
 }

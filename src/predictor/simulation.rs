@@ -13,6 +13,7 @@ use crate::kriging::binomial::{
     logit_observation_variance_empirical_bayes,
 };
 use crate::kriging::engine::OrdinaryKrigingEngine;
+use crate::kriging::pairwise::{SpaceTimePairwiseCovariance, SpatialPairwiseCovariance};
 use crate::kriging::simple_engine::SimpleKrigingEngine;
 use crate::kriging::universal::UniversalTrend;
 use crate::kriging::universal_engine::UniversalKrigingEngine;
@@ -22,7 +23,9 @@ use crate::spacetime::kriging::binomial::SpaceTimeBinomialObservation;
 use crate::spacetime::kriging::engine::SpaceTimeOrdinaryKrigingEngine;
 use crate::spacetime::kriging::simple_engine::SpaceTimeSimpleKrigingEngine;
 use crate::spacetime::kriging::universal::SpaceTimeUniversalTrend;
-use crate::spacetime::kriging::universal_engine::SpaceTimeUniversalKrigingEngine;
+use crate::spacetime::kriging::universal_engine::{
+    SpaceTimeTrendEval, SpaceTimeUniversalKrigingEngine,
+};
 use crate::spacetime::metric::{GeoMetric, ProjectedMetric, SpatialBasis, SpatialMetric};
 use crate::spacetime::variogram::SpaceTimeVariogram;
 use crate::utils::logistic;
@@ -400,7 +403,7 @@ fn single_prediction(
 /// Ordinary kriging SGS backend (geographic coordinates, incremental engine).
 #[derive(Debug, Clone)]
 pub struct OrdinaryGeoSimulator {
-    engine: OrdinaryKrigingEngine<GeoMetric>,
+    engine: OrdinaryKrigingEngine<SpatialPairwiseCovariance<GeoMetric>>,
 }
 
 impl OrdinaryGeoSimulator {
@@ -411,10 +414,9 @@ impl OrdinaryGeoSimulator {
     ) -> Result<Self, KrigingError> {
         validate_continuous_inputs(conditioning_coords, conditioning_values)?;
         let engine = OrdinaryKrigingEngine::fit(
-            GeoMetric,
+            SpatialPairwiseCovariance::new(GeoMetric, variogram),
             conditioning_coords.to_vec(),
             conditioning_values.to_vec(),
-            variogram,
         )?;
         Ok(Self { engine })
     }
@@ -443,7 +445,7 @@ impl KrigingSimulator for OrdinaryGeoSimulator {
 /// Simple kriging SGS backend (geographic coordinates, incremental engine).
 #[derive(Debug, Clone)]
 pub struct SimpleGeoSimulator {
-    engine: SimpleKrigingEngine<GeoMetric>,
+    engine: SimpleKrigingEngine<SpatialPairwiseCovariance<GeoMetric>>,
 }
 
 impl SimpleGeoSimulator {
@@ -455,10 +457,9 @@ impl SimpleGeoSimulator {
     ) -> Result<Self, KrigingError> {
         validate_continuous_inputs(conditioning_coords, conditioning_values)?;
         let engine = SimpleKrigingEngine::fit(
-            GeoMetric,
+            SpatialPairwiseCovariance::new(GeoMetric, variogram),
             conditioning_coords.to_vec(),
             conditioning_values.to_vec(),
-            variogram,
             mean,
         )?;
         Ok(Self { engine })
@@ -484,8 +485,8 @@ impl KrigingSimulator for SimpleGeoSimulator {
 /// Universal kriging SGS backend (polynomial drift; constant trend uses ordinary engine).
 #[derive(Debug, Clone)]
 enum UniversalGeoSimulatorInner {
-    Constant(OrdinaryKrigingEngine<GeoMetric>),
-    Drift(UniversalKrigingEngine),
+    Constant(OrdinaryKrigingEngine<SpatialPairwiseCovariance<GeoMetric>>),
+    Drift(UniversalKrigingEngine<SpatialPairwiseCovariance<GeoMetric>, UniversalTrend>),
 }
 
 /// Universal kriging SGS backend (polynomial drift).
@@ -504,10 +505,9 @@ impl UniversalGeoSimulator {
         if trend == UniversalTrend::Constant {
             validate_continuous_inputs(conditioning_coords, conditioning_values)?;
             let engine = OrdinaryKrigingEngine::fit(
-                GeoMetric,
+                SpatialPairwiseCovariance::new(GeoMetric, variogram),
                 conditioning_coords.to_vec(),
                 conditioning_values.to_vec(),
-                variogram,
             )?;
             Ok(Self {
                 inner: UniversalGeoSimulatorInner::Constant(engine),
@@ -515,9 +515,9 @@ impl UniversalGeoSimulator {
         } else {
             validate_universal_inputs(conditioning_coords.len(), conditioning_values.len(), trend)?;
             let engine = UniversalKrigingEngine::fit(
+                SpatialPairwiseCovariance::new(GeoMetric, variogram),
                 conditioning_coords.to_vec(),
                 conditioning_values.to_vec(),
-                variogram,
                 trend,
             )?;
             Ok(Self {
@@ -563,7 +563,7 @@ impl KrigingSimulator for UniversalGeoSimulator {
 /// Projected ordinary kriging SGS backend (planar coordinates, incremental engine).
 #[derive(Debug, Clone)]
 pub struct ProjectedOrdinarySimulator {
-    engine: OrdinaryKrigingEngine<ProjectedMetric>,
+    engine: OrdinaryKrigingEngine<SpatialPairwiseCovariance<ProjectedMetric>>,
 }
 
 impl ProjectedOrdinarySimulator {
@@ -576,10 +576,9 @@ impl ProjectedOrdinarySimulator {
         validate_continuous_inputs(conditioning_coords, conditioning_values)?;
         let metric = ProjectedMetric::with_anisotropy(anisotropy);
         let engine = OrdinaryKrigingEngine::fit(
-            metric,
+            SpatialPairwiseCovariance::new(metric, variogram),
             conditioning_coords.to_vec(),
             conditioning_values.to_vec(),
-            variogram,
         )?;
         Ok(Self { engine })
     }
@@ -608,7 +607,7 @@ impl KrigingSimulator for ProjectedOrdinarySimulator {
 /// Binomial kriging SGS backend (geographic coordinates, logit-scale engine).
 #[derive(Debug, Clone)]
 pub struct BinomialGeoSimulator {
-    engine: OrdinaryKrigingEngine<GeoMetric>,
+    engine: OrdinaryKrigingEngine<SpatialPairwiseCovariance<GeoMetric>>,
 }
 
 impl BinomialGeoSimulator {
@@ -633,10 +632,9 @@ impl BinomialGeoSimulator {
             "binomial simulation engine build failed",
             |extra| {
                 OrdinaryKrigingEngine::fit_with_extra_diagonal(
-                    GeoMetric,
+                    SpatialPairwiseCovariance::new(GeoMetric, variogram),
                     pool_coords.clone(),
                     pool_logits.clone(),
-                    variogram,
                     &extra,
                 )
             },
@@ -669,7 +667,7 @@ impl BinomialKrigingSimulator for BinomialGeoSimulator {
 /// Binomial kriging SGS backend (projected coordinates, logit-scale engine).
 #[derive(Debug, Clone)]
 pub struct BinomialProjectedSimulator {
-    engine: OrdinaryKrigingEngine<ProjectedMetric>,
+    engine: OrdinaryKrigingEngine<SpatialPairwiseCovariance<ProjectedMetric>>,
 }
 
 impl BinomialProjectedSimulator {
@@ -696,10 +694,9 @@ impl BinomialProjectedSimulator {
             "binomial projected simulation engine build failed",
             |extra| {
                 OrdinaryKrigingEngine::fit_with_extra_diagonal(
-                    metric,
+                    SpatialPairwiseCovariance::new(metric, variogram),
                     pool_coords.clone(),
                     pool_logits.clone(),
-                    variogram,
                     &extra,
                 )
             },
@@ -806,10 +803,9 @@ impl<M: SpatialMetric> SpacetimeOrdinarySimulator<M> {
     ) -> Result<Self, KrigingError> {
         validate_continuous_inputs(conditioning_coords, conditioning_values)?;
         let engine = SpaceTimeOrdinaryKrigingEngine::fit_with_extra_diagonal(
-            metric,
+            SpaceTimePairwiseCovariance::new(metric, variogram),
             conditioning_coords.to_vec(),
             conditioning_values.to_vec(),
-            variogram,
             &[],
         )?;
         Ok(Self { metric, engine })
@@ -850,10 +846,9 @@ impl<M: SpatialMetric> SpacetimeSimpleSimulator<M> {
     ) -> Result<Self, KrigingError> {
         validate_continuous_inputs(conditioning_coords, conditioning_values)?;
         let engine = SpaceTimeSimpleKrigingEngine::fit(
-            metric,
+            SpaceTimePairwiseCovariance::new(metric, variogram),
             conditioning_coords.to_vec(),
             conditioning_values.to_vec(),
-            variogram,
             mean,
         )?;
         Ok(Self { metric, engine })
@@ -901,10 +896,9 @@ impl<M: SpatialBasis> SpacetimeUniversalSimulator<M> {
         if trend == SpaceTimeUniversalTrend::Constant {
             validate_continuous_inputs(conditioning_coords, conditioning_values)?;
             let engine = SpaceTimeOrdinaryKrigingEngine::fit_with_extra_diagonal(
-                metric,
+                SpaceTimePairwiseCovariance::new(metric, variogram),
                 conditioning_coords.to_vec(),
                 conditioning_values.to_vec(),
-                variogram,
                 &[],
             )?;
             Ok(Self {
@@ -918,11 +912,10 @@ impl<M: SpatialBasis> SpacetimeUniversalSimulator<M> {
                 trend,
             )?;
             let engine = SpaceTimeUniversalKrigingEngine::fit(
-                metric,
+                SpaceTimePairwiseCovariance::new(metric, variogram),
                 conditioning_coords.to_vec(),
                 conditioning_values.to_vec(),
-                variogram,
-                trend,
+                SpaceTimeTrendEval::new(metric, trend),
             )?;
             Ok(Self {
                 metric,
@@ -1001,10 +994,9 @@ impl<M: SpatialMetric> SpacetimeBinomialSimulator<M> {
             "space-time binomial simulation engine build failed",
             |extra| {
                 SpaceTimeOrdinaryKrigingEngine::fit_with_extra_diagonal(
-                    metric,
+                    SpaceTimePairwiseCovariance::new(metric, variogram),
                     pool_coords.clone(),
                     pool_logits.clone(),
-                    variogram,
                     &extra,
                 )
             },

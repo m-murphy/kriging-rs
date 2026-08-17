@@ -1,293 +1,93 @@
-//! Dual-SPD universal space–time kriging engine.
-
-#[cfg(not(target_arch = "wasm32"))]
-use rayon::prelude::*;
-
-use nalgebra::{DMatrix, DVector};
+//! Type alias: space-time universal kriging is the universal engine over space-time
+//! pairwise covariance and a space-time trend-basis adapter.
 
 use crate::Real;
-use crate::cholesky_update::cholesky_extend_spd_lower;
-use crate::cholesky_update::forward_solve_lower;
-use crate::error::KrigingError;
-use crate::kriging::engine::{factor_spd, solve_spd_lower};
-use crate::kriging::numerics::extend_beta_column;
-use crate::kriging::ordinary::Prediction;
-use crate::spacetime::coord::{SpaceTimeCoord, temporal_distance};
-use crate::spacetime::kriging::engine::build_covariance;
-use crate::spacetime::kriging::ordinary::spacetime_diagonal_jitter;
+use crate::kriging::pairwise::SpaceTimePairwiseCovariance;
+use crate::kriging::universal::TrendBasis;
+use crate::kriging::universal_engine::UniversalKrigingEngine;
+use crate::spacetime::coord::SpaceTimeCoord;
 use crate::spacetime::kriging::universal::SpaceTimeUniversalTrend;
 use crate::spacetime::metric::SpatialBasis;
-use crate::spacetime::variogram::SpaceTimeVariogram;
 
-/// Fitted universal space–time kriging engine: Cholesky on `C` plus `β = C⁻¹F` and Schur `Fᵀβ`.
-#[derive(Debug, Clone)]
-pub struct SpaceTimeUniversalKrigingEngine<M: SpatialBasis> {
+/// Evaluates [`SpaceTimeUniversalTrend`] at a space–time site using [`SpatialBasis`].
+#[derive(Debug, Clone, Copy)]
+pub struct SpaceTimeTrendEval<M: SpatialBasis> {
     metric: M,
-    coords: Vec<SpaceTimeCoord<M::Coord>>,
-    prepared_spatial: Vec<M::Prepared>,
-    times: Vec<Real>,
-    values: Vec<Real>,
-    variogram: SpaceTimeVariogram,
     trend: SpaceTimeUniversalTrend,
-    cov_at_zero: Real,
-    observation_diagonal: Vec<Real>,
-    design: DMatrix<Real>,
-    chol_l: DMatrix<Real>,
-    beta: DMatrix<Real>,
-    schur_l: DMatrix<Real>,
 }
 
-impl<M: SpatialBasis> SpaceTimeUniversalKrigingEngine<M> {
-    pub fn fit(
-        metric: M,
-        coords: Vec<SpaceTimeCoord<M::Coord>>,
-        values: Vec<Real>,
-        variogram: SpaceTimeVariogram,
-        trend: SpaceTimeUniversalTrend,
-    ) -> Result<Self, KrigingError> {
-        Self::fit_with_extra_diagonal(metric, coords, values, variogram, trend, &[])
+impl<M: SpatialBasis> SpaceTimeTrendEval<M> {
+    pub fn new(metric: M, trend: SpaceTimeUniversalTrend) -> Self {
+        Self { metric, trend }
+    }
+}
+
+impl<M: SpatialBasis> TrendBasis for SpaceTimeTrendEval<M> {
+    type Site = SpaceTimeCoord<M::Coord>;
+
+    fn n_basis(self) -> usize {
+        self.trend.n_basis()
     }
 
-    pub fn fit_with_extra_diagonal(
-        metric: M,
-        coords: Vec<SpaceTimeCoord<M::Coord>>,
-        values: Vec<Real>,
-        variogram: SpaceTimeVariogram,
-        trend: SpaceTimeUniversalTrend,
-        extra_diagonal: &[Real],
-    ) -> Result<Self, KrigingError> {
-        let n = coords.len();
-        let p = trend.n_basis();
-        if n != values.len() {
-            return Err(KrigingError::DimensionMismatch(format!(
-                "coords ({n}) and values ({}) must have equal length",
-                values.len()
-            )));
-        }
-        if n < p + 1 {
-            return Err(KrigingError::InsufficientData(p + 1));
-        }
+    fn eval(self, site: Self::Site, out: &mut [Real]) {
+        let (s1, s2) = self.metric.spatial_components(site.spatial);
+        self.trend.eval(s1, s2, site.time, out);
+    }
+}
 
-        let prepared_spatial: Vec<M::Prepared> =
-            coords.iter().map(|c| metric.prepare(c.spatial)).collect();
-        let times: Vec<Real> = coords.iter().map(|c| c.time).collect();
-        let design = build_design(&metric, &coords, &times, trend, n, p);
-        let c = build_covariance(
-            &metric,
-            &prepared_spatial,
-            &times,
-            variogram,
-            extra_diagonal,
-        )?;
-        let chol_l = factor_spd(c)?;
-        let beta = solve_beta_columns(&chol_l, &design, n, p)?;
-        let schur = design.transpose() * &beta;
-        let schur_l = factor_spd(schur)?;
+/// Universal space-time engine: [`UniversalKrigingEngine`] with space-time covariance and trend adapters.
+pub type SpaceTimeUniversalKrigingEngine<M> =
+    UniversalKrigingEngine<SpaceTimePairwiseCovariance<M>, SpaceTimeTrendEval<M>>;
 
-        Ok(Self {
-            metric,
-            coords,
-            prepared_spatial,
-            times,
-            values,
+#[cfg(test)]
+mod golden_tests {
+    use super::*;
+    use crate::distance::GeoCoord;
+    use crate::spacetime::coord::SpaceTimeCoord;
+    use crate::spacetime::dataset::SpaceTimeDataset;
+    use crate::spacetime::kriging::universal::{
+        SpaceTimeUniversalKrigingModel, SpaceTimeUniversalTrend,
+    };
+    use crate::spacetime::metric::GeoMetric;
+    use crate::spacetime::variogram::SpaceTimeVariogram;
+    use crate::variogram::models::{VariogramModel, VariogramType};
+
+    #[test]
+    fn spacetime_linear_in_time_matches_universal_model() {
+        let coords = vec![
+            SpaceTimeCoord::new(GeoCoord::try_new(0.0, 0.0).unwrap(), 0.0),
+            SpaceTimeCoord::new(GeoCoord::try_new(0.0, 1.0).unwrap(), 1.0),
+            SpaceTimeCoord::new(GeoCoord::try_new(1.0, 0.0).unwrap(), 2.0),
+            SpaceTimeCoord::new(GeoCoord::try_new(1.0, 1.0).unwrap(), 3.0),
+        ];
+        let values = vec![1.0, 4.0, 7.0, 10.0];
+        let variogram = SpaceTimeVariogram::new_separable(
+            VariogramModel::new(0.05, 1.0, 300.0, VariogramType::Exponential).unwrap(),
+            VariogramModel::new(0.05, 1.0, 5.0, VariogramType::Exponential).unwrap(),
+        )
+        .unwrap();
+        let trend = SpaceTimeUniversalTrend::LinearInTime;
+        let target = SpaceTimeCoord::new(GeoCoord::try_new(0.25, 0.25).unwrap(), 1.5);
+
+        let golden = SpaceTimeUniversalKrigingModel::new(
+            GeoMetric,
+            SpaceTimeDataset::new(coords.clone(), values.clone()).unwrap(),
             variogram,
             trend,
-            cov_at_zero: variogram.c_at_zero(),
-            observation_diagonal: extra_diagonal.to_vec(),
-            design,
-            chol_l,
-            beta,
-            schur_l,
-        })
+        )
+        .expect("golden model");
+        let golden_pred = golden.predict(target).expect("golden predict");
+
+        let engine = SpaceTimeUniversalKrigingEngine::fit(
+            SpaceTimePairwiseCovariance::new(GeoMetric, variogram),
+            coords,
+            values,
+            SpaceTimeTrendEval::new(GeoMetric, trend),
+        )
+        .expect("engine fit");
+        let engine_pred = engine.predict(&[target]).expect("engine predict")[0];
+
+        assert!((engine_pred.value - golden_pred.value).abs() < 1e-3);
+        assert!((engine_pred.variance - golden_pred.variance).abs() < 1e-3);
     }
-
-    pub fn variogram(&self) -> SpaceTimeVariogram {
-        self.variogram
-    }
-
-    pub fn predict(
-        &self,
-        targets: &[SpaceTimeCoord<M::Coord>],
-    ) -> Result<Vec<Prediction>, KrigingError> {
-        if targets.is_empty() {
-            return Ok(Vec::new());
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            targets
-                .par_iter()
-                .map(|target| self.predict_one(*target))
-                .collect()
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            targets.iter().map(|&t| self.predict_one(t)).collect()
-        }
-    }
-
-    pub fn condition(
-        mut self,
-        site: SpaceTimeCoord<M::Coord>,
-        value: Real,
-        obs_var: Real,
-    ) -> Result<Self, KrigingError> {
-        if !obs_var.is_finite() || obs_var < 0.0 {
-            return Err(KrigingError::InvalidInput(
-                "observation variance must be finite and non-negative".to_string(),
-            ));
-        }
-        let n = self.prepared_spatial.len();
-        let p = self.trend.n_basis();
-        let prepared_site = self.metric.prepare(site.spatial);
-        let time_site = site.time;
-        let mut cross = DVector::zeros(n);
-        for i in 0..n {
-            let hs = self
-                .metric
-                .distance(self.prepared_spatial[i], prepared_site);
-            let ht = temporal_distance(self.times[i], time_site);
-            cross[i] = self.variogram.covariance(hs, ht);
-        }
-        let diag_eps = spacetime_diagonal_jitter(self.variogram);
-        let new_diag = self.cov_at_zero + diag_eps + obs_var;
-
-        let gamma_v = solve_spd_lower(&self.chol_l, &cross)?;
-        let w_fwd = forward_solve_lower(&self.chol_l, &cross)?;
-        let schur = new_diag - w_fwd.dot(&w_fwd);
-
-        self.chol_l = cholesky_extend_spd_lower(&self.chol_l, &cross, new_diag)?;
-        self.coords.push(site);
-        self.prepared_spatial.push(prepared_site);
-        self.times.push(time_site);
-        self.values.push(value);
-        self.observation_diagonal.push(obs_var);
-
-        let (s1, s2) = self.metric.spatial_components(site.spatial);
-        let mut f_row = vec![0.0 as Real; p];
-        self.trend.eval(s1, s2, time_site, &mut f_row);
-
-        let mut new_beta = DMatrix::zeros(n + 1, p);
-        for l in 0..p {
-            let mut col = DVector::zeros(n);
-            for i in 0..n {
-                col[i] = self.beta[(i, l)];
-            }
-            let col_new = extend_beta_column(&col, &cross, &gamma_v, schur, f_row[l])?;
-            for i in 0..=n {
-                new_beta[(i, l)] = col_new[i];
-            }
-        }
-        self.beta = new_beta;
-
-        let mut new_design = DMatrix::zeros(n + 1, p);
-        for i in 0..n {
-            for l in 0..p {
-                new_design[(i, l)] = self.design[(i, l)];
-            }
-        }
-        for l in 0..p {
-            new_design[(n, l)] = f_row[l];
-        }
-        self.design = new_design;
-
-        let schur_mat = self.design.transpose() * &self.beta;
-        self.schur_l = factor_spd(schur_mat)?;
-        Ok(self)
-    }
-
-    fn predict_one(&self, target: SpaceTimeCoord<M::Coord>) -> Result<Prediction, KrigingError> {
-        let n = self.prepared_spatial.len();
-        let prepared_target = self.metric.prepare(target.spatial);
-        let mut c0 = DVector::zeros(n);
-        for i in 0..n {
-            let hs = self
-                .metric
-                .distance(self.prepared_spatial[i], prepared_target);
-            let ht = temporal_distance(self.times[i], target.time);
-            c0[i] = self.variogram.covariance(hs, ht);
-        }
-        let (s1, s2) = self.metric.spatial_components(target.spatial);
-        let mut f0 = vec![0.0 as Real; self.trend.n_basis()];
-        self.trend.eval(s1, s2, target.time, &mut f0);
-        self.predict_from_cross_cov(&c0, &f0)
-    }
-
-    fn predict_from_cross_cov(
-        &self,
-        c0: &DVector<Real>,
-        f0: &[Real],
-    ) -> Result<Prediction, KrigingError> {
-        let n = self.prepared_spatial.len();
-        let p = self.trend.n_basis();
-        let gamma0 = solve_spd_lower(&self.chol_l, c0)?;
-
-        let mut rhs = DVector::zeros(p);
-        for l in 0..p {
-            let mut col_dot = 0.0 as Real;
-            for i in 0..n {
-                col_dot += self.design[(i, l)] * gamma0[i];
-            }
-            rhs[l] = col_dot - f0[l];
-        }
-        let lambda = solve_spd_lower(&self.schur_l, &rhs)?;
-
-        let mut value = 0.0 as Real;
-        let mut cov_dot = 0.0 as Real;
-        for i in 0..n {
-            let mut wi = gamma0[i];
-            for l in 0..p {
-                wi -= self.beta[(i, l)] * lambda[l];
-            }
-            value += wi * self.values[i];
-            cov_dot += wi * c0[i];
-        }
-        let mut mu_dot = 0.0 as Real;
-        for l in 0..p {
-            mu_dot += lambda[l] * f0[l];
-        }
-        Ok(Prediction {
-            value,
-            variance: (self.cov_at_zero - cov_dot - mu_dot).max(0.0),
-        })
-    }
-}
-
-fn build_design<M: SpatialBasis>(
-    metric: &M,
-    coords: &[SpaceTimeCoord<M::Coord>],
-    times: &[Real],
-    trend: SpaceTimeUniversalTrend,
-    n: usize,
-    p: usize,
-) -> DMatrix<Real> {
-    let mut design = DMatrix::zeros(n, p);
-    let mut buf = vec![0.0 as Real; p];
-    for i in 0..n {
-        let (s1, s2) = metric.spatial_components(coords[i].spatial);
-        trend.eval(s1, s2, times[i], &mut buf);
-        for l in 0..p {
-            design[(i, l)] = buf[l];
-        }
-    }
-    design
-}
-
-fn solve_beta_columns(
-    chol_l: &DMatrix<Real>,
-    design: &DMatrix<Real>,
-    n: usize,
-    p: usize,
-) -> Result<DMatrix<Real>, KrigingError> {
-    let mut beta = DMatrix::zeros(n, p);
-    for l in 0..p {
-        let mut col = DVector::zeros(n);
-        for i in 0..n {
-            col[i] = design[(i, l)];
-        }
-        let gamma = solve_spd_lower(chol_l, &col)?;
-        for i in 0..n {
-            beta[(i, l)] = gamma[i];
-        }
-    }
-    Ok(beta)
 }

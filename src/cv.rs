@@ -568,7 +568,7 @@ mod tests {
         assert_eq!(ok.len(), uk.len());
         for (a, b) in ok.iter().zip(uk.iter()) {
             // Dual SPD ordinary kriging (ADR-0001) can differ from bordered LU at the last
-            // few f32 ULPs; constant-trend universal still uses the legacy path today.
+            // few f32 ULPs; constant-trend universal delegates to the ordinary engine.
             assert!(
                 (a.predicted - b.predicted).abs() < 5e-6,
                 "constant-trend UK should match OK at station {} (ok={}, uk={})",
