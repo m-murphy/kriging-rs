@@ -1,21 +1,21 @@
 //! Universal space–time kriging.
 //!
 //! Generalizes ordinary ST kriging by allowing a deterministic polynomial trend in space,
-//! time, or both. Mirrors the 2-D [`UniversalKrigingModel`](crate::UniversalKrigingModel)
-//! pattern: stack `[C  F; F^T  0]` and solve the augmented system.
-
-use std::sync::Arc;
-
-use nalgebra::{DMatrix, DVector, Dyn, linalg::LU};
-#[cfg(not(target_arch = "wasm32"))]
-use rayon::prelude::*;
+//! time, or both. Non-constant trends use
+//! [`SpaceTimeUniversalKrigingEngine`](crate::spacetime::kriging::universal_engine::SpaceTimeUniversalKrigingEngine);
+//! constant trend delegates to [`SpaceTimeOrdinaryKrigingEngine`](crate::spacetime::kriging::engine::SpaceTimeOrdinaryKrigingEngine).
 
 use crate::Real;
 use crate::error::KrigingError;
+use crate::kriging::conditioner::KrigingConditioner;
 use crate::kriging::ordinary::Prediction;
-use crate::spacetime::coord::{SpaceTimeCoord, temporal_distance};
+use crate::kriging::pairwise::SpaceTimePairwiseCovariance;
+use crate::spacetime::coord::SpaceTimeCoord;
 use crate::spacetime::dataset::SpaceTimeDataset;
-use crate::spacetime::kriging::ordinary::spacetime_diagonal_jitter;
+use crate::spacetime::kriging::engine::SpaceTimeOrdinaryKrigingEngine;
+use crate::spacetime::kriging::universal_engine::{
+    SpaceTimeTrendEval, SpaceTimeUniversalKrigingEngine,
+};
 use crate::spacetime::metric::SpatialBasis;
 use crate::spacetime::variogram::SpaceTimeVariogram;
 
@@ -95,38 +95,17 @@ impl SpaceTimeUniversalTrend {
     }
 }
 
-/// Fitted universal space–time kriging model.
-#[derive(Debug)]
-pub struct SpaceTimeUniversalKrigingModel<M: SpatialBasis> {
-    metric: M,
-    coords: Vec<SpaceTimeCoord<M::Coord>>,
-    prepared_spatial: Vec<M::Prepared>,
-    times: Vec<Real>,
-    values: Vec<Real>,
-    variogram: SpaceTimeVariogram,
-    trend: SpaceTimeUniversalTrend,
-    c_at_zero: Real,
-    system_lu: Arc<LU<Real, Dyn, Dyn>>,
+#[derive(Debug, Clone)]
+enum SpaceTimeUniversalInner<M: SpatialBasis> {
+    Constant(SpaceTimeOrdinaryKrigingEngine<M>),
+    Drift(SpaceTimeUniversalKrigingEngine<M>),
 }
 
-impl<M: SpatialBasis> Clone for SpaceTimeUniversalKrigingModel<M>
-where
-    M::Coord: Clone,
-    M::Prepared: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            metric: self.metric,
-            coords: self.coords.clone(),
-            prepared_spatial: self.prepared_spatial.clone(),
-            times: self.times.clone(),
-            values: self.values.clone(),
-            variogram: self.variogram,
-            trend: self.trend,
-            c_at_zero: self.c_at_zero,
-            system_lu: Arc::clone(&self.system_lu),
-        }
-    }
+/// Fitted universal space–time kriging model.
+#[derive(Debug, Clone)]
+pub struct SpaceTimeUniversalKrigingModel<M: SpatialBasis> {
+    trend: SpaceTimeUniversalTrend,
+    inner: SpaceTimeUniversalInner<M>,
 }
 
 impl<M: SpatialBasis> SpaceTimeUniversalKrigingModel<M> {
@@ -137,158 +116,72 @@ impl<M: SpatialBasis> SpaceTimeUniversalKrigingModel<M> {
         trend: SpaceTimeUniversalTrend,
     ) -> Result<Self, KrigingError> {
         let (coords, values) = dataset.into_parts();
-        let n = coords.len();
-        let p = trend.n_basis();
-        if n < p + 1 {
-            return Err(KrigingError::InsufficientData(p + 1));
-        }
-        let prepared_spatial: Vec<M::Prepared> =
-            coords.iter().map(|c| metric.prepare(c.spatial)).collect();
-        let times: Vec<Real> = coords.iter().map(|c| c.time).collect();
-
-        let system = build_system(
-            &metric,
-            &coords,
-            &prepared_spatial,
-            &times,
-            variogram,
-            trend,
-        );
-        let system_lu = Arc::new(system.lu());
-        let probe = DVector::from_element(n + p, 0.0);
-        if system_lu.solve(&probe).is_none() {
-            return Err(KrigingError::MatrixError(
-                "could not factorize space-time universal kriging system".to_string(),
-            ));
-        }
-        Ok(Self {
-            metric,
-            coords,
-            prepared_spatial,
-            times,
-            values,
-            variogram,
-            trend,
-            c_at_zero: variogram.c_at_zero(),
-            system_lu,
-        })
+        let inner = if trend == SpaceTimeUniversalTrend::Constant {
+            SpaceTimeUniversalInner::Constant(
+                SpaceTimeOrdinaryKrigingEngine::fit_with_extra_diagonal(
+                    SpaceTimePairwiseCovariance::new(metric, variogram),
+                    coords,
+                    values,
+                    &[],
+                )?,
+            )
+        } else {
+            SpaceTimeUniversalInner::Drift(SpaceTimeUniversalKrigingEngine::fit(
+                SpaceTimePairwiseCovariance::new(metric, variogram),
+                coords,
+                values,
+                SpaceTimeTrendEval::new(metric, trend),
+            )?)
+        };
+        Ok(Self { trend, inner })
     }
 
     pub fn trend(&self) -> SpaceTimeUniversalTrend {
         self.trend
     }
 
+    pub fn variogram(&self) -> SpaceTimeVariogram {
+        match &self.inner {
+            SpaceTimeUniversalInner::Constant(engine) => engine.pairwise_covariance().variogram(),
+            SpaceTimeUniversalInner::Drift(engine) => engine.pairwise_covariance().variogram(),
+        }
+    }
+
+    /// Consume this fitted model as live state for sequential Gaussian simulation.
+    pub fn into_conditioner(
+        self,
+    ) -> Result<KrigingConditioner<SpaceTimeCoord<M::Coord>>, KrigingError>
+    where
+        M: 'static,
+        M::Coord: 'static,
+        M::Prepared: 'static,
+    {
+        Ok(match self.inner {
+            SpaceTimeUniversalInner::Constant(engine) => KrigingConditioner::from_ordinary(engine),
+            SpaceTimeUniversalInner::Drift(engine) => KrigingConditioner::from_universal(engine),
+        })
+    }
+
     pub fn predict(&self, target: SpaceTimeCoord<M::Coord>) -> Result<Prediction, KrigingError> {
-        let n = self.coords.len();
-        let p = self.trend.n_basis();
-        let mut rhs = DVector::from_element(n + p, 0.0);
-        self.predict_with_rhs(target, &mut rhs)
+        match &self.inner {
+            SpaceTimeUniversalInner::Constant(engine) => engine
+                .predict(&[target])
+                .map(|mut v| v.pop().expect("single prediction")),
+            SpaceTimeUniversalInner::Drift(engine) => engine
+                .predict(&[target])
+                .map(|mut v| v.pop().expect("single prediction")),
+        }
     }
 
     pub fn predict_batch(
         &self,
         targets: &[SpaceTimeCoord<M::Coord>],
     ) -> Result<Vec<Prediction>, KrigingError> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let n = self.coords.len();
-            let p = self.trend.n_basis();
-            targets
-                .par_iter()
-                .map_init(
-                    || DVector::<Real>::from_element(n + p, 0.0),
-                    |rhs, t| self.predict_with_rhs(*t, rhs),
-                )
-                .collect()
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            let n = self.coords.len();
-            let p = self.trend.n_basis();
-            let mut rhs = DVector::from_element(n + p, 0.0);
-            let mut out = Vec::with_capacity(targets.len());
-            for &t in targets {
-                out.push(self.predict_with_rhs(t, &mut rhs)?);
-            }
-            Ok(out)
+        match &self.inner {
+            SpaceTimeUniversalInner::Constant(engine) => engine.predict(targets),
+            SpaceTimeUniversalInner::Drift(engine) => engine.predict(targets),
         }
     }
-
-    fn predict_with_rhs(
-        &self,
-        target: SpaceTimeCoord<M::Coord>,
-        rhs: &mut DVector<Real>,
-    ) -> Result<Prediction, KrigingError> {
-        let n = self.coords.len();
-        let p = self.trend.n_basis();
-        let prepared_target = self.metric.prepare(target.spatial);
-        for i in 0..n {
-            let hs = self
-                .metric
-                .distance(self.prepared_spatial[i], prepared_target);
-            let ht = temporal_distance(self.times[i], target.time);
-            rhs[i] = self.variogram.covariance(hs, ht);
-        }
-        let (s1, s2) = self.metric.spatial_components(target.spatial);
-        let mut f0 = vec![0.0 as Real; p];
-        self.trend.eval(s1, s2, target.time, &mut f0);
-        for l in 0..p {
-            rhs[n + l] = f0[l];
-        }
-        let sol = self.system_lu.solve(rhs).ok_or_else(|| {
-            KrigingError::MatrixError(
-                "could not solve space-time universal kriging system".to_string(),
-            )
-        })?;
-        let mut value: Real = 0.0;
-        let mut cov_dot: Real = 0.0;
-        for i in 0..n {
-            value += sol[i] * self.values[i];
-            cov_dot += sol[i] * rhs[i];
-        }
-        let mut mu_dot: Real = 0.0;
-        for l in 0..p {
-            mu_dot += sol[n + l] * f0[l];
-        }
-        let variance = (self.c_at_zero - cov_dot - mu_dot).max(0.0);
-        Ok(Prediction { value, variance })
-    }
-}
-
-fn build_system<M: SpatialBasis>(
-    metric: &M,
-    coords: &[SpaceTimeCoord<M::Coord>],
-    prepared: &[M::Prepared],
-    times: &[Real],
-    variogram: SpaceTimeVariogram,
-    trend: SpaceTimeUniversalTrend,
-) -> DMatrix<Real> {
-    let n = prepared.len();
-    let p = trend.n_basis();
-    let diag_eps = spacetime_diagonal_jitter(n, variogram);
-    let mut m = DMatrix::from_element(n + p, n + p, 0.0);
-    for i in 0..n {
-        for j in i..n {
-            let hs = metric.distance(prepared[i], prepared[j]);
-            let ht = temporal_distance(times[i], times[j]);
-            let mut cov = variogram.covariance(hs, ht);
-            if i == j {
-                cov += diag_eps;
-            }
-            m[(i, j)] = cov;
-            m[(j, i)] = cov;
-        }
-    }
-    let mut fi = vec![0.0 as Real; p];
-    for i in 0..n {
-        let (s1, s2) = metric.spatial_components(coords[i].spatial);
-        trend.eval(s1, s2, times[i], &mut fi);
-        for l in 0..p {
-            m[(i, n + l)] = fi[l];
-            m[(n + l, i)] = fi[l];
-        }
-    }
-    m
 }
 
 #[cfg(test)]
@@ -369,7 +262,6 @@ mod tests {
 
     #[test]
     fn linear_in_time_recovers_pure_temporal_trend() {
-        // Field z = 1 + 3*t with no spatial dependence; LinearInTime should fit exactly.
         let mut coords = Vec::new();
         let mut values = Vec::new();
         for i in 0..3 {
@@ -406,8 +298,6 @@ mod tests {
 
     #[test]
     fn linear_in_space_and_time_recovers_planar_drift() {
-        // z = 1 + 2*lat + 0.5*lon + 3*t. With both spatial axes varying the design matrix
-        // is full-rank and LinearInSpaceAndTime should recover the plane closely.
         let (coords, values) = make_grid();
         let v = variogram();
         let model = SpaceTimeUniversalKrigingModel::new(

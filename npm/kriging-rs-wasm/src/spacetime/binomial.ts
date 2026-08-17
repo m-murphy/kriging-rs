@@ -6,13 +6,20 @@
  */
 
 import { KrigingError, wrapThrown } from "../errors.js";
+import {
+  binomialKFold,
+  binomialLeaveOneOut,
+  freeBinomialHandle,
+  getBinomialBuildNotes,
+  requireBinomialHandle,
+} from "../internal/binomial-model-shared.js";
 import { toFloat64Array, toUint32Array } from "../internal/convert.js";
 import { buildGridLatsLons, reshapeFlatToGrid } from "../internal/grid.js";
 import {
   mapBinomialBatchArrayOutput,
-  mapBinomialBuildNotes,
   mapBinomialPrediction,
   mapBinomialPredictionArray,
+  mapSpaceTimeBinomialDiagnostics,
 } from "../internal/mappers.js";
 import { requireLoadedModule } from "../internal/module.js";
 import {
@@ -20,18 +27,24 @@ import {
   packSpaceTimeVariogram,
 } from "../internal/spacetime.js";
 import { timesFromDates } from "../time.js";
-import type { WasmSpaceTimeBinomialInstance } from "../internal/wasm-shapes.js";
+import type { WasmKrigingModelHandle } from "../internal/wasm-shapes.js";
 import type {
   BinomialBatchArrayOutput,
   BinomialBuildNotes,
+  BinomialCvResult,
   BinomialGridOutput,
   BinomialPrediction,
   DateAxisOptions,
+  IntegerArrayInput,
   NumericArrayInput,
   PredictGridAtDateOptions,
   PredictGridAtTimeOptions,
+  SpaceTimeBinomialDiagnostics,
+  SpaceTimeBinomialFromPrecomputedLogitsOptions,
+  SpaceTimeBinomialFromPrecomputedLogitsWithVariancesOptions,
   SpaceTimeBinomialKrigingFromFittedOptions,
   SpaceTimeBinomialKrigingOptions,
+  SpaceTimeBinomialKrigingWithPriorOptions,
 } from "../types.js";
 
 const FREED = "SpaceTimeBinomialKriging model has been freed";
@@ -42,12 +55,12 @@ const FREED = "SpaceTimeBinomialKriging model has been freed";
  * (`[0, 1]`) and logit scales.
  */
 export class SpaceTimeBinomialKriging {
-  private inner: WasmSpaceTimeBinomialInstance | null;
+  private inner: WasmKrigingModelHandle | null;
 
   constructor(options: SpaceTimeBinomialKrigingOptions) {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmSpaceTimeBinomialKriging;
-    if (!ctor) {
+    const factory = mod.WasmKrigingModel?.spacetimeBinomialGeoFromArrays;
+    if (!factory) {
       throw new KrigingError(
         "SpaceTimeBinomialKriging is not available; rebuild the WASM package",
         { code: "backend_unavailable" }
@@ -55,7 +68,8 @@ export class SpaceTimeBinomialKriging {
     }
     const packed = packSpaceTimeVariogram(options.variogram);
     try {
-      this.inner = ctor.fromArrays(
+      this.inner = factory.call(
+        mod.WasmKrigingModel,
         toFloat64Array(options.lats),
         toFloat64Array(options.lons),
         toFloat64Array(options.times),
@@ -74,14 +88,173 @@ export class SpaceTimeBinomialKriging {
         packed.temporalShape,
         packed.k1,
         packed.k2,
-        packed.k3
+        packed.k3,
+        options.stability,
+        options.oneStepLaplaceObservationVariance
       );
     } catch (e) {
       throw wrapThrown(e);
     }
   }
 
-  private requireInner(): WasmSpaceTimeBinomialInstance {
+  /**
+   * Space-time binomial kriging with an explicit Beta prior on prevalence (same
+   * shrinkage semantics as {@link BinomialKriging.newWithPrior}).
+   */
+  static newWithPrior(
+    options: SpaceTimeBinomialKrigingWithPriorOptions
+  ): SpaceTimeBinomialKriging {
+    const mod = requireLoadedModule();
+    const factory = mod.WasmKrigingModel?.spacetimeBinomialGeoFromArraysWithPrior;
+    if (!factory) {
+      throw new KrigingError(
+        "SpaceTimeBinomialKriging is not available; rebuild the WASM package",
+        { code: "backend_unavailable" }
+      );
+    }
+    const packed = packSpaceTimeVariogram(options.variogram);
+    const instance = Object.create(
+      SpaceTimeBinomialKriging.prototype
+    ) as SpaceTimeBinomialKriging;
+    try {
+      (instance as unknown as { inner: WasmKrigingModelHandle | null }).inner =
+        factory.call(
+          mod.WasmKrigingModel,
+          toFloat64Array(options.lats),
+          toFloat64Array(options.lons),
+          toFloat64Array(options.times),
+          toUint32Array(options.successes),
+          toUint32Array(options.trials),
+          options.prior.alpha,
+          options.prior.beta,
+          packed.family,
+          packed.spatialType,
+          packed.spatialNugget,
+          packed.spatialSill,
+          packed.spatialRange,
+          packed.spatialShape,
+          packed.temporalType,
+          packed.temporalNugget,
+          packed.temporalSill,
+          packed.temporalRange,
+          packed.temporalShape,
+          packed.k1,
+          packed.k2,
+          packed.k3,
+          options.stability,
+          options.oneStepLaplaceObservationVariance
+        );
+    } catch (e) {
+      throw wrapThrown(e);
+    }
+    return instance;
+  }
+
+  /**
+   * Build from finite logits at each `(lat, lon, time)` (no per-trial observation
+   * variance on the diagonal; matches geo {@link BinomialKriging.fromPrecomputedLogits}).
+   */
+  static fromPrecomputedLogits(
+    options: SpaceTimeBinomialFromPrecomputedLogitsOptions
+  ): SpaceTimeBinomialKriging {
+    const mod = requireLoadedModule();
+    const factory = mod.WasmKrigingModel?.spacetimeBinomialGeoFromPrecomputedLogits;
+    if (!factory) {
+      throw new KrigingError(
+        "SpaceTimeBinomialKriging is not available; rebuild the WASM package",
+        { code: "backend_unavailable" }
+      );
+    }
+    const packed = packSpaceTimeVariogram(options.variogram);
+    const instance = Object.create(
+      SpaceTimeBinomialKriging.prototype
+    ) as SpaceTimeBinomialKriging;
+    try {
+      (instance as unknown as { inner: WasmKrigingModelHandle | null }).inner =
+        factory.call(
+          mod.WasmKrigingModel,
+          toFloat64Array(options.lats),
+          toFloat64Array(options.lons),
+          toFloat64Array(options.times),
+          toFloat64Array(options.logits),
+          packed.family,
+          packed.spatialType,
+          packed.spatialNugget,
+          packed.spatialSill,
+          packed.spatialRange,
+          packed.spatialShape,
+          packed.temporalType,
+          packed.temporalNugget,
+          packed.temporalSill,
+          packed.temporalRange,
+          packed.temporalShape,
+          packed.k1,
+          packed.k2,
+          packed.k3
+        );
+    } catch (e) {
+      throw wrapThrown(e);
+    }
+    return instance;
+  }
+
+  /**
+   * Like {@link SpaceTimeBinomialKriging.fromPrecomputedLogits}, with per-site logit observation
+   * variances on the diagonal.
+   */
+  static fromPrecomputedLogitsWithVariances(
+    options: SpaceTimeBinomialFromPrecomputedLogitsWithVariancesOptions
+  ): SpaceTimeBinomialKriging {
+    const mod = requireLoadedModule();
+    const factory =
+      mod.WasmKrigingModel?.spacetimeBinomialGeoFromPrecomputedLogitsWithVariances;
+    if (!factory) {
+      throw new KrigingError(
+        "SpaceTimeBinomialKriging is not available; rebuild the WASM package",
+        { code: "backend_unavailable" }
+      );
+    }
+    const packed = packSpaceTimeVariogram(options.variogram);
+    const instance = Object.create(
+      SpaceTimeBinomialKriging.prototype
+    ) as SpaceTimeBinomialKriging;
+    const priorAlpha = options.prior?.alpha;
+    const priorBeta = options.prior?.beta;
+    try {
+      (instance as unknown as { inner: WasmKrigingModelHandle | null }).inner =
+        factory.call(
+          mod.WasmKrigingModel,
+          toFloat64Array(options.lats),
+          toFloat64Array(options.lons),
+          toFloat64Array(options.times),
+          toFloat64Array(options.logits),
+          toFloat64Array(options.logitObservationVariance),
+          packed.family,
+          packed.spatialType,
+          packed.spatialNugget,
+          packed.spatialSill,
+          packed.spatialRange,
+          packed.spatialShape,
+          packed.temporalType,
+          packed.temporalNugget,
+          packed.temporalSill,
+          packed.temporalRange,
+          packed.temporalShape,
+          packed.k1,
+          packed.k2,
+          packed.k3,
+          priorAlpha,
+          priorBeta,
+          options.stability,
+          options.oneStepLaplaceObservationVariance
+        );
+    } catch (e) {
+      throw wrapThrown(e);
+    }
+    return instance;
+  }
+
+  private requireInner(): WasmKrigingModelHandle {
     if (this.inner === null) {
       throw new KrigingError(FREED, { code: "model_freed" });
     }
@@ -99,13 +272,15 @@ export class SpaceTimeBinomialKriging {
       successes: options.successes,
       trials: options.trials,
       variogram: fittedToSpaceTimeVariogramParams(options.fittedVariogram),
+      ...(options.stability !== undefined ? { stability: options.stability } : {}),
+      ...(options.oneStepLaplaceObservationVariance === true
+        ? { oneStepLaplaceObservationVariance: true }
+        : {}),
     });
   }
 
   free(): void {
-    if (this.inner === null) return;
-    if (typeof this.inner.free === "function") this.inner.free();
-    this.inner = null;
+    this.inner = freeBinomialHandle(this.inner);
   }
 
   /** Explicit-resource-management disposer; calls {@link free}. */
@@ -113,17 +288,56 @@ export class SpaceTimeBinomialKriging {
     this.free();
   }
 
-  /** Build-time diagnostics (prior, dropped rows, logit inflation, …). */
-  getBuildNotes(): BinomialBuildNotes {
+  /** Build-time diagnostics (prior, dropped rows, logit inflation, warnings, …). */
+  get buildNotes(): BinomialBuildNotes {
+    return getBinomialBuildNotes(
+      requireBinomialHandle(this.inner, FREED),
+      FREED
+    );
+  }
+
+  /**
+   * Fitted space–time variogram, {@link BinomialBuildNotes}, and optional LOO logit MSDR.
+   * Pass `{ lats, lons, times, successes, trials }` aligned with the training set to compute MSDR.
+   */
+  diagnostics(counts?: {
+    lats: NumericArrayInput;
+    lons: NumericArrayInput;
+    times: NumericArrayInput;
+    successes: IntegerArrayInput;
+    trials: IntegerArrayInput;
+  }): SpaceTimeBinomialDiagnostics {
     try {
-      return mapBinomialBuildNotes(this.requireInner().getBuildNotes());
+      const inner = this.requireInner();
+      const getDiagnostics = inner.getDiagnostics;
+      if (typeof getDiagnostics !== "function") {
+        throw new KrigingError(
+          "SpaceTimeBinomialKriging.diagnostics requires WASM getDiagnostics",
+          { code: "internal_error" }
+        );
+      }
+      const opts: unknown =
+        counts === undefined
+          ? undefined
+          : {
+              lats: toFloat64Array(counts.lats),
+              lons: toFloat64Array(counts.lons),
+              times: toFloat64Array(counts.times),
+              successes: toUint32Array(counts.successes),
+              trials: toUint32Array(counts.trials),
+            };
+      return mapSpaceTimeBinomialDiagnostics(
+        opts === undefined
+          ? getDiagnostics.call(inner)
+          : getDiagnostics.call(inner, opts)
+      );
     } catch (e) {
       throw wrapThrown(e);
     }
   }
 
   predict(lat: number, lon: number, time: number): BinomialPrediction {
-    return mapBinomialPrediction(this.requireInner().predict(lat, lon, time));
+    return mapBinomialPrediction(this.requireInner().predictSpaceTime(lat, lon, time));
   }
 
   predictBatch(
@@ -131,7 +345,7 @@ export class SpaceTimeBinomialKriging {
     lons: NumericArrayInput,
     times: NumericArrayInput
   ): BinomialPrediction[] {
-    const out = this.requireInner().predictBatch(
+    const out = this.requireInner().predictBatchSpaceTime(
       toFloat64Array(lats),
       toFloat64Array(lons),
       toFloat64Array(times)
@@ -144,7 +358,7 @@ export class SpaceTimeBinomialKriging {
     lons: NumericArrayInput,
     times: NumericArrayInput
   ): BinomialBatchArrayOutput {
-    const out = this.requireInner().predictBatchArrays(
+    const out = this.requireInner().predictBatchArraysSpaceTime(
       toFloat64Array(lats),
       toFloat64Array(lons),
       toFloat64Array(times)
@@ -165,17 +379,19 @@ export class SpaceTimeBinomialKriging {
     const { lats, lons } = buildGridLatsLons(options);
     const times = new Float64Array(lats.length);
     times.fill(options.time);
-    const out = inner.predictBatchArrays(lats, lons, times);
+    const out = inner.predictBatchArraysSpaceTime(lats, lons, times);
     const {
-      prevalences: prevFlat,
+      prevalenceMedians: prevFlat,
+      prevalenceMeans: pmeanFlat,
       logitValues: logitFlat,
-      variances: varFlat,
+      logitVariances: lvFlat,
       prevalenceVariances: prevVarFlat,
     } = mapBinomialBatchArrayOutput(out);
     return {
-      prevalences: reshapeFlatToGrid(prevFlat, nRows, nCols),
+      prevalenceMedians: reshapeFlatToGrid(prevFlat, nRows, nCols),
+      prevalenceMeans: reshapeFlatToGrid(pmeanFlat, nRows, nCols),
       logitValues: reshapeFlatToGrid(logitFlat, nRows, nCols),
-      variances: reshapeFlatToGrid(varFlat, nRows, nCols),
+      logitVariances: reshapeFlatToGrid(lvFlat, nRows, nCols),
       prevalenceVariances: reshapeFlatToGrid(prevVarFlat, nRows, nCols),
     };
   }
@@ -239,6 +455,25 @@ export class SpaceTimeBinomialKriging {
   predictGridAtDate(options: PredictGridAtDateOptions): BinomialGridOutput {
     const time = dateToTime(options.date, options);
     return this.predictGridAtTime({ ...options, time });
+  }
+
+  /**
+   * Leave-one-out CV on **this fitted model** (same training data and variogram).
+   * Prefer {@link leaveOneOut} when validating from raw arrays before building a model.
+   */
+  leaveOneOut(): BinomialCvResult {
+    return binomialLeaveOneOut(
+      requireBinomialHandle(this.inner, FREED),
+      FREED
+    );
+  }
+
+  /**
+   * K-fold CV on **this fitted model** (deterministic round-robin folds).
+   * Prefer {@link kFold} when validating from raw arrays before building a model.
+   */
+  kFold(k: number): BinomialCvResult {
+    return binomialKFold(requireBinomialHandle(this.inner, FREED), FREED, k);
   }
 }
 

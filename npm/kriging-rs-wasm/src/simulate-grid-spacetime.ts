@@ -30,8 +30,8 @@
 
 import { KrigingError } from "./errors.js";
 import {
-  conditionalSimulateSpaceTimeBinomial,
-  conditionalSimulateManySpaceTimeBinomial,
+  conditionalSimulate,
+  conditionalSimulateMany,
 } from "./simulation.js";
 import { gridCellCenters, reshapeGridRow } from "./simulate-grid.js";
 import { timesFromDates } from "./time.js";
@@ -79,19 +79,21 @@ export function simulateBinomialSpaceTimeGrid(
   const { lats: targetLats, lons: targetLons } = gridCellCenters(options);
   const targetTimes = new Float64Array(targetLats.length);
   targetTimes.fill(options.time);
-  const result = conditionalSimulateSpaceTimeBinomial({
+  const result = conditionalSimulate({
+    geometry: "spacetime",
+    family: "binomial",
     conditioningLats: options.lats,
     conditioningLons: options.lons,
     conditioningTimes: options.times,
-    successes: options.successes,
-    trials: options.trials,
+    conditioningSuccesses: options.successes,
+    conditioningTrials: options.trials,
     targetLats,
     targetLons,
     targetTimes,
-    variogram: options.variogram,
+    spaceTimeVariogram: options.variogram,
     prior: options.prior,
     seed: options.seed,
-  });
+  }) as import("./types.js").BinomialSimulationResult;
   return {
     logitSamples: reshapeGridRow(
       result.logitSamples,
@@ -119,20 +121,22 @@ export function simulateBinomialSpaceTimeGridEnsemble(
   const { lats: targetLats, lons: targetLons } = gridCellCenters(options);
   const targetTimes = new Float64Array(targetLats.length);
   targetTimes.fill(options.time);
-  const result = conditionalSimulateManySpaceTimeBinomial({
+  const result = conditionalSimulateMany({
+    geometry: "spacetime",
+    family: "binomial",
     conditioningLats: options.lats,
     conditioningLons: options.lons,
     conditioningTimes: options.times,
-    successes: options.successes,
-    trials: options.trials,
+    conditioningSuccesses: options.successes,
+    conditioningTrials: options.trials,
     targetLats,
     targetLons,
     targetTimes,
-    variogram: options.variogram,
+    spaceTimeVariogram: options.variogram,
     prior: options.prior,
     nRealizations: options.nRealizations,
     baseSeed: options.baseSeed,
-  });
+  }) as import("./types.js").BinomialSimulationManyResult;
   return {
     west: options.west,
     south: options.south,

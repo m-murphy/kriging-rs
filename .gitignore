@@ -19,5 +19,9 @@ wasm-pack.log
 docs/*.out
 docs/pdf/
 
+# Quarto HTML render output (source is the .md)
+docs/change-summary-calibrated-binomial-and-diagnostics.html
+docs/change-summary-calibrated-binomial-and-diagnostics_files/
+
 *.tgz
 www/dist

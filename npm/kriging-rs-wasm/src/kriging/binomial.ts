@@ -1,31 +1,46 @@
 /**
  * Binomial kriging: prevalence / proportion surfaces from count data (successes/trials).
  *
+ * Use {@link BinomialKriging} for global lat/lon (Haversine). Use
+ * {@link BinomialProjectedKriging} when data are already in a planar projection with
+ * known anisotropy. Reserve {@link BinomialTangentPlaneKriging} for small regional
+ * windows where equirectangular km + anisotropy is preferable to full-sphere Haversine.
+ *
  * @module
  */
 
-import { KrigingError, wrapThrown } from "../errors.js";
+import { wrapThrown } from "../errors.js";
 import { toFloat64Array, toUint32Array } from "../internal/convert.js";
 import {
-  fittedToVariogramParamsWithNuggetOverride,
-  reshapeFlatToGrid,
-} from "../internal/grid.js";
-import {
-  mapBinomialBatchArrayOutput,
-  mapBinomialBuildNotes,
-  mapBinomialPrediction,
-  mapBinomialPredictionArray,
-} from "../internal/mappers.js";
+  attachBinomialHandle,
+  binomialKFold,
+  binomialLeaveOneOut,
+  freeBinomialHandle,
+  getBinomialBuildNotes,
+  getBinomialDiagnostics2d,
+  packGeoDiagnosticsOpts,
+  predictBatchArraysBinomialGeo,
+  predictBatchBinomialGeo,
+  predictBatchGpuBinomialGeo,
+  predictBatchGpuOrCpuBinomialGeo,
+  predictBinomialGeo,
+  predictGridBinomialGeo,
+  requireBinomialHandle,
+  type GeoBinomialDiagnosticsCounts,
+} from "../internal/binomial-model-shared.js";
 import { requireLoadedModule } from "../internal/module.js";
 import type {
   BinomialKrigingOptionsWasm,
   BinomialKrigingWithPriorOptionsWasm,
-  WasmBinomialInstance,
+  WasmKrigingModelHandle,
 } from "../internal/wasm-shapes.js";
 import type {
   BinomialBatchArrayOutput,
   BinomialBuildNotes,
+  BinomialCvResult,
+  BinomialDiagnostics,
   BinomialFromPrecomputedLogitsOptions,
+  BinomialFromPrecomputedLogitsWithVariancesOptions,
   BinomialGridOutput,
   BinomialKrigingFromFittedVariogramOptions,
   BinomialKrigingFromFittedVariogramWithPriorOptions,
@@ -53,6 +68,10 @@ function toBinomialOptionsWasm(
       range: opts.variogram.range,
       shape: opts.variogram.shape,
     },
+    ...(opts.stability !== undefined ? { stability: opts.stability } : {}),
+    ...(opts.oneStepLaplaceObservationVariance === true
+      ? { oneStepLaplaceObservationVariance: true }
+      : {}),
   };
 }
 
@@ -66,6 +85,7 @@ function toBinomialWithPriorOptionsWasm(
       successes: opts.successes,
       trials: opts.trials,
       variogram: opts.variogram,
+      stability: opts.stability,
     }),
     prior: { alpha: opts.prior.alpha, beta: opts.prior.beta },
   };
@@ -80,18 +100,12 @@ function toBinomialWithPriorOptionsWasm(
  * @throws {KrigingError} When the WASM module is not loaded, or when inputs are invalid.
  */
 export class BinomialKriging {
-  private inner: WasmBinomialInstance | null;
+  private inner: WasmKrigingModelHandle | null;
 
-  /**
-   * Build a binomial kriging model from locations, success/trial counts, and variogram parameters.
-   *
-   * @param options - Sample coordinates, successes, trials, and variogram (nugget, sill, range, type, optional shape).
-   * @throws {KrigingError} When the WASM module is not loaded or when inputs are invalid.
-   */
   constructor(options: BinomialKrigingOptions) {
     const mod = requireLoadedModule();
     try {
-      this.inner = mod.WasmBinomialKriging.fromArrays(
+      this.inner = mod.WasmKrigingModel.binomialGeoFromArrays(
         toFloat64Array(options.lats),
         toFloat64Array(options.lons),
         toUint32Array(options.successes),
@@ -100,39 +114,24 @@ export class BinomialKriging {
         options.variogram.nugget,
         options.variogram.sill,
         options.variogram.range,
-        options.variogram.shape
+        options.variogram.shape,
+        options.stability,
+        options.oneStepLaplaceObservationVariance
       );
     } catch (e) {
       throw wrapThrown(e);
     }
   }
 
-  private requireInner(): WasmBinomialInstance {
-    if (this.inner === null) {
-      throw new KrigingError(BINOMIAL_FREED, { code: "model_freed" });
-    }
-    return this.inner;
-  }
-
-  /**
-   * Build a binomial kriging model from locations and **pre-computed logits**. Bypasses
-   * the empirical-Bayes shrinkage step used by the default constructor; use when you
-   * already have finite logit estimates (e.g. from an externally fitted mean-field
-   * model).
-   *
-   * @throws {KrigingError} When logits are non-finite or the WASM module is not loaded.
-   */
   static fromPrecomputedLogits(
     options: BinomialFromPrecomputedLogitsOptions
   ): BinomialKriging {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmBinomialKriging;
-    const instance = Object.create(
-      BinomialKriging.prototype
-    ) as BinomialKriging;
+    const factory = mod.WasmKrigingModel;
     try {
-      (instance as unknown as { inner: WasmBinomialInstance | null }).inner =
-        ctor.fromPrecomputedLogits(
+      return attachBinomialHandle(
+        BinomialKriging.prototype,
+        factory.binomialGeoFromPrecomputedLogits(
           toFloat64Array(options.lats),
           toFloat64Array(options.lons),
           toFloat64Array(options.logits),
@@ -141,48 +140,60 @@ export class BinomialKriging {
           options.variogram.sill,
           options.variogram.range,
           options.variogram.shape
-        );
+        )
+      );
     } catch (e) {
       throw wrapThrown(e);
     }
-    return instance;
   }
 
-  /**
-   * Create a binomial kriging model with a Beta(alpha, beta) prior on prevalence.
-   * Useful when counts are small or some locations have zero trials.
-   *
-   * @param options - Sample coordinates, successes, trials, variogram, and prior { alpha, beta }.
-   * @returns A new BinomialKriging instance.
-   * @throws {KrigingError} When the WASM module is not loaded or when inputs are invalid.
-   */
+  static fromPrecomputedLogitsWithVariances(
+    options: BinomialFromPrecomputedLogitsWithVariancesOptions
+  ): BinomialKriging {
+    const mod = requireLoadedModule();
+    const factory = mod.WasmKrigingModel;
+    const priorAlpha = options.prior?.alpha;
+    const priorBeta = options.prior?.beta;
+    try {
+      return attachBinomialHandle(
+        BinomialKriging.prototype,
+        factory.binomialGeoFromPrecomputedLogitsWithVariances(
+          toFloat64Array(options.lats),
+          toFloat64Array(options.lons),
+          toFloat64Array(options.logits),
+          toFloat64Array(options.logitObservationVariance),
+          options.variogram.variogramType,
+          options.variogram.nugget,
+          options.variogram.sill,
+          options.variogram.range,
+          options.variogram.shape,
+          priorAlpha,
+          priorBeta,
+          options.stability,
+          options.oneStepLaplaceObservationVariance
+        )
+      );
+    } catch (e) {
+      throw wrapThrown(e);
+    }
+  }
+
   static newWithPrior(
     options: BinomialKrigingWithPriorOptions
   ): BinomialKriging {
     const mod = requireLoadedModule();
-    const instance = Object.create(
-      BinomialKriging.prototype
-    ) as BinomialKriging;
     try {
-      (instance as unknown as { inner: WasmBinomialInstance | null }).inner =
-        mod.WasmBinomialKriging.newWithPrior(
+      return attachBinomialHandle(
+        BinomialKriging.prototype,
+        mod.WasmKrigingModel.binomialGeoNewWithPrior(
           toBinomialWithPriorOptionsWasm(options)
-        );
+        )
+      );
     } catch (e) {
       throw wrapThrown(e);
     }
-    return instance;
   }
 
-  /**
-   * Build a binomial kriging model from count data and a fitted variogram (e.g. from
-   * fitting on logits or reusing ordinary-fit params). Avoids manually spreading
-   * variogram fields.
-   *
-   * @param options - Sample lats, lons, successes, trials, and a {@link FittedVariogram}.
-   * @returns A new BinomialKriging instance.
-   * @throws {KrigingError} When the WASM module is not loaded or when inputs are invalid.
-   */
   static fromFittedVariogram(
     options: BinomialKrigingFromFittedVariogramOptions
   ): BinomialKriging {
@@ -191,20 +202,20 @@ export class BinomialKriging {
       lons: options.lons,
       successes: options.successes,
       trials: options.trials,
-      variogram: fittedToVariogramParamsWithNuggetOverride(
-        options.fittedVariogram,
-        options.nuggetOverride
-      ),
+      variogram: {
+        variogramType: options.fittedVariogram.variogramType,
+        nugget: options.fittedVariogram.nugget,
+        sill: options.fittedVariogram.sill,
+        range: options.fittedVariogram.range,
+        shape: options.fittedVariogram.shape,
+      },
+      ...(options.stability !== undefined ? { stability: options.stability } : {}),
+      ...(options.oneStepLaplaceObservationVariance === true
+        ? { oneStepLaplaceObservationVariance: true }
+        : {}),
     });
   }
 
-  /**
-   * Build a binomial kriging model with a Beta prior from count data and a fitted variogram.
-   *
-   * @param options - Sample lats, lons, successes, trials, a {@link FittedVariogram}, and prior { alpha, beta }.
-   * @returns A new BinomialKriging instance.
-   * @throws {KrigingError} When the WASM module is not loaded or when inputs are invalid.
-   */
   static fromFittedVariogramWithPrior(
     options: BinomialKrigingFromFittedVariogramWithPriorOptions
   ): BinomialKriging {
@@ -213,177 +224,123 @@ export class BinomialKriging {
       lons: options.lons,
       successes: options.successes,
       trials: options.trials,
-      variogram: fittedToVariogramParamsWithNuggetOverride(
-        options.fittedVariogram,
-        options.nuggetOverride
-      ),
+      variogram: {
+        variogramType: options.fittedVariogram.variogramType,
+        nugget: options.fittedVariogram.nugget,
+        sill: options.fittedVariogram.sill,
+        range: options.fittedVariogram.range,
+        shape: options.fittedVariogram.shape,
+      },
       prior: options.prior,
+      ...(options.stability !== undefined ? { stability: options.stability } : {}),
+      ...(options.oneStepLaplaceObservationVariance === true
+        ? { oneStepLaplaceObservationVariance: true }
+        : {}),
     });
   }
 
-  /**
-   * Release WASM-held resources. Safe to call multiple times; subsequent calls are no-ops.
-   * You can call free() in a finally block after creating a model.
-   */
   free(): void {
-    if (this.inner === null) return;
-    if (typeof this.inner.free === "function") {
-      this.inner.free();
-    }
-    this.inner = null;
+    this.inner = freeBinomialHandle(this.inner);
   }
 
-  /** Explicit-resource-management disposer; calls {@link free}. */
   [Symbol.dispose](): void {
     this.free();
   }
 
-  /**
-   * Build-time diagnostics (prior, dropped zero-trial rows, logit inflation, …).
-   * Matches the JSON from WASM `getBuildNotes`.
-   */
-  getBuildNotes(): BinomialBuildNotes {
-    try {
-      return mapBinomialBuildNotes(this.requireInner().getBuildNotes());
-    } catch (e) {
-      throw wrapThrown(e);
-    }
+  get buildNotes(): BinomialBuildNotes {
+    return getBinomialBuildNotes(
+      requireBinomialHandle(this.inner, BINOMIAL_FREED),
+      BINOMIAL_FREED
+    );
   }
 
-  /**
-   * Single-point prevalence prediction at (lat, lon) in degrees.
-   *
-   * @param lat - Latitude in degrees.
-   * @param lon - Longitude in degrees.
-   * @returns Prevalence in [0, 1], logit value, and kriging variance.
-   */
+  diagnostics(counts?: GeoBinomialDiagnosticsCounts): BinomialDiagnostics {
+    return getBinomialDiagnostics2d(
+      requireBinomialHandle(this.inner, BINOMIAL_FREED),
+      BINOMIAL_FREED,
+      counts,
+      packGeoDiagnosticsOpts
+    );
+  }
+
   predict(lat: number, lon: number): BinomialPrediction {
-    return mapBinomialPrediction(this.requireInner().predict(lat, lon));
+    return predictBinomialGeo(
+      requireBinomialHandle(this.inner, BINOMIAL_FREED),
+      lat,
+      lon
+    );
   }
 
-  /**
-   * Batch prevalence prediction at multiple (lat, lon) pairs. For large grids, prefer
-   * {@link BinomialKriging.predictBatchArrays}.
-   *
-   * @param lats - Latitudes in degrees (same length as lons).
-   * @param lons - Longitudes in degrees (same length as lats).
-   * @returns Array of prevalence predictions for each location.
-   */
   predictBatch(
     lats: NumericArrayInput,
     lons: NumericArrayInput
   ): BinomialPrediction[] {
-    const out = this.requireInner().predictBatch(
-      toFloat64Array(lats),
-      toFloat64Array(lons)
+    return predictBatchBinomialGeo(
+      requireBinomialHandle(this.inner, BINOMIAL_FREED),
+      lats,
+      lons
     );
-    return mapBinomialPredictionArray(out);
   }
 
-  /**
-   * Batch prevalence prediction returning typed arrays. Prefer over
-   * {@link BinomialKriging.predictBatch} for large grids.
-   *
-   * @param lats - Latitudes in degrees (same length as lons).
-   * @param lons - Longitudes in degrees (same length as lats).
-   * @returns Object with `prevalences`, `logitValues`, and `variances` Float64Arrays.
-   */
   predictBatchArrays(
     lats: NumericArrayInput,
     lons: NumericArrayInput
   ): BinomialBatchArrayOutput {
-    const out = this.requireInner().predictBatchArrays(
-      toFloat64Array(lats),
-      toFloat64Array(lons)
+    return predictBatchArraysBinomialGeo(
+      requireBinomialHandle(this.inner, BINOMIAL_FREED),
+      lats,
+      lons
     );
-    return mapBinomialBatchArrayOutput(out);
   }
 
-  /**
-   * Predict prevalence on a rectangular grid. Same as {@link OrdinaryKriging.predictGrid}
-   * but returns prevalences and logit values. Grid shape [yCells][xCells].
-   *
-   * @param options - west, south, east, north (degrees), xCells, yCells
-   * @returns Object with `prevalences`, `logitValues`, and `variances` as number[][]
-   */
   predictGrid(options: PredictGridOptions): BinomialGridOutput {
-    const inner = this.requireInner();
-    const nRows = Math.max(1, Math.floor(options.yCells));
-    const nCols = Math.max(1, Math.floor(options.xCells));
-    const out = inner.predictGridArrays(
-      options.west,
-      options.east,
-      options.south,
-      options.north,
-      nCols,
-      nRows
+    return predictGridBinomialGeo(
+      requireBinomialHandle(this.inner, BINOMIAL_FREED),
+      options
     );
-    const {
-      prevalences: pFlat,
-      logitValues: lFlat,
-      variances: vFlat,
-      prevalenceVariances: pvFlat,
-    } = mapBinomialBatchArrayOutput(out);
-    return {
-      prevalences: reshapeFlatToGrid(pFlat, nRows, nCols),
-      logitValues: reshapeFlatToGrid(lFlat, nRows, nCols),
-      variances: reshapeFlatToGrid(vFlat, nRows, nCols),
-      prevalenceVariances: reshapeFlatToGrid(pvFlat, nRows, nCols),
-    };
   }
 
-  /**
-   * Batch prevalence prediction using WebGPU. Requires build with GPU feature.
-   * Throws {@link KrigingError} with code `backend_unavailable` if the GPU path fails for any
-   * reason. Use {@link BinomialKriging.predictBatchGpuOrCpu} when silent CPU fallback is
-   * acceptable.
-   *
-   * @param lats - Latitudes in degrees (same length as lons).
-   * @param lons - Longitudes in degrees (same length as lats).
-   * @returns Promise resolving to an array of prevalence predictions for each location.
-   * @throws {KrigingError} code `backend_unavailable` if the GPU path fails, or if the package
-   *   was not built with the `gpu` feature.
-   */
   async predictBatchGpu(
     lats: NumericArrayInput,
     lons: NumericArrayInput
   ): Promise<BinomialPrediction[]> {
-    const inner = this.requireInner();
-    if (typeof inner.predictBatchGpu !== "function") {
-      throw new KrigingError(
-        'predictBatchGpu not available; rebuild WASM package with feature "gpu"',
-        { code: "backend_unavailable" }
-      );
-    }
-    try {
-      const out = await inner.predictBatchGpu(
-        toFloat64Array(lats),
-        toFloat64Array(lons)
-      );
-      return mapBinomialPredictionArray(out);
-    } catch (e) {
-      throw wrapThrown(e);
-    }
+    return predictBatchGpuBinomialGeo(
+      requireBinomialHandle(this.inner, BINOMIAL_FREED),
+      lats,
+      lons
+    );
   }
 
-  /**
-   * GPU-first batch prevalence prediction with automatic CPU fallback on any GPU error.
-   */
   async predictBatchGpuOrCpu(
     lats: NumericArrayInput,
     lons: NumericArrayInput
   ): Promise<BinomialPrediction[]> {
-    const inner = this.requireInner();
-    const latArr = toFloat64Array(lats);
-    const lonArr = toFloat64Array(lons);
-    if (typeof inner.predictBatchGpuOrCpu === "function") {
-      try {
-        const out = await inner.predictBatchGpuOrCpu(latArr, lonArr);
-        return mapBinomialPredictionArray(out);
-      } catch (e) {
-        throw wrapThrown(e);
-      }
-    }
-    return this.predictBatch(latArr, lonArr);
+    const inner = requireBinomialHandle(this.inner, BINOMIAL_FREED);
+    return predictBatchGpuOrCpuBinomialGeo(inner, lats, lons, () =>
+      this.predictBatch(lats, lons)
+    );
+  }
+
+  /**
+   * Leave-one-out CV on **this fitted model** (same training data and variogram).
+   * Prefer {@link leaveOneOut} when validating from raw arrays before building a model.
+   */
+  leaveOneOut(): BinomialCvResult {
+    return binomialLeaveOneOut(
+      requireBinomialHandle(this.inner, BINOMIAL_FREED),
+      BINOMIAL_FREED
+    );
+  }
+
+  /**
+   * K-fold CV on **this fitted model** (deterministic round-robin folds).
+   * Prefer {@link kFold} when validating from raw arrays before building a model.
+   */
+  kFold(k: number): BinomialCvResult {
+    return binomialKFold(
+      requireBinomialHandle(this.inner, BINOMIAL_FREED),
+      BINOMIAL_FREED,
+      k
+    );
   }
 }

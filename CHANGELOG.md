@@ -7,7 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-04-26
+### Added
+
+- **`BinomialCounts`** — geometry-free `(successes, trials)` retained on count-based
+  calibrated binomial fits for instance CV and diagnostics without re-packing tensors.
+- **`binomial_logit_loo_msdr`** — shared Rust helper for logit-scale LOO MSDR on any
+  binomial [`KrigingPredictor`](src/predictor/cv.rs).
+- **`SpaceTimeBinomialDiagnostics`** export from the `spacetime` module.
+- **Tangent-plane binomial instance CV** — `leaveOneOut` / `kFold` on
+  `BinomialTangentPlaneKriging` (npm) and `WasmKrigingModel` handles (WASM).
+- **`BinomialAdapterRef`** — WASM dispatch for binomial build notes, diagnostics, and
+  instance CV across geo, projected, tangent-plane, and spacetime adapters.
+- **`KrigingConditioner<Site, Scale>`** — opaque live fitted state for ordinary, simple,
+  universal, and binomial sequential Gaussian simulation, with compile-time continuous/logit
+  scale separation and atomic condition append.
+
+### Changed
+
+- **Universal kriging engine** — [`UniversalKrigingEngine<K, T>`](src/kriging/universal_engine.rs)
+  is parameterized by pairwise covariance and [trend basis](docs/adr/0004-trend-basis-universal-engine.md);
+  [`SpaceTimeUniversalKrigingEngine<M>`](src/spacetime/kriging/universal_engine.rs) is a type alias.
+- **Binomial `diagnostics()`** (Rust and npm) — count-based builds compute LOO logit MSDR
+  from retained training counts and model coordinates; explicit count tensors are only
+  required for precomputed-logit builds.
+- **WASM binomial adapters** hold full calibrated fits instead of split model/notes/CV
+  buffers; diagnostics and instance CV read stored training counts.
+- **npm binomial quartet** — shared `binomial-model-shared` helpers for lifecycle,
+  diagnostics, CV, and batch/grid prediction across geo, projected, tangent-plane, and
+  spacetime classes.
+- **SGS construction** — fitted models now provide `.into_conditioner()`; the four
+  `sequential_*` functions consume conditioners while retaining their RNG, target-order, and
+  result semantics.
+- **Binomial SGS calibration** — simulation now uses the fitted model's canonical
+  Laplace/Fisher logit observation variance instead of a separate empirical-Bayes variance path.
+
+### Removed
+
+- **Breaking Rust API:** `KrigingSimulator`, `BinomialKrigingSimulator`, the ten
+  model/domain-specific `*Simulator` structs, and the duplicate `predictor::simulation` route.
+  Use a fitted model's `.into_conditioner()` and the functions in `simulation` instead.
+- **Breaking Rust API:** unused `distance_matrix`, `distance_matrix_flat`, and `gpu_square`
+  helpers. Use `haversine_distance` for direct geographic distance calculations or the fitted
+  model APIs for pairwise covariance and GPU prediction.
+- Orphaned internal matrix and Cholesky rank-one update utilities that had no production callers.
+
+## [0.4.0] - 2026-06-12
+
+Large release after 0.3.0: calibrated binomial kriging, dual-SPD engines, generic
+predictor/simulator harnesses, unified WASM CV/simulation and model handle, and faster LOO CV.
 
 ### Added
 
@@ -16,22 +63,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   automatic inflation retries and always-returned [`BinomialBuildNotes`]
   (`calibrationVersion`, `logitInflation`, `nBuildAttempts`, prior, dropped zero-trial
   indices). The geographic fit type is `BinomialFit` (`BinomialCalibratedResult<BinomialKrigingModel>`);
-  use [`BinomialKrigingModel::new_with_config`] for full control. (The older separate
-  “hetero-only” constructor is removed; `new` / `new_with_prior` are heteroskedastic
-  by default with `HeteroskedasticBinomialConfig::default()`.)
-- **WASM:** `WasmBinomialKriging`, `WasmBinomialProjectedKriging`, and
-  `WasmSpaceTimeBinomialKriging` store build notes and expose `getBuildNotes()`. Count
-  inputs with `trials==0` are dropped before fit (at least two retained sites required).
+  use [`BinomialKrigingModel::new_with_config`] for full control. `new` / `new_with_prior`
+  are heteroskedastic by default with `HeteroskedasticBinomialConfig::default()`.
+- **Empirical variogram (binomial):** `compute_empirical_variogram_binomial_calibrated`
+  (pair-noise aware classical estimator) for the calibrated default.
 - **TypeScript:** `interpolateBinomialToGrid` includes `buildNotes` on
   `InterpolateBinomialToGridResult`. `getBuildNotes()` is available on
   `BinomialKriging`, `BinomialProjectedKriging`, and `SpaceTimeBinomialKriging`.
-- **Empirical variogram (binomial):** `compute_empirical_variogram_binomial_calibrated`
-  (pair-noise aware classical estimator) for the calibrated default.
+- **Dual SPD ordinary kriging engine** — [`OrdinaryKrigingEngine<K: PairwiseCovariance>`](src/kriging/engine.rs)
+  and [`SpaceTimeOrdinaryKrigingEngine<M>`](src/spacetime/kriging/engine.rs) (type alias): Cholesky on the
+  covariance block `C` plus precomputed `β = C⁻¹·1`, with incremental conditioning via
+  [`cholesky_extend_spd_lower`](src/cholesky_update.rs). See [ADR-0001](docs/adr/0001-dual-spd-ordinary-kriging.md)
+  and [ADR-0003](docs/adr/0003-pairwise-covariance-ordinary-engine.md).
+- **Simple kriging engines** for incremental SGS and prediction wrappers:
+  [`SimpleKrigingEngine<K: PairwiseCovariance>`](src/kriging/simple_engine.rs) and
+  [`SpaceTimeSimpleKrigingEngine<M>`](src/spacetime/kriging/simple_engine.rs) (type alias).
+- **Universal kriging engines** (dual SPD with multi-constraint Schur complement):
+  [`UniversalKrigingEngine<K, T>`](src/kriging/universal_engine.rs) parameterized by
+  pairwise covariance and [trend basis](docs/adr/0004-trend-basis-universal-engine.md), and
+  [`SpaceTimeUniversalKrigingEngine<M>`](src/spacetime/kriging/universal_engine.rs) (type alias).
+  Constant trend delegates to the ordinary engine.
+- **Calibrated logit ordinary build** — shared [`build_calibrated_logit_ordinary`](src/kriging/binomial.rs)
+  for geographic, projected, and space–time binomial models.
+- **Generic predictor / simulator harnesses** (the simulator backend surface was later
+  replaced by the Unreleased conditioner API):
+  - [`KrigingPredictor`](src/predictor/cv.rs) + [`leave_one_out_cv`](src/predictor/cv.rs) /
+    [`k_fold_cv`](src/predictor/cv.rs)
+  - Legacy `KrigingSimulator` +
+    [`sequential_gaussian_simulate`](src/simulation.rs) /
+    [`sequential_binomial_simulate`](src/simulation.rs)
+  - Per-geometry backend structs (e.g. [`OrdinaryGeoPredictor`](src/predictor/cv.rs),
+    legacy `BinomialProjectedSimulator`)
+- **Domain vocabulary** — [`CONTEXT.md`](CONTEXT.md) and architecture review artifacts.
+- **`cv()`** — single WASM entry point dispatching on `(geometry, family)` for
+  geo, projected, and spacetime ordinary / simple / universal / binomial CV.
+- **`simulate()`** — single WASM entry point for all 2-D and spacetime SGS
+  variants; set `nRealizations > 1` for ensemble output.
+- TypeScript types **`CvOptions`**, **`SimulateOptions`**, **`KrigingGeometry`**,
+  **`KrigingFamily`**.
+- **Instance CV on fitted models** — all continuous and binomial model classes
+  (2-D geo/projected and spacetime) expose `.leaveOneOut()` and `.kFold(k)` using
+  the model's training data and variogram (binomial requires building from
+  `successes`/`trials`, not precomputed logits).
+- **`WasmKrigingModel` tagged handle** (ADR-0002) — one WASM type wraps every fitted
+  variant with shared `geometry` / `family` tags, predict dispatch, instance CV,
+  and static factories (`ordinaryGeoFromArrays`, `spacetimeBinomialGeoFromArrays`,
+  etc.). TypeScript model classes (`OrdinaryKriging`, `SpaceTimeOrdinaryKriging`, …)
+  are thin adapters over this handle.
 - `OrdinaryKrigingModel::new_with_extra_diagonal` for arbitrary (homogeneous or) **site-specific**
   non-spatial noise on the covariance diagonal.
 - Browser-representative workload and **prediction-only** benchmark: `benches/BROWSER_BENCHMARKS.md`
   and Criterion `bench_binomial_browser_representative` (`400` stations, `200×200` target grid;
   optional `gpu-blocking` sub-bench for WebGPU class RHS).
+- **Fast LOO CV (ordinary / simple / ST ordinary)** — `leave_one_out_predictions` on the dual-SPD
+  engines deletes one station from the fitted Cholesky factor per hold-out via O(n²) rank-one
+  downdate (Krause & Igel 2015) instead of refitting each fold from scratch. Constant-trend
+  universal CV delegates to the ordinary fast path.
 
 ### Changed (breaking / migration from 0.3.x)
 
@@ -42,11 +129,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   builders, including some `from_precomputed_logits*`) return
   `BinomialCalibratedResult<…>` (alias `BinomialFit` in geographic 2D). Use
   `.model`, `.into_model()`, or `Deref` to `&InnerModel` for `predict` / `predict_batch`.
-- **WASM/TS** consumers must **rebuild** the published `pkg` for `getBuildNotes` and
-  the `trials==0` / minimum-site validation behavior.
-- **Binomial SGS** (`conditional_simulate*`) uses heteroskedastic (logit observation
-  variance) conditioning in the per-target sequential fits for closer alignment with
-  calibrated binomial prediction.
+- **Numerical drift vs 0.3.x:** ordinary (and binomial-via-ordinary) predictions may differ at
+  the last few ULPs in `f32` due to the dual-SPD formulation (mathematically equivalent in exact
+  arithmetic). One CV tolerance was relaxed accordingly.
+- **CV and simulation Rust API:** the 20 named `leave_one_out_*` / `k_fold_*` and 16
+  `conditional_simulate_*` entry points added in 0.3.0 are **removed**. Use predictor/simulator
+  backend structs with the generic harnesses instead (re-exported from [`cv`](src/cv.rs) and
+  [`simulation`](src/simulation.rs)).
+- **Unified WASM/TypeScript CV and simulation seam** — the per-variant suffixed exports from
+  0.3.0 (`leaveOneOutSimple`, `leaveOneOutBinomial`, `conditionalSimulateSpaceTimeUniversal`,
+  `conditionalSimulateManyBinomial`, …) are **removed**. Dispatch through `cv()` /
+  `simulate()` instead. The base convenience wrappers **`leaveOneOut`**, **`kFold`**,
+  **`conditionalSimulate`**, and **`conditionalSimulateMany`** remain, but now take unified
+  `CvOptions` / `SimulateOptions` with optional `geometry` and `family` (default `"geo"` +
+  `"ordinary"`). In 0.3.x those four names were geo-ordinary-only with variant-specific option
+  types.
+- **Spacetime binomial CV** no longer requires a dummy `values` array; only
+  `successes` / `trials` are validated for the binomial family.
+- **Per-family WASM model exports removed** — `WasmOrdinaryKriging`,
+  `WasmBinomialKriging`, `WasmSpaceTimeOrdinaryKriging`, and the other eleven
+  legacy `Wasm*Kriging` types are no longer exported from the WASM binary. Use
+  `WasmKrigingModel` static factories or the public TypeScript model classes.
+- Count inputs with `trials==0` are dropped before binomial fit (at least two retained sites
+  required). Rebuild the published `pkg` after upgrading (`npm run build:wasm`).
+
+### Changed
+
+- **Incremental SGS:** all continuous and binomial simulator backends extend the kriging
+  conditioner per target (ordinary, simple, universal with any supported drift, projected,
+  space–time). No refit-per-target paths remain in production SGS.
+- **SGS harness:** skips appending a sampled target when kriging variance is below
+  `1e-10` (target already in the conditioning set), avoiding duplicate-site Cholesky failures.
+- **Binomial SGS** uses heteroskedastic (logit observation variance) conditioning in the
+  per-target sequential fits for closer alignment with calibrated binomial prediction.
+- **Size-independent diagonal jitter** — `kriging_diagonal_jitter` / `spacetime_diagonal_jitter` no longer
+  scale with `√n`, so incremental Cholesky extend/downdate and LOO CV stay consistent when the
+  conditioning set grows or shrinks by one station.
+
+### Removed
+
+- Separate **hetero-only** binomial constructor (superseded by calibrated default on `new` /
+  `new_with_prior` / `new_with_config`).
+- Dead helpers duplicated from the former `predictor/simulation` module in
+  [`simulation.rs`](src/simulation.rs) (`Rng`, `resolve_target_order`, `validate_continuous_inputs`).
+- Per-variant WASM/TypeScript CV and SGS exports from 0.3.0 (see migration table below).
+
+### Fixed
+
+- **GPU batch prediction** on [`OrdinaryKrigingModel`](src/kriging/ordinary.rs): uses
+  `engine.coords()` and `engine.variogram()` after the engine refactor.
+- **Ordinary engine condition append** now appends to `coords` as well as `prepared`/`values`.
+
+### Migration (Rust)
+
+```rust
+// CV — was leave_one_out_ordinary(&coords, &values, variogram)
+leave_one_out_cv(&OrdinaryGeoPredictor { coords, values, variogram })?;
+
+// SGS — was conditional_simulate_ordinary(...)
+sequential_gaussian_simulate(
+    OrdinaryKrigingModel::new(dataset, variogram)?.into_conditioner()?,
+    &targets,
+    SimulationOptions::new(seed),
+)?;
+```
+
+### Migration (npm / WASM)
+
+**Retained wrappers (signature change):** `leaveOneOut`, `kFold`, `conditionalSimulate`, and
+`conditionalSimulateMany` are still exported. Pass unified options; omit `geometry` / `family`
+for geo + ordinary (same default as 0.3.x geo-ordinary calls).
+
+| Removed export (0.3.x suffixed variants) | Replacement |
+|------------------------------------------|-------------|
+| `leaveOneOutSimple` / `kFoldSimple` | `cv({ geometry: "geo", family: "simple", mean, … })` or `leaveOneOut({ … })` |
+| `leaveOneOutUniversal` / `kFoldUniversal` | `cv({ geometry: "geo", family: "universal", trend, … })` |
+| `leaveOneOutProjected` / `kFoldProjected` | `cv({ geometry: "projected", family: "ordinary", xs, ys, majorAngleDeg, rangeRatio, … })` |
+| `leaveOneOutBinomial` / `kFoldBinomial` | `cv({ geometry: "geo", family: "binomial", successes, trials, … })` |
+| `leaveOneOutBinomialProjected` / `kFoldBinomialProjected` | `cv({ geometry: "projected", family: "binomial", xs, ys, successes, trials, … })` |
+| `leaveOneOutSpaceTime*` / `kFoldSpaceTime*` | `cv({ geometry: "spacetime", family: "ordinary" \| "simple" \| "universal" \| "binomial", times, spaceTimeVariogram, … })` |
+| `conditionalSimulateSimple` / `Universal` / `Projected` / `Binomial` | `simulate({ geometry, family, … })` or `conditionalSimulate({ … })` |
+| `conditionalSimulateSpaceTime*` | `simulate({ geometry: "spacetime", family, spaceTimeVariogram, … })` |
+| `conditionalSimulateManySimple` / `*Binomial` / `*SpaceTime*` (suffixed) | `conditionalSimulateMany({ geometry, family, nRealizations, baseSeed, … })` |
+| `WasmOrdinaryKriging`, `WasmSimpleKriging`, … | `WasmKrigingModel.ordinaryGeoFromArrays`, `WasmKrigingModel.simpleGeoFromArrays`, … |
+| `WasmSpaceTimeOrdinaryKriging`, … | `WasmKrigingModel.spacetimeOrdinaryGeoFromArrays`, … |
+
+Spacetime calls use **`spaceTimeVariogram`** (not `variogram`). Binomial simulation
+uses **`conditioningSuccesses`** / **`conditioningTrials`**; binomial CV uses
+**`successes`** / **`trials`**.
+
+```ts
+import { cv, leaveOneOut, kFold, simulate, conditionalSimulate } from "kriging-rs-wasm";
+
+// LOO ordinary CV (geometry/family optional on convenience wrappers)
+const loo = leaveOneOut({ lats, lons, values, variogram });
+
+// K-fold projected binomial CV
+const kf = cv({
+  geometry: "projected",
+  family: "binomial",
+  xs, ys, successes, trials, variogram,
+  majorAngleDeg: 0, rangeRatio: 1, k: 5,
+});
+
+// Spacetime SGS
+const samples = simulate({
+  geometry: "spacetime",
+  family: "ordinary",
+  conditioningLats, conditioningLons, conditioningTimes, conditioningValues,
+  targetLats, targetLons, targetTimes,
+  spaceTimeVariogram,
+  seed: 42n,
+});
+```
+
+Public TypeScript classes construct via `WasmKrigingModel.*` factories internally.
+If you call WASM glue directly, use `WasmKrigingModel` static factories.
 
 ## [0.3.0] - 2026-04-16
 
@@ -213,7 +411,7 @@ Higher-level ergonomics layered on top of the WASM bindings.
 
 - **npm package (kriging-rs-wasm)**
   - `init()` now returns `Promise<void>` (was `Promise<unknown>`) so callers can use it directly without a wrapper.
-  - Optional `nuggetOverride` on `OrdinaryKrigingFromFittedOptions`, `BinomialKrigingFromFittedVariogramOptions`, and `BinomialKrigingFromFittedVariogramWithPriorOptions` to override the fitted variogram nugget when building the model.
+  - Optional `nuggetOverride` on `OrdinaryKrigingFromFittedOptions` to override the fitted variogram nugget when building the model. Binomial count data uses `fitBinomialVariogram` (calibrated path); use its returned `FittedVariogram` with `BinomialKriging.fromFittedVariogram*` instead of overriding the nugget separately.
   - `model.free()` is idempotent: safe to call multiple times; subsequent calls are no-ops. The TypeScript wrapper clears its reference after the first call so use-after-free throws a clear error. Documented in README and JSDoc.
 
 ## [0.1.0] - 2025-03-15

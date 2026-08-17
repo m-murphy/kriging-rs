@@ -5,6 +5,9 @@
 //! implementations work for geographic and projected spatial coordinates.
 
 pub mod binomial;
+pub(crate) mod engine;
 pub mod ordinary;
 pub mod simple;
+pub(crate) mod simple_engine;
 pub mod universal;
+pub(crate) mod universal_engine;

@@ -58,7 +58,9 @@ pub use empirical::{
 pub use fitting::{
     SpaceTimeFitConfig, SpaceTimeFitResult, SpaceTimeVariogramType, fit_spacetime_variogram,
 };
-pub use kriging::binomial::{SpaceTimeBinomialKrigingModel, SpaceTimeBinomialObservation};
+pub use kriging::binomial::{
+    SpaceTimeBinomialDiagnostics, SpaceTimeBinomialKrigingModel, SpaceTimeBinomialObservation,
+};
 pub use kriging::ordinary::SpaceTimeOrdinaryKrigingModel;
 pub use kriging::simple::SpaceTimeSimpleKrigingModel;
 pub use kriging::universal::{SpaceTimeUniversalKrigingModel, SpaceTimeUniversalTrend};

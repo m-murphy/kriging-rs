@@ -58,17 +58,19 @@ export interface OrdinaryPrediction {
 
 /**
  * Result of a single binomial kriging prediction (prevalence surface).
- * @property prevalence - Estimated prevalence in [0, 1]
- * @property logitValue - Logit-scale value
- * @property variance - Kriging variance of the **logit**, not of prevalence. See
- *   {@link BinomialPrediction.prevalenceVariance} for a probability-scale approximation.
- * @property prevalenceVariance - Delta-method approximation of Var(prevalence),
- *   i.e. `[p(1-p)]^2 * variance`. Use this for approximate CIs on the probability scale.
+ * @property prevalenceMedian - Predictive median of prevalence in (0, 1) (inverse logit of predictive logit median).
+ * @property prevalenceMean - Gauss–Hermite estimate of E[prevalence] under latent Normal on logit.
+ * @property logit - Mean of predictive distribution on the logit scale (ordinary kriging estimate).
+ * @property logitVariance - Kriging variance of the **logit**. See {@link BinomialPrediction.prevalenceVariance}
+ *   for a probability-scale approximation of Var(prevalence) around the median map.
+ * @property prevalenceVariance - Delta-method approximation of Var(prevalence) from logit mean/variance,
+ *   i.e. `[p(1-p)]^2 * logitVariance` with `p = logistic(logit)`.
  */
 export interface BinomialPrediction {
-  prevalence: number;
-  logitValue: number;
-  variance: number;
+  prevalenceMedian: number;
+  prevalenceMean: number;
+  logit: number;
+  logitVariance: number;
   prevalenceVariance: number;
 }
 
@@ -83,13 +85,14 @@ export interface OrdinaryBatchArrayOutput {
 
 /**
  * Batch binomial kriging output as typed arrays (avoids per-point object allocation).
- * Use for large prediction grids. `variances` is the kriging variance of the logit;
- * `prevalenceVariances` is the delta-method probability-scale approximation.
+ * Use for large prediction grids. `logitVariances` is the kriging variance of the logit;
+ * `prevalenceVariances` is the delta-method probability-scale approximation around `logistic(logit)`.
  */
 export interface BinomialBatchArrayOutput {
-  prevalences: Float64Array;
+  prevalenceMedians: Float64Array;
+  prevalenceMeans: Float64Array;
   logitValues: Float64Array;
-  variances: Float64Array;
+  logitVariances: Float64Array;
   prevalenceVariances: Float64Array;
 }
 
@@ -114,6 +117,20 @@ export interface PredictGridOptions {
 }
 
 /**
+ * Options for {@link BinomialProjectedKriging.predictGrid}: rectangular bounds in the same
+ * planar units as the model's `xs`/`ys`, plus cell counts. Row `j` spans `yMin` to `yMax`
+ * (south to north analogy); column `i` spans `xMin` to `xMax` (west to east).
+ */
+export interface PredictProjectedGridOptions {
+  xMin: number;
+  xMax: number;
+  yMin: number;
+  yMax: number;
+  xCells: number;
+  yCells: number;
+}
+
+/**
  * Ordinary kriging grid output: 2D arrays with shape [yCells][xCells].
  * values[j][i] and variances[j][i] correspond to row j (latitude), column i (longitude).
  */
@@ -123,14 +140,15 @@ export interface OrdinaryGridOutput {
 }
 
 /**
- * Binomial kriging grid output: 2D arrays with shape [yCells][xCells]. `variances` is the
+ * Binomial kriging grid output: 2D arrays with shape [yCells][xCells]. `logitVariances` is the
  * kriging variance on the logit scale; `prevalenceVariances` is the delta-method
- * probability-scale approximation `[p(1-p)]^2 * variance`.
+ * probability-scale approximation `[p(1-p)]^2 * logitVariance` with `p = logistic(logit)`.
  */
 export interface BinomialGridOutput {
-  prevalences: number[][];
+  prevalenceMedians: number[][];
+  prevalenceMeans: number[][];
   logitValues: number[][];
-  variances: number[][];
+  logitVariances: number[][];
   prevalenceVariances: number[][];
 }
 
@@ -197,7 +215,7 @@ export interface InterpolateOrdinaryToGridOptions {
   nBins?: number;
   /** Optional max distance for binning. */
   maxDistance?: number;
-  /** Optional nugget override when building model from fitted variogram. */
+  /** Optional nugget override when building the model from the fitted variogram (ordinary only; for binomial use {@link fitBinomialVariogram}). */
   nuggetOverride?: number;
 }
 
@@ -206,11 +224,10 @@ export interface InterpolateOrdinaryToGridOptions {
  * logits the kriger consumes, build a model, predict on a rectangular grid, then
  * free the model.
  *
- * The variogram is fit on `logit((s + α) / (n + α + β))` per station, matching
- * the values the binomial kriger interpolates internally — so the fitted
- * `nugget`, `sill`, and `range` are calibrated for the same field. The default
- * prior is `Beta(1, 1)`; override with `prior` to match a custom shrinkage
- * choice.
+ * Variogram fitting uses {@link fitBinomialVariogram} (noise-calibrated empirical
+ * variogram on the same EB-smoothed logits the kriger uses). The default prior is
+ * `Beta(1, 1)`; pass `prior: { alpha, beta }` for a fixed prior, or `prior: "auto"` to
+ * estimate **α**, **β** from pooled counts ({@link estimateBinomialPrior}).
  *
  * Pass `withCv: true` (or `withCv: { k: <folds> }`) to additionally run
  * leave-one-out (or k-fold) binomial cross-validation against the fitted
@@ -240,23 +257,23 @@ export interface InterpolateBinomialToGridOptions {
   nBins?: number;
   /** Optional max distance for binning (km). */
   maxDistance?: number;
-  /** Optional nugget override when building model from fitted variogram. */
-  nuggetOverride?: number;
-  /** Optional Beta(alpha, beta) prior for binomial model (default Beta(1, 1)). */
-  prior?: BinomialPriorParams;
+  /** Optional Beta prior for the binomial model and variogram fit; default Beta(1, 1). Use `"auto"` to estimate from counts. */
+  prior?: BinomialPriorInput;
   /**
-   * Empirical estimator passed to {@link fitVariogram}. `"cressie-hawkins"` is
-   * recommended for noisy count data; defaults to `"classical"` (Matheron).
+   * ε for calibrated pair weights in {@link fitBinomialVariogram}; omit for default.
    */
-  estimator?: EmpiricalEstimator;
+  relWeightEps?: number;
   /**
    * If set, also runs binomial cross-validation against the fitted variogram
    * and exposes the {@link BinomialCvSummary} on the returned object.
    *
-   * - `true` (or `"loo"`): leave-one-out CV via {@link leaveOneOutBinomial}.
-   * - `{ k: number }`: k-fold CV via {@link kFoldBinomial}.
+   * - `true` (or `"loo"`): leave-one-out CV via {@link leaveOneOut} / {@link cv}
+     with `family: "binomial"`.
+   * - `{ k: number }`: k-fold CV via {@link kFold} / {@link cv} with the same family.
    */
   withCv?: boolean | "loo" | { k: number };
+  stability?: BinomialStabilityPreset;
+  oneStepLaplaceObservationVariance?: boolean;
 }
 
 /**
@@ -265,7 +282,7 @@ export interface InterpolateBinomialToGridOptions {
  * kriging build, and (when `withCv` is set) the binomial CV summary.
  */
 export interface InterpolateBinomialToGridResult extends BinomialGridOutput {
-  /** Variogram parameters fit from the EB-smoothed logits. */
+  /** Variogram parameters from {@link fitBinomialVariogram} (calibrated binomial path). */
   fittedVariogram: FittedVariogram;
   /** Diagnostics from the binomial model build (prior, dropped rows, inflation, …). */
   buildNotes: BinomialBuildNotes;
@@ -532,8 +549,8 @@ export interface PolygonCells {
 /**
  * Options for {@link aggregatePrevalenceByPolygon}: reduce one or more polygons
  * over a binomial ensemble buffer (typically from
- * {@link simulateBinomialGridEnsemble} or
- * {@link conditionalSimulateManyBinomial}).
+ * {@link simulateBinomialGridEnsemble} or {@link conditionalSimulateMany} with
+ * `family: "binomial"`).
  */
 export interface AggregatePrevalenceByPolygonOptions {
   /**
@@ -632,6 +649,31 @@ export interface FitVariogramOptions {
 }
 
 /**
+ * Options for {@link fitBinomialVariogram}: count data plus variogram model type.
+ * Uses the same noise-calibrated empirical variogram on EB-smoothed logits as the
+ * binomial kriger. Only the classical empirical estimator is supported (omit
+ * `estimator` or pass `"classical"`).
+ */
+export interface FitBinomialVariogramOptions {
+  sampleLats: NumericArrayInput;
+  sampleLons: NumericArrayInput;
+  successes: IntegerArrayInput;
+  trials: IntegerArrayInput;
+  variogramType: VariogramTypeName | number;
+  maxDistance?: number;
+  nBins?: number;
+  /** Must be `"classical"` if set; Cressie–Hawkins is not supported on this path. */
+  estimator?: EmpiricalEstimator;
+  /** Beta prior for smoothed logits; default Beta(1, 1). Use `"auto"` to estimate from counts. */
+  prior?: BinomialPriorInput;
+  /**
+   * ε in pair weights `1 / (0.5·(σ_i²+σ_j²) + ε)` for the calibrated empirical variogram.
+   * Omit for a small library default.
+   */
+  relWeightEps?: number;
+}
+
+/**
  * Variogram parameters for model construction (nugget, sill, range, optional shape).
  */
 export interface VariogramParams {
@@ -642,6 +684,13 @@ export interface VariogramParams {
   /** Shape parameter for stable/matern; omit for other types. */
   shape?: number;
 }
+
+/**
+ * Preset for heteroskedastic (calibrated) binomial builds: controls logit observation
+ * variance floor and how many inflation retries the factorization may attempt.
+ * Maps to Rust `BinomialStability`.
+ */
+export type BinomialStabilityPreset = "default" | "strict" | "permissive";
 
 /**
  * Options for constructing an ordinary kriging model. Pass a single object to
@@ -664,6 +713,13 @@ export interface BinomialKrigingOptions {
   successes: IntegerArrayInput;
   trials: IntegerArrayInput;
   variogram: VariogramParams;
+  /** Optional heteroskedastic build preset (default library behavior when omitted). */
+  stability?: BinomialStabilityPreset;
+  /**
+   * When true, use a one-step Laplace refinement for per-site logit observation variance on
+   * count-based calibrated builds; bumps {@link BinomialBuildNotes.calibrationVersion} when used.
+   */
+  oneStepLaplaceObservationVariance?: boolean;
 }
 
 /**
@@ -675,8 +731,14 @@ export interface BinomialPriorParams {
 }
 
 /**
+ * Explicit Beta prior, or `"auto"` to estimate **α**, **β** from pooled successes/trials
+ * (same heuristic as Rust `estimate_binomial_prior_from_counts` / {@link estimateBinomialPrior}).
+ */
+export type BinomialPriorInput = BinomialPriorParams | "auto";
+
+/**
  * Build-time diagnostics for a calibrated binomial kriging model (geographic,
- * projected, or space–time). Returned by {@link BinomialKriging.getBuildNotes}
+ * projected, or space–time). Exposed as {@link BinomialKriging.buildNotes}.
  * and included on {@link InterpolateBinomialToGridResult}.
  *
  * Field names match the WASM JSON (`camelCase`).
@@ -694,6 +756,32 @@ export interface BinomialBuildNotes {
   zeroTrialDroppedIndices: number[];
   /** True when the model was built from caller logits only (no per-trial variances). */
   fromPrecomputedLogitsOnly: boolean;
+  /** Build-time messages (e.g. logit variance inflation). */
+  warnings: string[];
+  conditionNumber?: number;
+  effectiveDof?: number;
+  lastMsdr?: number;
+}
+
+/**
+ * Bundled variogram, build notes, and optional leave-one-out logit MSDR from
+ * {@link BinomialKriging.diagnostics}.
+ */
+export interface BinomialDiagnostics {
+  variogram: VariogramParams;
+  buildNotes: BinomialBuildNotes;
+  /** Present when count tensors were supplied for LOO MSDR. */
+  logitLooMsdr?: number;
+}
+
+/**
+ * Space–time binomial {@link SpaceTimeBinomialKriging.diagnostics} payload: fitted
+ * space–time variogram, build notes, optional LOO logit MSDR.
+ */
+export interface SpaceTimeBinomialDiagnostics {
+  variogram: SpaceTimeVariogramParams;
+  buildNotes: BinomialBuildNotes;
+  logitLooMsdr?: number;
 }
 
 /**
@@ -706,6 +794,38 @@ export interface BinomialKrigingWithPriorOptions {
   successes: IntegerArrayInput;
   trials: IntegerArrayInput;
   variogram: VariogramParams;
+  prior: BinomialPriorParams;
+  stability?: BinomialStabilityPreset;
+  oneStepLaplaceObservationVariance?: boolean;
+}
+
+/**
+ * Options for {@link BinomialTangentPlaneKriging}: same count + variogram inputs as
+ * {@link BinomialKrigingOptions}, plus tangent-plane reference (optional; default is mean lat/lon)
+ * and 2-D anisotropy (`majorAngleDeg`, `rangeRatio`). Distances use km equirectangular offsets
+ * from the reference — valid for small areas only (see build notes warning).
+ */
+export interface BinomialTangentPlaneKrigingOptions {
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  successes: IntegerArrayInput;
+  trials: IntegerArrayInput;
+  variogram: VariogramParams;
+  /** Azimuth of the major correlation axis, degrees counter-clockwise from local +x (east). */
+  majorAngleDeg: number;
+  /** Minor / major range ratio in `(0, 1]`. Use `1` for isotropic correlation on the plane. */
+  rangeRatio: number;
+  /** Optional tangent-plane origin latitude (degrees); must be paired with `tangentPlaneRefLon`. */
+  tangentPlaneRefLat?: number;
+  /** Optional tangent-plane origin longitude (degrees); must be paired with `tangentPlaneRefLat`. */
+  tangentPlaneRefLon?: number;
+  stability?: BinomialStabilityPreset;
+  oneStepLaplaceObservationVariance?: boolean;
+}
+
+/** Options for {@link BinomialTangentPlaneKriging.newWithPrior}. */
+export interface BinomialTangentPlaneKrigingWithPriorOptions
+  extends BinomialTangentPlaneKrigingOptions {
   prior: BinomialPriorParams;
 }
 
@@ -776,6 +896,24 @@ export interface BinomialFromPrecomputedLogitsOptions {
 }
 
 /**
+ * Options for {@link BinomialKriging.fromPrecomputedLogitsWithVariances}: finite logits plus a
+ * per-site logit observation variance vector (diagonal), with the same default heteroskedastic
+ * stability policy as count-based builds.
+ */
+export interface BinomialFromPrecomputedLogitsWithVariancesOptions {
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  logits: NumericArrayInput;
+  /** Per-site base variance on the logit diagonal (same length as `logits`). */
+  logitObservationVariance: NumericArrayInput;
+  variogram: VariogramParams;
+  /** Optional Beta prior for build notes; default Beta(1, 1) when omitted. */
+  prior?: BinomialPriorParams;
+  stability?: BinomialStabilityPreset;
+  oneStepLaplaceObservationVariance?: boolean;
+}
+
+/**
  * Options for {@link BinomialProjectedKriging} on planar `(x, y)` coordinates with
  * 2-D anisotropy. Distances are Euclidean (optionally anisotropy-deformed); the
  * `range` is in the same linear units as `xs`/`ys`.
@@ -790,6 +928,8 @@ export interface BinomialProjectedKrigingOptions {
   majorAngleDeg: number;
   /** Ratio of minor to major range, in `(0, 1]`. `1` = isotropic. */
   rangeRatio: number;
+  stability?: BinomialStabilityPreset;
+  oneStepLaplaceObservationVariance?: boolean;
 }
 
 /** Options for {@link BinomialProjectedKriging.newWithPrior}. */
@@ -809,6 +949,45 @@ export interface BinomialProjectedFromPrecomputedLogitsOptions {
   variogram: VariogramParams;
   majorAngleDeg: number;
   rangeRatio: number;
+}
+
+/** Options for {@link BinomialProjectedKriging.fromPrecomputedLogitsWithVariances}. */
+export interface BinomialProjectedFromPrecomputedLogitsWithVariancesOptions {
+  xs: NumericArrayInput;
+  ys: NumericArrayInput;
+  logits: NumericArrayInput;
+  logitObservationVariance: NumericArrayInput;
+  variogram: VariogramParams;
+  majorAngleDeg: number;
+  rangeRatio: number;
+  prior?: BinomialPriorParams;
+  stability?: BinomialStabilityPreset;
+  oneStepLaplaceObservationVariance?: boolean;
+}
+
+/**
+ * Options for {@link BinomialProjectedKriging.fromFittedVariogram}: count data, fitted
+ * isotropic variogram (same units as `xs`/`ys`), and anisotropy controls.
+ */
+export interface BinomialProjectedKrigingFromFittedVariogramOptions {
+  xs: NumericArrayInput;
+  ys: NumericArrayInput;
+  successes: IntegerArrayInput;
+  trials: IntegerArrayInput;
+  fittedVariogram: FittedVariogram;
+  majorAngleDeg: number;
+  rangeRatio: number;
+  stability?: BinomialStabilityPreset;
+  oneStepLaplaceObservationVariance?: boolean;
+}
+
+/**
+ * Options for {@link BinomialProjectedKriging.fromFittedVariogramWithPrior}: same as
+ * {@link BinomialProjectedKrigingFromFittedVariogramOptions} plus a Beta prior.
+ */
+export interface BinomialProjectedKrigingFromFittedVariogramWithPriorOptions
+  extends BinomialProjectedKrigingFromFittedVariogramOptions {
+  prior: BinomialPriorParams;
 }
 
 /**
@@ -880,7 +1059,288 @@ export interface CvSummary {
   msdr: number;
 }
 
-/** Result of {@link leaveOneOut} / {@link kFold}. */
+/** Geometry seam for unified CV / simulation entry points. */
+export type KrigingGeometry = "geo" | "projected" | "spacetime";
+
+/** Kriging family seam for unified CV / simulation entry points. */
+export type KrigingFamily = "ordinary" | "simple" | "universal" | "binomial";
+
+/** Omit `K` from each member of union `T` (TypeScript `Omit` is not distributive). */
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
+  ? Omit<T, K>
+  : never;
+
+/** Shared fold and prior options for {@link cv}. */
+type CvFoldOptions = {
+  /** Number of folds (`2 ≤ k ≤ n`). Omit for leave-one-out. */
+  k?: number;
+  prior?: BinomialPriorInput;
+};
+
+/** Projected anisotropy fields (2-D geometries only). */
+type ProjectedAnisotropyOptions = {
+  majorAngleDeg?: number;
+  rangeRatio?: number;
+};
+
+/** Family-specific fields for geo / projected CV. */
+type CvGeoFamilyOptions =
+  | {
+      family?: "ordinary";
+      values: NumericArrayInput;
+    }
+  | {
+      family: "simple";
+      values: NumericArrayInput;
+      mean: number;
+    }
+  | {
+      family: "universal";
+      values: NumericArrayInput;
+      trend?: UniversalTrend;
+    }
+  | {
+      family: "binomial";
+      successes: IntegerArrayInput;
+      trials: IntegerArrayInput;
+    };
+
+/** Family-specific fields for spacetime CV. */
+type CvSpacetimeFamilyOptions =
+  | {
+      family?: "ordinary";
+      values: NumericArrayInput;
+    }
+  | {
+      family: "simple";
+      values: NumericArrayInput;
+      mean: number;
+    }
+  | {
+      family: "universal";
+      values: NumericArrayInput;
+      trend?: SpaceTimeUniversalTrend;
+    }
+  | {
+      family: "binomial";
+      successes: IntegerArrayInput;
+      trials: IntegerArrayInput;
+    };
+
+/**
+ * Geographic cross-validation — `(lat, lon)` and a 2-D variogram.
+ * Folds are deterministic round-robin (station `i` → fold `i % k`); shuffle inputs
+ * for randomized validation. Binomial CV: stations with `trials[i] === 0` carry
+ * `NaN` observed fields and are excluded from summary aggregates.
+ */
+export type GeoCvOptions = CvFoldOptions & {
+  geometry: "geo";
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  variogram: VariogramParams;
+} & CvGeoFamilyOptions;
+
+/**
+ * Like {@link GeoCvOptions} but `geometry` defaults to `"geo"` and `family`
+ * defaults to `"ordinary"` on {@link leaveOneOut} / {@link kFold}.
+ */
+export type GeoCvOptionsInput = CvFoldOptions & {
+  geometry?: "geo";
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  variogram: VariogramParams;
+} & CvGeoFamilyOptions;
+
+/** Projected cross-validation — planar `(x, y)` and a 2-D variogram. */
+export type ProjectedCvOptions = CvFoldOptions &
+  ProjectedAnisotropyOptions & {
+    geometry: "projected";
+    xs: NumericArrayInput;
+    ys: NumericArrayInput;
+    variogram: VariogramParams;
+  } & CvGeoFamilyOptions;
+
+/** Spacetime cross-validation — `(lat, lon, time)` and a space-time variogram. */
+export type SpacetimeCvOptions = CvFoldOptions & {
+  geometry: "spacetime";
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  times: NumericArrayInput;
+  spaceTimeVariogram: SpaceTimeVariogramParams;
+} & CvSpacetimeFamilyOptions;
+
+/**
+ * Cross-validation options discriminated by `geometry`.
+ * Use {@link CvOptionsInput} at call sites that rely on geo + ordinary defaults.
+ */
+export type CvOptions = GeoCvOptions | ProjectedCvOptions | SpacetimeCvOptions;
+
+/** Input accepted by {@link cv}, {@link leaveOneOut}, and {@link kFold}. */
+export type CvOptionsInput =
+  | GeoCvOptionsInput
+  | ProjectedCvOptions
+  | SpacetimeCvOptions;
+
+/** {@link leaveOneOut} input — `k` is not accepted. */
+export type LeaveOneOutOptions = DistributiveOmit<CvOptionsInput, "k">;
+
+/** Shared seed / realization options for {@link simulate}. */
+type SimulateSeedOptions = {
+  prior?: BinomialPriorInput;
+  seed?: number | bigint;
+  baseSeed?: number | bigint;
+  nRealizations?: number;
+  targetOrder?: ArrayLike<number> | Uint32Array;
+};
+
+/** Family-specific fields for geo / projected simulation. */
+type SimulateGeoFamilyOptions =
+  | {
+      family?: "ordinary";
+      conditioningValues: NumericArrayInput;
+    }
+  | {
+      family: "simple";
+      conditioningValues: NumericArrayInput;
+      mean: number;
+    }
+  | {
+      family: "universal";
+      conditioningValues: NumericArrayInput;
+      trend?: UniversalTrend;
+    }
+  | {
+      family: "binomial";
+      conditioningSuccesses: IntegerArrayInput;
+      conditioningTrials: IntegerArrayInput;
+    };
+
+/** Family-specific fields for spacetime simulation. */
+type SimulateSpacetimeFamilyOptions =
+  | {
+      family?: "ordinary";
+      conditioningValues: NumericArrayInput;
+    }
+  | {
+      family: "simple";
+      conditioningValues: NumericArrayInput;
+      mean: number;
+    }
+  | {
+      family: "universal";
+      conditioningValues: NumericArrayInput;
+      trend?: SpaceTimeUniversalTrend;
+    }
+  | {
+      family: "binomial";
+      conditioningSuccesses: IntegerArrayInput;
+      conditioningTrials: IntegerArrayInput;
+    };
+
+/**
+ * Geographic sequential Gaussian simulation — Haversine conditioning and targets.
+ * Deterministic for a given `seed` (or `baseSeed` when `nRealizations > 1`).
+ * Binomial simulation runs on the logit scale; stations with `trials === 0` are
+ * dropped from the initial conditioning pool.
+ */
+export type GeoSimulateOptions = SimulateSeedOptions & {
+  geometry: "geo";
+  conditioningLats: NumericArrayInput;
+  conditioningLons: NumericArrayInput;
+  targetLats: NumericArrayInput;
+  targetLons: NumericArrayInput;
+  variogram: VariogramParams;
+} & SimulateGeoFamilyOptions;
+
+/**
+ * Like {@link GeoSimulateOptions} but `geometry` defaults to `"geo"` and `family`
+ * defaults to `"ordinary"` on {@link conditionalSimulate} / {@link conditionalSimulateMany}.
+ */
+export type GeoSimulateOptionsInput = SimulateSeedOptions & {
+  geometry?: "geo";
+  conditioningLats: NumericArrayInput;
+  conditioningLons: NumericArrayInput;
+  targetLats: NumericArrayInput;
+  targetLons: NumericArrayInput;
+  variogram: VariogramParams;
+} & SimulateGeoFamilyOptions;
+
+/** Projected sequential Gaussian simulation — planar conditioning and targets. */
+export type ProjectedSimulateOptions = SimulateSeedOptions &
+  ProjectedAnisotropyOptions & {
+    geometry: "projected";
+    conditioningXs: NumericArrayInput;
+    conditioningYs: NumericArrayInput;
+    targetXs: NumericArrayInput;
+    targetYs: NumericArrayInput;
+    variogram: VariogramParams;
+  } & SimulateGeoFamilyOptions;
+
+/** Spacetime sequential Gaussian simulation. */
+export type SpacetimeSimulateOptions = SimulateSeedOptions & {
+  geometry: "spacetime";
+  conditioningLats: NumericArrayInput;
+  conditioningLons: NumericArrayInput;
+  conditioningTimes: NumericArrayInput;
+  targetLats: NumericArrayInput;
+  targetLons: NumericArrayInput;
+  targetTimes: NumericArrayInput;
+  spaceTimeVariogram: SpaceTimeVariogramParams;
+} & SimulateSpacetimeFamilyOptions;
+
+/**
+ * Simulation options discriminated by `geometry`.
+ * Use {@link SimulateOptionsInput} at call sites that rely on geo + ordinary defaults.
+ */
+export type SimulateOptions =
+  | GeoSimulateOptions
+  | ProjectedSimulateOptions
+  | SpacetimeSimulateOptions;
+
+/** Input accepted by {@link simulate}, {@link conditionalSimulate}, and {@link conditionalSimulateMany}. */
+export type SimulateOptionsInput =
+  | GeoSimulateOptionsInput
+  | ProjectedSimulateOptions
+  | SpacetimeSimulateOptions;
+
+/**
+ * @internal Flat field bag for WASM serde packing after geometry/family normalization.
+ * Public callers should use the discriminated {@link CvOptionsInput} / {@link SimulateOptionsInput}.
+ */
+export type UnifiedOptionsFlat = CvFoldOptions &
+  SimulateSeedOptions & {
+    geometry?: KrigingGeometry;
+    family?: KrigingFamily;
+    lats?: NumericArrayInput;
+    lons?: NumericArrayInput;
+    xs?: NumericArrayInput;
+    ys?: NumericArrayInput;
+    values?: NumericArrayInput;
+    successes?: IntegerArrayInput;
+    trials?: IntegerArrayInput;
+    times?: NumericArrayInput;
+    variogram?: VariogramParams | SpaceTimeVariogramParams;
+    spaceTimeVariogram?: SpaceTimeVariogramParams;
+    mean?: number;
+    trend?: UniversalTrend | SpaceTimeUniversalTrend;
+    majorAngleDeg?: number;
+    rangeRatio?: number;
+    conditioningLats?: NumericArrayInput;
+    conditioningLons?: NumericArrayInput;
+    conditioningXs?: NumericArrayInput;
+    conditioningYs?: NumericArrayInput;
+    conditioningTimes?: NumericArrayInput;
+    conditioningValues?: NumericArrayInput;
+    conditioningSuccesses?: IntegerArrayInput;
+    conditioningTrials?: IntegerArrayInput;
+    targetLats?: NumericArrayInput;
+    targetLons?: NumericArrayInput;
+    targetXs?: NumericArrayInput;
+    targetYs?: NumericArrayInput;
+    targetTimes?: NumericArrayInput;
+  };
+
+/** Result of {@link cv} / {@link leaveOneOut} / {@link kFold} for continuous families. */
 export interface CvResult {
   /** Per-station residuals in input order. */
   residuals: CvResidual[];
@@ -896,133 +1356,13 @@ export interface CvResult {
 }
 
 /**
- * Options for {@link leaveOneOut}. Uses ordinary kriging with the supplied variogram.
- */
-export interface LeaveOneOutOptions {
-  lats: NumericArrayInput;
-  lons: NumericArrayInput;
-  values: NumericArrayInput;
-  variogram: VariogramParams;
-}
-
-/**
- * Options for {@link kFold}. Folds are deterministic round-robin (station `i` → fold `i % k`).
- * Caller should shuffle inputs for randomized validation.
- */
-export interface KFoldOptions extends LeaveOneOutOptions {
-  /** Number of folds, must satisfy `2 ≤ k ≤ n`. */
-  k: number;
-}
-
-/**
- * Options for {@link leaveOneOutSimple}. Simple kriging treats the supplied `mean` as
- * known for every fold (no in-fold refit), matching practice for an externally estimated
- * mean.
- */
-export interface LeaveOneOutSimpleOptions extends LeaveOneOutOptions {
-  /** Known constant mean used by simple kriging inside each fold. */
-  mean: number;
-}
-
-/** Options for {@link kFoldSimple}. */
-export interface KFoldSimpleOptions extends LeaveOneOutSimpleOptions {
-  /** Number of folds, must satisfy `2 ≤ k ≤ n`. */
-  k: number;
-}
-
-/**
- * Options for {@link leaveOneOutUniversal}. Trend coefficients are re-estimated inside
- * each fold from the training stations, so the trend contributes no in-sample leakage.
- */
-export interface LeaveOneOutUniversalOptions extends LeaveOneOutOptions {
-  /** Polynomial drift basis. `"constant"` is equivalent to ordinary kriging. */
-  trend: UniversalTrend;
-}
-
-/** Options for {@link kFoldUniversal}. */
-export interface KFoldUniversalOptions extends LeaveOneOutUniversalOptions {
-  /** Number of folds, must satisfy `2 ≤ k ≤ n`. */
-  k: number;
-}
-
-/**
- * Options for {@link leaveOneOutProjected}. Uses planar `(x, y)` coordinates and the
- * kriging variogram's `range` must be expressed in the same linear units. When
- * `rangeRatio === 1` the model is isotropic and `majorAngleDeg` is ignored.
- */
-export interface LeaveOneOutProjectedOptions {
-  xs: NumericArrayInput;
-  ys: NumericArrayInput;
-  values: NumericArrayInput;
-  variogram: VariogramParams;
-  /** Angle of the major (longer-range) axis in degrees (0 = +x, counter-clockwise). */
-  majorAngleDeg: number;
-  /** Ratio of minor range to major range, in (0, 1]. `1` = isotropic. */
-  rangeRatio: number;
-}
-
-/** Options for {@link kFoldProjected}. */
-export interface KFoldProjectedOptions extends LeaveOneOutProjectedOptions {
-  /** Number of folds, must satisfy `2 ≤ k ≤ n`. */
-  k: number;
-}
-
-/**
- * Options for {@link leaveOneOutBinomial}. A station whose `trials[i] === 0` is treated as
- * unobservable: it participates in no training fold, and its residual carries `NaN` for
- * observed fields (prediction is still populated). The `summary.logit` and
- * `summary.prevalence` aggregates skip those stations automatically.
- */
-export interface LeaveOneOutBinomialOptions {
-  lats: NumericArrayInput;
-  lons: NumericArrayInput;
-  successes: ArrayLike<number> | Uint32Array;
-  trials: ArrayLike<number> | Uint32Array;
-  variogram: VariogramParams;
-  /** Optional Beta(alpha, beta) prior; defaults to Beta(1, 1) when omitted. */
-  prior?: BinomialPriorParams;
-}
-
-/** Options for {@link kFoldBinomial}. */
-export interface KFoldBinomialOptions extends LeaveOneOutBinomialOptions {
-  /** Number of folds, must satisfy `2 ≤ k ≤ n`. */
-  k: number;
-}
-
-/**
- * Options for {@link leaveOneOutBinomialProjected}. Same conventions as
- * {@link LeaveOneOutBinomialOptions} but on planar `(x, y)` coordinates with
- * 2-D geometric anisotropy. Pass `rangeRatio === 1` for isotropic (the
- * `majorAngleDeg` is then ignored).
- */
-export interface LeaveOneOutBinomialProjectedOptions {
-  xs: NumericArrayInput;
-  ys: NumericArrayInput;
-  successes: ArrayLike<number> | Uint32Array;
-  trials: ArrayLike<number> | Uint32Array;
-  variogram: VariogramParams;
-  /** Angle of the major (longer-range) axis in degrees (0 = +x, counter-clockwise). */
-  majorAngleDeg: number;
-  /** Ratio of minor range to major range, in (0, 1]. `1` = isotropic. */
-  rangeRatio: number;
-  /** Optional Beta(alpha, beta) prior; defaults to Beta(1, 1) when omitted. */
-  prior?: BinomialPriorParams;
-}
-
-/** Options for {@link kFoldBinomialProjected}. */
-export interface KFoldBinomialProjectedOptions
-  extends LeaveOneOutBinomialProjectedOptions {
-  /** Number of folds, must satisfy `2 ≤ k ≤ n`. */
-  k: number;
-}
-
-/**
  * Per-station residual from binomial cross-validation. Reports the held-out observation
  * and the model's prediction on **both** the logit scale (directly comparable to
  * continuous kriging and MSDR-calibratable) and the prevalence scale (intuitive; delta-
  * method variance).
  *
- * When `trials === 0`, observed fields are `NaN`; see {@link LeaveOneOutBinomialOptions}.
+ * When `trials === 0`, observed fields are `NaN`; stations with zero trials are skipped in
+ * summary aggregation (see {@link CvOptions} with `family: "binomial"`).
  */
 export interface BinomialCvResidual {
   /** Index of the held-out station in the original input arrays. */
@@ -1050,6 +1390,27 @@ export interface BinomialCvResidual {
 }
 
 /**
+ * One equal-width bin on **predicted** prevalence in `[0, 1]` (ten bins by default).
+ * `pooledObservedPrevalence` is trial-weighted: `sum(successes) / sum(trials)` in the bin.
+ */
+export interface PrevalenceCalibrationBin {
+  /** Bin index `0 .. nBins-1` along predicted prevalence. */
+  binIndex: number;
+  /** Lower edge of the bin on the predicted-prevalence axis. */
+  predictedLo: number;
+  /** Upper edge (inclusive at 1 for the last bin). */
+  predictedHi: number;
+  /** Number of evaluated stations (`trials > 0`) in this bin. */
+  nStations: number;
+  sumTrials: number;
+  sumSuccesses: number;
+  /** Mean predicted prevalence among stations in the bin. `NaN` if `nStations === 0`. */
+  meanPredicted: number;
+  /** Pooled observed prevalence in the bin. `NaN` if `sumTrials === 0`. */
+  pooledObservedPrevalence: number;
+}
+
+/**
  * Aggregate binomial-CV summary reported on **both** scales. `nEvaluated` excludes
  * stations with `trials === 0` (which contribute `NaN` observations).
  */
@@ -1062,9 +1423,22 @@ export interface BinomialCvSummary {
   logit: CvSummary;
   /** Summary statistics on the prevalence scale. */
   prevalence: CvSummary;
+  /**
+   * Mean squared error `(ŷ − y)²` over evaluated stations (`y = successes / trials`), one
+   * term per station. `NaN` when `nEvaluated === 0`.
+   */
+  brier: number;
+  /**
+   * Trial-weighted mean log predictive mass
+   * `(∑ᵢ sᵢ log ŷᵢ + (nᵢ−sᵢ) log(1−ŷᵢ)) / (∑ᵢ nᵢ)` with `ŷ` clamped to `(ε, 1−ε)`.
+   * Higher is better. `NaN` when there are no trials.
+   */
+  logScorePerTrial: number;
+  /** Ten equal-width bins on predicted prevalence for calibration diagnostics. */
+  calibrationBins: PrevalenceCalibrationBin[];
 }
 
-/** Result of {@link leaveOneOutBinomial} / {@link kFoldBinomial}. */
+/** Result of {@link cv} / {@link leaveOneOut} / {@link kFold} for binomial families. */
 export interface BinomialCvResult {
   /** Per-station residuals in input order. */
   residuals: BinomialCvResidual[];
@@ -1085,110 +1459,9 @@ export interface BinomialCvResult {
 }
 
 /**
- * Options for {@link conditionalSimulate}.
- *
- * Returns one sample per target in input order. When called repeatedly with the same
- * arguments (including `seed`), the output is deterministic.
- */
-export interface ConditionalSimulateOptions {
-  conditioningLats: NumericArrayInput;
-  conditioningLons: NumericArrayInput;
-  conditioningValues: NumericArrayInput;
-  targetLats: NumericArrayInput;
-  targetLons: NumericArrayInput;
-  variogram: VariogramParams;
-  /** RNG seed for reproducibility (defaults to `0n`). Accepts number or bigint. */
-  seed?: number | bigint;
-  /** Optional permutation of `0..nTargets` giving the visit order. */
-  targetOrder?: ArrayLike<number> | Uint32Array;
-}
-
-/**
- * Options for {@link conditionalSimulateMany}.
- *
- * Replaces the single `seed` field with `nRealizations` and a `baseSeed`. The k-th
- * realization is drawn with `baseSeed + BigInt(k)` so every draw is independent yet
- * deterministic.
- */
-export interface ConditionalSimulateManyOptions
-  extends Omit<ConditionalSimulateOptions, "seed"> {
-  /** Number of independent realizations to draw (must be >= 1). */
-  nRealizations: number;
-  /** Seed for the first realization. Successive realizations use `baseSeed + k`. */
-  baseSeed?: number | bigint;
-}
-
-/**
- * Options for {@link conditionalSimulateSimple}.
- *
- * Simulation uses simple kriging with the supplied known `mean` at every step.
- */
-export interface ConditionalSimulateSimpleOptions extends ConditionalSimulateOptions {
-  /** Known constant mean used by simple kriging inside the simulation loop. */
-  mean: number;
-}
-
-/**
- * Options for {@link conditionalSimulateUniversal}.
- *
- * Trend coefficients are re-estimated at each simulation step. Requires at least
- * `p + 1` conditioning stations, where `p = 1` (constant), `3` (linear), or `6` (quadratic).
- */
-export interface ConditionalSimulateUniversalOptions extends ConditionalSimulateOptions {
-  /** Polynomial drift basis. `"constant"` is equivalent to ordinary kriging. */
-  trend: UniversalTrend;
-}
-
-/**
- * Options for {@link conditionalSimulateProjected}.
- *
- * Uses planar `(x, y)` coordinates and optional 2-D geometric anisotropy. Pass
- * `rangeRatio = 1` for isotropic simulation (angle is then ignored).
- */
-export interface ConditionalSimulateProjectedOptions {
-  conditioningXs: NumericArrayInput;
-  conditioningYs: NumericArrayInput;
-  conditioningValues: NumericArrayInput;
-  targetXs: NumericArrayInput;
-  targetYs: NumericArrayInput;
-  variogram: VariogramParams;
-  /** Angle of the major (longer-range) axis in degrees (0 = +x, counter-clockwise). */
-  majorAngleDeg: number;
-  /** Ratio of minor range to major range, in (0, 1]. `1` = isotropic. */
-  rangeRatio: number;
-  /** RNG seed for reproducibility (defaults to `0n`). */
-  seed?: number | bigint;
-  /** Optional permutation of `0..nTargets` giving the visit order. */
-  targetOrder?: ArrayLike<number> | Uint32Array;
-}
-
-/**
- * Options for {@link conditionalSimulateBinomial}.
- *
- * Simulation happens on the **logit** scale (where the Gaussian assumption is natural) and
- * results are reported on both the logit and prevalence scales via
- * {@link BinomialSimulationResult}. Stations with `trials === 0` are dropped from the
- * initial conditioning pool.
- */
-export interface ConditionalSimulateBinomialOptions {
-  conditioningLats: NumericArrayInput;
-  conditioningLons: NumericArrayInput;
-  successes: IntegerArrayInput;
-  trials: IntegerArrayInput;
-  targetLats: NumericArrayInput;
-  targetLons: NumericArrayInput;
-  variogram: VariogramParams;
-  /** Optional Beta(alpha, beta) prior; defaults to Beta(1, 1) when omitted. */
-  prior?: BinomialPriorParams;
-  /** RNG seed for reproducibility (defaults to `0n`). */
-  seed?: number | bigint;
-  /** Optional permutation of `0..nTargets` giving the visit order. */
-  targetOrder?: ArrayLike<number> | Uint32Array;
-}
-
-/**
- * Result of {@link conditionalSimulateBinomial}. Contains samples on both the logit scale
- * (unbounded) and the prevalence scale (in `(0, 1)`), in the original target input order.
+ * Result of {@link simulate} / {@link conditionalSimulate} for binomial families.
+ * Contains samples on both the logit scale (unbounded) and the prevalence scale
+ * (in `(0, 1)`), in the original target input order.
  *
  * By construction, `prevalenceSamples[i] === logistic(logitSamples[i])`.
  */
@@ -1200,74 +1473,8 @@ export interface BinomialSimulationResult {
 }
 
 /**
- * Options for {@link conditionalSimulateManyBinomial}. Mirrors
- * {@link ConditionalSimulateBinomialOptions} but replaces `seed` with `nRealizations`
- * and `baseSeed`. Each realization `k` is drawn with `seed = baseSeed + BigInt(k)` so
- * the k-th row of the result is bit-identical to a single
- * {@link conditionalSimulateBinomial} call with that seed.
- */
-export interface ConditionalSimulateManyBinomialOptions
-  extends Omit<ConditionalSimulateBinomialOptions, "seed"> {
-  /** Number of independent realizations to draw (must be >= 1). */
-  nRealizations: number;
-  /** Seed for the first realization. Successive realizations use `baseSeed + k`. */
-  baseSeed?: number | bigint;
-}
-
-/**
- * Options for {@link conditionalSimulateBinomialProjected}. Same as
- * {@link ConditionalSimulateBinomialOptions} but on planar `(x, y)` coordinates
- * with optional 2-D geometric anisotropy. Pass `rangeRatio === 1` for isotropic.
- */
-export interface ConditionalSimulateBinomialProjectedOptions {
-  conditioningXs: NumericArrayInput;
-  conditioningYs: NumericArrayInput;
-  successes: IntegerArrayInput;
-  trials: IntegerArrayInput;
-  targetXs: NumericArrayInput;
-  targetYs: NumericArrayInput;
-  variogram: VariogramParams;
-  /** Angle of the major (longer-range) axis in degrees (0 = +x, counter-clockwise). */
-  majorAngleDeg: number;
-  /** Ratio of minor range to major range, in (0, 1]. `1` = isotropic. */
-  rangeRatio: number;
-  /** Optional Beta(alpha, beta) prior; defaults to Beta(1, 1) when omitted. */
-  prior?: BinomialPriorParams;
-  /** RNG seed for reproducibility (defaults to `0n`). */
-  seed?: number | bigint;
-  /** Optional permutation of `0..nTargets` giving the visit order. */
-  targetOrder?: ArrayLike<number> | Uint32Array;
-}
-
-/**
- * Options for {@link conditionalSimulateManyBinomialProjected}. Mirrors
- * {@link ConditionalSimulateBinomialProjectedOptions} but with `nRealizations`
- * and `baseSeed` instead of `seed`.
- */
-export interface ConditionalSimulateManyBinomialProjectedOptions
-  extends Omit<ConditionalSimulateBinomialProjectedOptions, "seed"> {
-  /** Number of independent realizations to draw (must be >= 1). */
-  nRealizations: number;
-  /** Seed for the first realization. Successive realizations use `baseSeed + k`. */
-  baseSeed?: number | bigint;
-}
-
-/**
- * Options for {@link conditionalSimulateManySpaceTimeBinomial}. Mirrors
- * {@link ConditionalSimulateSpaceTimeBinomialOptions} but with `nRealizations` and
- * `baseSeed` instead of `seed`.
- */
-export interface ConditionalSimulateManySpaceTimeBinomialOptions
-  extends Omit<ConditionalSimulateSpaceTimeBinomialOptions, "seed"> {
-  /** Number of independent realizations to draw (must be >= 1). */
-  nRealizations: number;
-  /** Seed for the first realization. */
-  baseSeed?: number | bigint;
-}
-
-/**
- * Result of {@link conditionalSimulateManyBinomial} and
- * {@link conditionalSimulateManySpaceTimeBinomial}.
+ * Result of {@link simulate} / {@link conditionalSimulateMany} for binomial families
+ * when `nRealizations > 1`.
  *
  * Each typed array is row-major of length `nRealizations * nTargets`. Row `k`
  * (`logitSamples.subarray(k * nTargets, (k + 1) * nTargets)`) corresponds to the k-th
@@ -1310,13 +1517,13 @@ export interface OrdinaryKrigingFromFittedOptions {
   lons: NumericArrayInput;
   values: NumericArrayInput;
   fittedVariogram: FittedVariogram;
-  /** If set, overrides the fitted variogram nugget when building the model (e.g. for UI-tuned sigma²). */
+  /** If set, overrides the fitted variogram nugget when building the model (ordinary only; for binomial counts use {@link fitBinomialVariogram}). */
   nuggetOverride?: number;
 }
 
 /**
  * Options for {@link BinomialKriging.fromFittedVariogram}: count data plus a fitted variogram
- * (e.g. from fitting on logits or reusing ordinary-fit params) to build the model.
+ * (typically from {@link fitBinomialVariogram} with the same stations and prior as the model).
  */
 export interface BinomialKrigingFromFittedVariogramOptions {
   lats: NumericArrayInput;
@@ -1324,13 +1531,13 @@ export interface BinomialKrigingFromFittedVariogramOptions {
   successes: IntegerArrayInput;
   trials: IntegerArrayInput;
   fittedVariogram: FittedVariogram;
-  /** If set, overrides the fitted variogram nugget when building the model. */
-  nuggetOverride?: number;
+  stability?: BinomialStabilityPreset;
+  oneStepLaplaceObservationVariance?: boolean;
 }
 
 /**
- * Options for {@link BinomialKriging.fromFittedVariogramWithPrior}: count data, fitted variogram,
- * and Beta prior to build a binomial kriging model with a prior.
+ * Options for {@link BinomialKriging.fromFittedVariogramWithPrior}: count data, fitted variogram
+ * (typically from {@link fitBinomialVariogram} with the same `prior`), and Beta prior.
  */
 export interface BinomialKrigingFromFittedVariogramWithPriorOptions {
   lats: NumericArrayInput;
@@ -1339,8 +1546,8 @@ export interface BinomialKrigingFromFittedVariogramWithPriorOptions {
   trials: IntegerArrayInput;
   fittedVariogram: FittedVariogram;
   prior: BinomialPriorParams;
-  /** If set, overrides the fitted variogram nugget when building the model. */
-  nuggetOverride?: number;
+  stability?: BinomialStabilityPreset;
+  oneStepLaplaceObservationVariance?: boolean;
 }
 
 /**
@@ -1449,6 +1656,36 @@ export interface SpaceTimeBinomialKrigingOptions {
   successes: IntegerArrayInput;
   trials: IntegerArrayInput;
   variogram: SpaceTimeVariogramParams;
+  stability?: BinomialStabilityPreset;
+  oneStepLaplaceObservationVariance?: boolean;
+}
+
+/** Options for {@link SpaceTimeBinomialKriging.newWithPrior}. */
+export interface SpaceTimeBinomialKrigingWithPriorOptions
+  extends SpaceTimeBinomialKrigingOptions {
+  prior: BinomialPriorParams;
+}
+
+/** Options for {@link SpaceTimeBinomialKriging.fromPrecomputedLogits}. */
+export interface SpaceTimeBinomialFromPrecomputedLogitsOptions {
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  times: NumericArrayInput;
+  logits: NumericArrayInput;
+  variogram: SpaceTimeVariogramParams;
+}
+
+/** Options for {@link SpaceTimeBinomialKriging.fromPrecomputedLogitsWithVariances}. */
+export interface SpaceTimeBinomialFromPrecomputedLogitsWithVariancesOptions {
+  lats: NumericArrayInput;
+  lons: NumericArrayInput;
+  times: NumericArrayInput;
+  logits: NumericArrayInput;
+  logitObservationVariance: NumericArrayInput;
+  variogram: SpaceTimeVariogramParams;
+  prior?: BinomialPriorParams;
+  stability?: BinomialStabilityPreset;
+  oneStepLaplaceObservationVariance?: boolean;
 }
 
 /** Options for building a projected (planar) space-time ordinary kriging model. */
@@ -1498,6 +1735,8 @@ export interface SpaceTimeBinomialKrigingFromFittedOptions {
   successes: IntegerArrayInput;
   trials: IntegerArrayInput;
   fittedVariogram: FittedSpaceTimeVariogram;
+  stability?: BinomialStabilityPreset;
+  oneStepLaplaceObservationVariance?: boolean;
 }
 
 /** Options for {@link SpaceTimeProjectedOrdinaryKriging.fromFitted}. */
@@ -1594,132 +1833,4 @@ export type FittedSpaceTimeVariogram =
 export interface FitSpaceTimeVariogramResult {
   empirical: EmpiricalSpaceTimeVariogramResult;
   fit: FittedSpaceTimeVariogram;
-}
-
-/**
- * Options for {@link leaveOneOutSpaceTime}. Space-time ordinary kriging CV over geographic
- * coordinates with a scalar time axis.
- */
-export interface LeaveOneOutSpaceTimeOptions {
-  lats: NumericArrayInput;
-  lons: NumericArrayInput;
-  times: NumericArrayInput;
-  values: NumericArrayInput;
-  variogram: SpaceTimeVariogramParams;
-}
-
-/** Options for {@link kFoldSpaceTime}. */
-export interface KFoldSpaceTimeOptions extends LeaveOneOutSpaceTimeOptions {
-  /** Number of folds, must satisfy `2 ≤ k ≤ n`. */
-  k: number;
-}
-
-/** Options for {@link leaveOneOutSpaceTimeSimple}. */
-export interface LeaveOneOutSpaceTimeSimpleOptions extends LeaveOneOutSpaceTimeOptions {
-  /** Known constant mean used by simple ST kriging inside each fold. */
-  mean: number;
-}
-
-/** Options for {@link kFoldSpaceTimeSimple}. */
-export interface KFoldSpaceTimeSimpleOptions extends LeaveOneOutSpaceTimeSimpleOptions {
-  /** Number of folds, must satisfy `2 ≤ k ≤ n`. */
-  k: number;
-}
-
-/** Options for {@link leaveOneOutSpaceTimeUniversal}. */
-export interface LeaveOneOutSpaceTimeUniversalOptions extends LeaveOneOutSpaceTimeOptions {
-  /** Polynomial drift basis for universal ST kriging. */
-  trend: SpaceTimeUniversalTrend;
-}
-
-/** Options for {@link kFoldSpaceTimeUniversal}. */
-export interface KFoldSpaceTimeUniversalOptions extends LeaveOneOutSpaceTimeUniversalOptions {
-  /** Number of folds, must satisfy `2 ≤ k ≤ n`. */
-  k: number;
-}
-
-/**
- * Options for {@link leaveOneOutSpaceTimeBinomial}. Stations with `trials[i] === 0` are
- * treated as unobservable and carry `NaN` observed fields; summaries skip them.
- */
-export interface LeaveOneOutSpaceTimeBinomialOptions {
-  lats: NumericArrayInput;
-  lons: NumericArrayInput;
-  times: NumericArrayInput;
-  successes: IntegerArrayInput;
-  trials: IntegerArrayInput;
-  variogram: SpaceTimeVariogramParams;
-  /** Optional Beta(alpha, beta) prior; defaults to Beta(1, 1) when omitted. */
-  prior?: BinomialPriorParams;
-}
-
-/** Options for {@link kFoldSpaceTimeBinomial}. */
-export interface KFoldSpaceTimeBinomialOptions extends LeaveOneOutSpaceTimeBinomialOptions {
-  /** Number of folds, must satisfy `2 ≤ k ≤ n`. */
-  k: number;
-}
-
-/**
- * Options for {@link conditionalSimulateSpaceTime}. Space-time SGS returns one sample per
- * target in input order; deterministic for a given `seed`.
- */
-export interface ConditionalSimulateSpaceTimeOptions {
-  conditioningLats: NumericArrayInput;
-  conditioningLons: NumericArrayInput;
-  conditioningTimes: NumericArrayInput;
-  conditioningValues: NumericArrayInput;
-  targetLats: NumericArrayInput;
-  targetLons: NumericArrayInput;
-  targetTimes: NumericArrayInput;
-  variogram: SpaceTimeVariogramParams;
-  /** RNG seed for reproducibility (defaults to `0n`). */
-  seed?: number | bigint;
-  /** Optional permutation of `0..nTargets` giving the visit order. */
-  targetOrder?: ArrayLike<number> | Uint32Array;
-}
-
-/**
- * Options for {@link conditionalSimulateManySpaceTime}. Mirrors
- * {@link ConditionalSimulateManyOptions} for the space-time ordinary variant.
- */
-export interface ConditionalSimulateManySpaceTimeOptions
-  extends Omit<ConditionalSimulateSpaceTimeOptions, "seed"> {
-  /** Number of independent realizations to draw (must be >= 1). */
-  nRealizations: number;
-  /** Seed for the first realization. Successive realizations use `baseSeed + k`. */
-  baseSeed?: number | bigint;
-}
-
-/** Options for {@link conditionalSimulateSpaceTimeSimple}. */
-export interface ConditionalSimulateSpaceTimeSimpleOptions extends ConditionalSimulateSpaceTimeOptions {
-  /** Known constant mean used by simple ST kriging inside the simulation loop. */
-  mean: number;
-}
-
-/** Options for {@link conditionalSimulateSpaceTimeUniversal}. */
-export interface ConditionalSimulateSpaceTimeUniversalOptions extends ConditionalSimulateSpaceTimeOptions {
-  /** Polynomial drift basis for universal ST kriging. */
-  trend: SpaceTimeUniversalTrend;
-}
-
-/**
- * Options for {@link conditionalSimulateSpaceTimeBinomial}. Simulation happens on the logit
- * scale; results are returned on both logit and prevalence scales.
- */
-export interface ConditionalSimulateSpaceTimeBinomialOptions {
-  conditioningLats: NumericArrayInput;
-  conditioningLons: NumericArrayInput;
-  conditioningTimes: NumericArrayInput;
-  successes: IntegerArrayInput;
-  trials: IntegerArrayInput;
-  targetLats: NumericArrayInput;
-  targetLons: NumericArrayInput;
-  targetTimes: NumericArrayInput;
-  variogram: SpaceTimeVariogramParams;
-  /** Optional Beta(alpha, beta) prior; defaults to Beta(1, 1) when omitted. */
-  prior?: BinomialPriorParams;
-  /** RNG seed for reproducibility (defaults to `0n`). */
-  seed?: number | bigint;
-  /** Optional permutation of `0..nTargets` giving the visit order. */
-  targetOrder?: ArrayLike<number> | Uint32Array;
 }

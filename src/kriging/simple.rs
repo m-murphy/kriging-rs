@@ -14,46 +14,21 @@
 //! Use simple kriging when you have an independently estimated mean (e.g. from a calibration
 //! dataset) and want slightly lower variance than ordinary kriging buys you.
 
-use std::sync::Arc;
-
-use nalgebra::{DMatrix, DVector, Dyn, linalg::LU};
-#[cfg(not(target_arch = "wasm32"))]
-use rayon::prelude::*;
-
 use crate::Real;
-use crate::distance::{GeoCoord, PreparedGeoCoord, haversine_distance_prepared, prepare_geo_coord};
+use crate::distance::GeoCoord;
 use crate::error::KrigingError;
 use crate::geo_dataset::GeoDataset;
-use crate::kriging::ordinary::{Prediction, kriging_diagonal_jitter};
+use crate::kriging::conditioner::KrigingConditioner;
+use crate::kriging::ordinary::Prediction;
+use crate::kriging::pairwise::SpatialPairwiseCovariance;
+use crate::kriging::simple_engine::SimpleKrigingEngine;
+use crate::spacetime::metric::GeoMetric;
 use crate::variogram::models::VariogramModel;
 
 /// Fitted simple kriging model.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SimpleKrigingModel {
-    coords: Vec<GeoCoord>,
-    prepared_coords: Vec<PreparedGeoCoord>,
-    residuals: Vec<Real>,
-    mean: Real,
-    variogram: VariogramModel,
-    cov_at_zero: Real,
-    system: DMatrix<Real>,
-    /// Shared LU factorization; `Clone` just bumps the `Arc`.
-    system_lu: Arc<LU<Real, Dyn, Dyn>>,
-}
-
-impl Clone for SimpleKrigingModel {
-    fn clone(&self) -> Self {
-        Self {
-            coords: self.coords.clone(),
-            prepared_coords: self.prepared_coords.clone(),
-            residuals: self.residuals.clone(),
-            mean: self.mean,
-            variogram: self.variogram,
-            cov_at_zero: self.cov_at_zero,
-            system: self.system.clone(),
-            system_lu: Arc::clone(&self.system_lu),
-        }
-    }
+    engine: SimpleKrigingEngine<SpatialPairwiseCovariance<GeoMetric>>,
 }
 
 impl SimpleKrigingModel {
@@ -64,114 +39,48 @@ impl SimpleKrigingModel {
         mean: Real,
     ) -> Result<Self, KrigingError> {
         let (coords, values) = dataset.into_parts();
-        let prepared_coords = coords
-            .iter()
-            .copied()
-            .map(prepare_geo_coord)
-            .collect::<Vec<_>>();
-        let residuals: Vec<Real> = values.iter().map(|v| *v - mean).collect();
-
-        let system = build_simple_system(&prepared_coords, variogram);
-        let system_lu = Arc::new(system.clone().lu());
-        // Probe solvability up front.
-        let probe = DVector::from_element(coords.len(), 1.0);
-        if system_lu.solve(&probe).is_none() {
-            return Err(KrigingError::MatrixError(
-                "could not factorize simple kriging system".to_string(),
-            ));
-        }
-        Ok(Self {
+        let engine = SimpleKrigingEngine::fit(
+            SpatialPairwiseCovariance::new(GeoMetric, variogram),
             coords,
-            prepared_coords,
-            residuals,
+            values,
             mean,
-            variogram,
-            cov_at_zero: variogram.covariance(0.0),
-            system,
-            system_lu,
-        })
+        )?;
+        Ok(Self { engine })
     }
 
     /// The known mean used by the model.
     pub fn mean(&self) -> Real {
-        self.mean
+        self.engine.mean()
+    }
+
+    pub fn coords(&self) -> &[GeoCoord] {
+        self.engine.coords()
+    }
+
+    pub fn values(&self) -> Vec<Real> {
+        self.engine.observed_values()
+    }
+
+    pub fn variogram(&self) -> VariogramModel {
+        self.engine.pairwise_covariance().variogram()
+    }
+
+    /// Consume this fitted model as live state for sequential Gaussian simulation.
+    pub fn into_conditioner(self) -> Result<KrigingConditioner<GeoCoord>, KrigingError> {
+        Ok(KrigingConditioner::from_simple(self.engine))
     }
 
     /// Predict at a single target.
     pub fn predict(&self, coord: GeoCoord) -> Result<Prediction, KrigingError> {
-        let mut rhs = DVector::from_element(self.coords.len(), 0.0);
-        self.predict_with_rhs(coord, &mut rhs)
+        self.engine
+            .predict(&[coord])
+            .map(|mut v| v.pop().expect("single prediction"))
     }
 
     /// Batch predictions; parallel on native builds.
     pub fn predict_batch(&self, coords: &[GeoCoord]) -> Result<Vec<Prediction>, KrigingError> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let n = self.coords.len();
-            coords
-                .par_iter()
-                .map_init(
-                    || DVector::<Real>::from_element(n, 0.0),
-                    |rhs, c| self.predict_with_rhs(*c, rhs),
-                )
-                .collect()
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            let mut rhs = DVector::from_element(self.coords.len(), 0.0);
-            let mut out = Vec::with_capacity(coords.len());
-            for &c in coords {
-                out.push(self.predict_with_rhs(c, &mut rhs)?);
-            }
-            Ok(out)
-        }
+        self.engine.predict(coords)
     }
-
-    fn predict_with_rhs(
-        &self,
-        coord: GeoCoord,
-        rhs: &mut DVector<Real>,
-    ) -> Result<Prediction, KrigingError> {
-        let n = self.coords.len();
-        let prepared = prepare_geo_coord(coord);
-        for i in 0..n {
-            rhs[i] = self.variogram.covariance(haversine_distance_prepared(
-                self.prepared_coords[i],
-                prepared,
-            ));
-        }
-        let w = self.system_lu.solve(rhs).ok_or_else(|| {
-            KrigingError::MatrixError("could not solve simple kriging system".to_string())
-        })?;
-        let mut residual_pred: Real = 0.0;
-        let mut cov_dot: Real = 0.0;
-        for i in 0..n {
-            residual_pred += w[i] * self.residuals[i];
-            cov_dot += w[i] * rhs[i];
-        }
-        let variance = (self.cov_at_zero - cov_dot).max(0.0);
-        Ok(Prediction {
-            value: self.mean + residual_pred,
-            variance,
-        })
-    }
-}
-
-fn build_simple_system(coords: &[PreparedGeoCoord], variogram: VariogramModel) -> DMatrix<Real> {
-    let n = coords.len();
-    let diag_eps = kriging_diagonal_jitter(n, variogram);
-    let mut m = DMatrix::from_element(n, n, 0.0);
-    for i in 0..n {
-        for j in i..n {
-            let mut cov = variogram.covariance(haversine_distance_prepared(coords[i], coords[j]));
-            if i == j {
-                cov += diag_eps;
-            }
-            m[(i, j)] = cov;
-            m[(j, i)] = cov;
-        }
-    }
-    m
 }
 
 #[cfg(test)]
@@ -207,8 +116,6 @@ mod tests {
         let variogram = VariogramModel::new(0.01, 1.0, 5.0, VariogramType::Exponential).unwrap();
         let dataset = GeoDataset::new(coords, values).unwrap();
         let model = SimpleKrigingModel::new(dataset, variogram, mean).expect("model");
-        // Target far from all stations (many range units away) has near-zero
-        // covariance with the data, so weights ~ 0 and the prediction reverts to the mean.
         let pred = model
             .predict(GeoCoord::try_new(50.0, 50.0).unwrap())
             .expect("prediction");

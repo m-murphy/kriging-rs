@@ -13,16 +13,19 @@ import {
   requireNumber,
   requireVariogramType,
   toFloat64Array,
+  toUint32Array,
 } from "./internal/convert.js";
 import { mapEmpiricalVariogram } from "./internal/mappers.js";
 import {
   requireLoadedModule,
   variogramTypeToNumber,
 } from "./internal/module.js";
+import { resolveBinomialPriorInput } from "./internal/prior.js";
 import type {
   ComputeDirectionalEmpiricalVariogramOptions,
   ComputeEmpiricalVariogramOptions,
   EmpiricalVariogramResult,
+  FitBinomialVariogramOptions,
   FitVariogramOptions,
   FittedVariogram,
   NestedVariogramComponent,
@@ -69,6 +72,67 @@ export function fitVariogram(options: FitVariogramOptions): FittedVariogram {
       nBins,
       variogramTypeNum,
       estimator
+    );
+  } catch (e) {
+    throw wrapThrown(e);
+  }
+  const result = asRecord(out);
+  const fitted: FittedVariogram = {
+    variogramType: requireVariogramType(result.variogramType),
+    nugget: requireNumber(result.nugget),
+    sill: requireNumber(result.sill),
+    range: requireNumber(result.range),
+    residuals: requireNumber(result.residuals),
+  };
+  if (
+    result.shape !== undefined &&
+    typeof result.shape === "number" &&
+    Number.isFinite(result.shape)
+  ) {
+    fitted.shape = result.shape;
+  }
+  return fitted;
+}
+
+/**
+ * Fit a variogram model to binomial count data using the noise-calibrated empirical
+ * variogram on EB-smoothed logits (same path as {@link BinomialKriging}). Only the
+ * classical empirical estimator is supported.
+ *
+ * @param options - Sample coordinates, successes, trials, variogram type, and optional binning / prior / ε
+ */
+export function fitBinomialVariogram(
+  options: FitBinomialVariogramOptions
+): FittedVariogram {
+  const {
+    sampleLats,
+    sampleLons,
+    successes,
+    trials,
+    variogramType,
+    maxDistance,
+    nBins = 12,
+    estimator,
+    prior,
+    relWeightEps,
+  } = options;
+  const mod = requireLoadedModule();
+  const variogramTypeNum = variogramTypeToNumber(variogramType);
+  const priorResolved = resolveBinomialPriorInput(prior, { successes, trials });
+  let out: unknown;
+  try {
+    out = mod.fitBinomialVariogram(
+      toFloat64Array(sampleLats),
+      toFloat64Array(sampleLons),
+      toUint32Array(successes),
+      toUint32Array(trials),
+      maxDistance,
+      nBins,
+      variogramTypeNum,
+      estimator,
+      priorResolved?.alpha,
+      priorResolved?.beta,
+      relWeightEps
     );
   } catch (e) {
     throw wrapThrown(e);

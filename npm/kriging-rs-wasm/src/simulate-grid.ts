@@ -28,8 +28,8 @@
 
 import { KrigingError } from "./errors.js";
 import {
-  conditionalSimulateBinomial,
-  conditionalSimulateManyBinomial,
+  conditionalSimulate,
+  conditionalSimulateMany,
 } from "./simulation.js";
 import type {
   BinomialGridEnsemble,
@@ -146,17 +146,19 @@ export function simulateBinomialGrid(
 ): BinomialGridSimulation {
   const { xCells, yCells } = validateBounds(options);
   const { lats: targetLats, lons: targetLons } = gridCellCenters(options);
-  const result = conditionalSimulateBinomial({
+  const result = conditionalSimulate({
+    geometry: "geo",
+    family: "binomial",
     conditioningLats: options.lats,
     conditioningLons: options.lons,
-    successes: options.successes,
-    trials: options.trials,
+    conditioningSuccesses: options.successes,
+    conditioningTrials: options.trials,
     targetLats,
     targetLons,
     variogram: options.variogram,
     prior: options.prior,
     seed: options.seed,
-  });
+  }) as import("./types.js").BinomialSimulationResult;
   return {
     logitSamples: reshapeGridRow(result.logitSamples, xCells, yCells),
     prevalences: reshapeGridRow(result.prevalenceSamples, xCells, yCells),
@@ -178,18 +180,20 @@ export function simulateBinomialGridEnsemble(
 ): BinomialGridEnsemble {
   const { xCells, yCells } = validateBounds(options);
   const { lats: targetLats, lons: targetLons } = gridCellCenters(options);
-  const result = conditionalSimulateManyBinomial({
+  const result = conditionalSimulateMany({
+    geometry: "geo",
+    family: "binomial",
     conditioningLats: options.lats,
     conditioningLons: options.lons,
-    successes: options.successes,
-    trials: options.trials,
+    conditioningSuccesses: options.successes,
+    conditioningTrials: options.trials,
     targetLats,
     targetLons,
     variogram: options.variogram,
     prior: options.prior,
     nRealizations: options.nRealizations,
     baseSeed: options.baseSeed,
-  });
+  }) as import("./types.js").BinomialSimulationManyResult;
   return {
     west: options.west,
     south: options.south,

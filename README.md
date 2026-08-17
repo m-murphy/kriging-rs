@@ -31,6 +31,21 @@ let prediction = model.predict(GeoCoord::try_new(0.3, 0.3)?)?;
 println!("{:?}", prediction.value);
 ```
 
+### Rust SGS migration (0.5)
+
+The simulator traits and model-specific `*Simulator` structs are replaced by a fitted-model
+conditioner. Consume the fitted model, then pass the conditioner to the simulation harness:
+
+```rust
+use kriging_rs::simulation::{SimulationOptions, sequential_gaussian_simulate};
+
+let simulation = sequential_gaussian_simulate(
+    model.into_conditioner()?,
+    &targets,
+    SimulationOptions::new(seed),
+)?;
+```
+
 ## Features
 
 - Ordinary, simple, universal, and binomial kriging for 2-D spatial interpolation
@@ -52,7 +67,7 @@ println!("{:?}", prediction.value);
   working values → **ordinary kriging with per-site logit observation variance** (calibrated
   binomial) on the covariance diagonal, then `logistic` to prevalence; *not* a full
   binomial-likelihood field model. Build diagnostics are always returned on the Rust side
-  ([`BinomialBuildNotes`]) and exposed in WASM as `getBuildNotes()`. See
+  ([`BinomialBuildNotes`]) and exposed in WASM as the `buildNotes` getter. See
   [benches/BROWSER_BENCHMARKS.md](benches/BROWSER_BENCHMARKS.md) for a large
   browser-representative prediction workload
 

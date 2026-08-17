@@ -34,20 +34,17 @@ const pred = model.predict(37.705, -122.435);
 | `SimpleKriging` | Ordinary kriging's fixed-mean analogue; requires a known `mean`. |
 | `UniversalKriging` | Kriging with a polynomial drift basis (`"constant"` / `"linear"` / `"quadratic"` in lat/lon). |
 | `ProjectedKriging` | Planar kriging on `(x, y)` coordinates with 2D anisotropy (`majorAngleDeg`, `rangeRatio`). |
-| `BinomialKriging` | **Prevalence/proportion** surfaces from count data (successes out of trials). Also `fromPrecomputedLogits` to bypass empirical-Bayes shrinkage. |
-| `fitVariogram` | Fit a variogram model to sample data; optional `estimator: "classical" \| "cressie-hawkins"`. Use the result to build an `OrdinaryKriging` model. |
+| `BinomialKriging` | **Prevalence/proportion** surfaces from count data (successes out of trials) on global lat/lon (Haversine). Also `fromPrecomputedLogits` to bypass empirical-Bayes shrinkage. |
+| `BinomialProjectedKriging` | Binomial prevalence on planar `(x, y)` with 2-D anisotropy — use when coordinates are already projected. |
+| `BinomialTangentPlaneKriging` | **Advanced:** binomial on a local tangent plane from lat/lon (small regions only). Prefer `BinomialKriging` or `BinomialProjectedKriging` first. |
+| `fitVariogram` | Fit a variogram model to continuous sample data; optional `estimator: "classical" \| "cressie-hawkins"`. Use the result to build an `OrdinaryKriging` model. |
+| `fitBinomialVariogram` | Fit a variogram on EB-smoothed logits from count data (classical estimator only). Use with `BinomialKriging.fromFittedVariogram` / `fromFittedVariogramWithPrior`. |
 | `computeEmpiricalVariogram` | Compute the (isotropic) empirical variogram cloud directly, without fitting a parametric model. |
 | `computeDirectionalEmpiricalVariogram` | Directional empirical variogram on planar `(x, y)` data for diagnosing anisotropy. |
-| `leaveOneOut` / `kFold` | Cross-validation on ordinary kriging. |
-| `leaveOneOutSimple` / `kFoldSimple` | Cross-validation on simple kriging (known, constant mean). |
-| `leaveOneOutUniversal` / `kFoldUniversal` | Cross-validation on universal kriging with a constant / linear / quadratic drift; drift refit per fold. |
-| `leaveOneOutProjected` / `kFoldProjected` | Cross-validation on projected (planar) kriging with optional 2-D anisotropy. |
-| `leaveOneOutBinomial` / `kFoldBinomial` | Cross-validation on binomial kriging; reports residuals on **both** the logit and prevalence scales. |
-| `conditionalSimulate` | Sequential Gaussian simulation (ordinary kriging); deterministic for a given `seed`. |
-| `conditionalSimulateSimple` | SGS with simple kriging (known `mean`). |
-| `conditionalSimulateUniversal` | SGS with universal kriging (polynomial drift refit per step). |
-| `conditionalSimulateProjected` | SGS on planar `(x, y)` coordinates with optional 2-D anisotropy. |
-| `conditionalSimulateBinomial` | SGS for count data on the logit scale; returns samples on **both** the logit and prevalence scales. |
+| `cv` | Unified cross-validation keyed by `geometry` + `family`; omit `k` for leave-one-out. |
+| `leaveOneOut` / `kFold` | Convenience wrappers around `cv` (default: geo + ordinary). |
+| `simulate` | Unified sequential Gaussian simulation keyed by `geometry` + `family`. |
+| `conditionalSimulate` / `conditionalSimulateMany` | Convenience wrappers around `simulate` (default: geo + ordinary). |
 | `evaluateNestedVariogram` | Evaluate a nested (additive) variogram at given distances for offline inspection/plotting. |
 | `interpolateOrdinaryToGrid` | One-shot: fit + build + predict on grid + free; returns value and variance grids. |
 | `interpolateBinomialToGrid` | One-shot: fit + build + predict on grid + free; returns prevalence and variance grids. |
@@ -62,14 +59,8 @@ const pred = model.predict(37.705, -122.435);
 | `SpaceTimeProjectedOrdinaryKriging` | ST ordinary kriging on projected `(x, y, time)` with 2-D anisotropy. |
 | `computeEmpiricalSpaceTimeVariogram` | 2-D empirical space-time variogram (spatial × temporal bins). |
 | `fitSpaceTimeVariogram` | Fit a separable or product-sum ST variogram against the empirical surface. |
-| `leaveOneOutSpaceTime` / `kFoldSpaceTime` | Cross-validation on ST ordinary kriging. |
-| `leaveOneOutSpaceTimeSimple` / `kFoldSpaceTimeSimple` | Cross-validation on ST simple kriging (known `mean`). |
-| `leaveOneOutSpaceTimeUniversal` / `kFoldSpaceTimeUniversal` | Cross-validation on ST universal kriging; trend refit per fold. |
-| `leaveOneOutSpaceTimeBinomial` / `kFoldSpaceTimeBinomial` | Cross-validation on ST binomial kriging; dual-scale residuals. |
-| `conditionalSimulateSpaceTime` | Sequential Gaussian simulation for ST ordinary kriging; deterministic for a given `seed`. |
-| `conditionalSimulateSpaceTimeSimple` | ST SGS with simple kriging (known `mean`). |
-| `conditionalSimulateSpaceTimeUniversal` | ST SGS with universal kriging (polynomial trend refit per step). |
-| `conditionalSimulateSpaceTimeBinomial` | ST SGS for count data on the logit scale; returns both logit and prevalence samples. |
+| `cv` / `leaveOneOut` / `kFold` | Spacetime cross-validation — pass `geometry: "spacetime"`, `family`, `times`, and `spaceTimeVariogram`. |
+| `simulate` / `conditionalSimulate` / `conditionalSimulateMany` | Spacetime SGS — same `geometry` / `family` keys; binomial uses `conditioningSuccesses` / `conditioningTrials`. |
 
 **When to use which:** Use **ordinary kriging** when you have continuous measurements at locations (e.g. sensor values, elevations). Use **binomial kriging** when you have counts (successes and trials) and want to estimate a proportion or prevalence surface.
 
@@ -168,8 +159,8 @@ const batch = fittedModel.predictBatch(lats, lons);
 **Convenience factories (fit → model):** To avoid manually spreading `fitted` fields, use the static factories:
 
 - **Ordinary:** `OrdinaryKriging.fromFitted({ lats, lons, values, fittedVariogram: fitted })`. Optional `nuggetOverride` overrides the fitted nugget (e.g. for a UI-tuned sigma²).
-- **Binomial:** `BinomialKriging.fromFittedVariogram({ lats, lons, successes, trials, fittedVariogram })`. Optional `nuggetOverride` overrides the fitted nugget.
-- **Binomial with prior:** `BinomialKriging.fromFittedVariogramWithPrior({ lats, lons, successes, trials, fittedVariogram, prior: { alpha, beta } })`. Optional `nuggetOverride` overrides the fitted nugget.
+- **Binomial:** `BinomialKriging.fromFittedVariogram({ lats, lons, successes, trials, fittedVariogram })`. Fit counts with `fitBinomialVariogram` so the empirical variogram matches the binomial kriger’s calibrated logit path; then pass that `FittedVariogram` here.
+- **Binomial with prior:** `BinomialKriging.fromFittedVariogramWithPrior({ lats, lons, successes, trials, fittedVariogram, prior: { alpha, beta } })`. Use the same `prior` in `fitBinomialVariogram` as in the model when fitting externally.
 
 Example:
 
@@ -207,7 +198,8 @@ const model = new BinomialKriging({
   variogram: { variogramType: "exponential", nugget: 0.01, sill: 1.0, range: 100 },
 });
 const pred = model.predict(37.705, -122.435);
-// pred.prevalence in [0, 1], pred.variance, pred.logitValue
+// pred.prevalenceMedian / pred.prevalenceMean in (0, 1);
+// pred.logit, pred.logitVariance, pred.prevalenceVariance
 ```
 
 With a Beta prior (e.g. when counts are small):
@@ -223,11 +215,20 @@ const model = BinomialKriging.newWithPrior({
 });
 ```
 
+#### Choosing binomial geometry
+
+| Class | When |
+| --- | --- |
+| `BinomialKriging` | Default for lat/lon inputs anywhere on the globe (Haversine km). |
+| `BinomialProjectedKriging` | Coordinates are already in a planar frame (meters, grid cells) and you need 2-D anisotropy. |
+| `BinomialTangentPlaneKriging` | **Advanced:** small regional windows where equirectangular km + anisotropy beats Haversine, but you still want to pass lat/lon. |
+
 **Model contract (Rust / wasm consumers):** The default `BinomialKriging` path is
 empirical-Bayes–smoothed logit + **ordinary kriging with per-site logit observation
-variance** (calibrated default) + `logistic`, not a full binomial-likelihood field
-model. `getBuildNotes()` returns `BinomialBuildNotes` (version, prior, logit
-inflation, etc.); rows with `trials === 0` are dropped. See
+variance** (Laplace / Fisher on the smoothed proportion by default) + predictive
+prevalence summaries, not a full binomial-likelihood field model. The `buildNotes`
+getter returns `BinomialBuildNotes` (calibration version, prior, logit inflation,
+`warnings[]`, etc.); rows with `trials === 0` are dropped. See
 `benches/BROWSER_BENCHMARKS.md` in the repository for large-grid prediction
 benchmarks.
 
@@ -240,7 +241,7 @@ const { values, variances } = model.predictBatchArrays(gridLats, gridLons);
 // values.length === gridLats.length; same for variances
 ```
 
-For ordinary kriging the result is `{ values, variances }`; for binomial it is `{ prevalences, logitValues, variances }`.
+For ordinary kriging the result is `{ values, variances }`; for binomial it is `{ prevalenceMedians, prevalenceMeans, logitValues, logitVariances, prevalenceVariances }`.
 
 ### Grid prediction (bounds + resolution)
 
@@ -257,7 +258,7 @@ const { values, variances } = model.predictGrid({
 });
 ```
 
-**Grid layout:** Results are 2D arrays (not flat). Row index = latitude index, column index = longitude index. First row (`j = 0`) = south, last row = north; first column (`i = 0`) = west, last column = east. So `values[j][i]` is the prediction at the cell with latitude row `j` and longitude column `i`. Internally the library uses row-major order (south to north, then west to east within each row). Ordinary kriging returns `{ values, variances }`; binomial returns `{ prevalences, logitValues, variances }`, all with shape `[yCells][xCells]`.
+**Grid layout:** Results are 2D arrays (not flat). Row index = latitude index, column index = longitude index. First row (`j = 0`) = south, last row = north; first column (`i = 0`) = west, last column = east. So `values[j][i]` is the prediction at the cell with latitude row `j` and longitude column `i`. Internally the library uses row-major order (south to north, then west to east within each row). Ordinary kriging returns `{ values, variances }`; binomial returns `{ prevalenceMedians, prevalenceMeans, logitValues, logitVariances, prevalenceVariances }`, all with shape `[yCells][xCells]`.
 
 ### Search neighborhoods (ordinary kriging)
 
@@ -369,37 +370,40 @@ The same `estimator` option is accepted by `fitVariogram({ ..., estimator: "cres
 
 Diagnose predictive skill and variogram calibration via leave-one-out or K-fold CV. Per-station residuals include observed/predicted values and kriging variance; the summary reports `n`, `meanError`, `rmse`, and `msdr` (mean squared deviation ratio; ≈ 1 when the variogram is well calibrated). Folds are deterministic round-robin (station `i` → fold `i % k`); shuffle inputs for randomized folds.
 
-Every kriging variant ships a CV entry point:
+#### Model CV vs stateless `cv`
+
+Two equivalent paths exist; pick based on whether you already hold a fitted model:
+
+| Situation | Use |
+| --- | --- |
+| Comparing variogram settings, validating before building a model, or avoiding WASM state | `cv()` / `leaveOneOut()` / `kFold()` with raw arrays |
+| You already built a model for prediction and want diagnostics on **that** fit | `model.leaveOneOut()` / `model.kFold(k)` on the handle |
+
+Stateless CV refits a fresh model on each fold from the arrays you pass in. Model CV runs on the training stations and variogram already stored in the handle. Result shapes are the same.
+
+Every kriging variant is selected with `geometry` and `family` on `cv()` (or the
+`leaveOneOut` / `kFold` convenience wrappers, which default to geo + ordinary):
 
 ```ts
-import {
-  leaveOneOut,
-  kFold,
-  leaveOneOutSimple,
-  kFoldSimple,
-  leaveOneOutUniversal,
-  kFoldUniversal,
-  leaveOneOutProjected,
-  kFoldProjected,
-  leaveOneOutBinomial,
-  kFoldBinomial,
-} from "kriging-rs-wasm";
+import { cv, leaveOneOut, kFold } from "kriging-rs-wasm";
 
-// Ordinary (no trend, unknown mean).
+// Ordinary (no trend, unknown mean) — geometry/family optional on leaveOneOut/kFold
 const ordinary = leaveOneOut({ lats, lons, values, variogram });
 const ordinaryK = kFold({ lats, lons, values, variogram, k: 10 });
 
-// Simple (known mean; held fixed across folds).
-const simple = leaveOneOutSimple({ lats, lons, values, variogram, mean: 12.5 });
+// Simple (known mean; held fixed across folds)
+const simple = cv({ geometry: "geo", family: "simple", lats, lons, values, variogram, mean: 12.5 });
 
-// Universal (polynomial drift; refit per fold, no leakage).
-const universal = leaveOneOutUniversal({
+// Universal (polynomial drift; refit per fold, no leakage)
+const universal = cv({
+  geometry: "geo", family: "universal",
   lats, lons, values, variogram,
   trend: "linear", // "constant" | "linear" | "quadratic"
 });
 
-// Projected (planar x/y; optional 2-D anisotropy).
-const projected = leaveOneOutProjected({
+// Projected (planar x/y; optional 2-D anisotropy)
+const projected = cv({
+  geometry: "projected", family: "ordinary",
   xs, ys, values, variogram,
   majorAngleDeg: 45,
   rangeRatio: 0.5, // pass 1 for isotropic
@@ -410,12 +414,13 @@ All of the above return `{ residuals, summary, arrays }` where `arrays` contains
 
 #### Binomial cross-validation (both scales)
 
-Binomial CV is special: a held-out station has a logit-scale observation (natural for MSDR and variogram calibration) **and** a prevalence-scale observation (natural for probability-scale error metrics). `leaveOneOutBinomial` / `kFoldBinomial` report both, along with a two-sided summary.
+Binomial CV is special: a held-out station has a logit-scale observation (natural for MSDR and variogram calibration) **and** a prevalence-scale observation (natural for probability-scale error metrics). Pass `family: "binomial"` to `cv()` / `leaveOneOut` / `kFold`; both scales are reported along with a two-sided summary.
 
 ```ts
-const binomial = leaveOneOutBinomial({
+const binomial = cv({
+  geometry: "geo", family: "binomial",
   lats, lons, successes, trials, variogram,
-  // priorAlpha, priorBeta — optional; must appear together, defaults to Beta(1, 1).
+  // prior: { alpha, beta } | "auto" — optional; defaults to Beta(1, 1).
 });
 
 // Each residual carries both scales:
@@ -440,26 +445,21 @@ Stations with `trials[i] === 0` are unobservable: they contribute no training fo
 
 ### Conditional simulation (Sequential Gaussian Simulation)
 
-Generate realizations of the spatial process conditioned on observed stations. Deterministic for a given `seed`; pass a different seed for each realization. One helper per kriging variant, mirroring the cross-validation surface:
+Generate realizations of the spatial process conditioned on observed stations. Deterministic for a given `seed`; pass a different seed for each realization. Select the kriging variant with `geometry` and `family` on `simulate()` (or the `conditionalSimulate` / `conditionalSimulateMany` wrappers, which default to geo + ordinary):
 
-| Helper | When to use |
+| `family` | When to use |
 | --- | --- |
-| `conditionalSimulate` | Ordinary kriging — unknown mean, no trend. |
-| `conditionalSimulateSimple` | You have an externally known **mean** (climatology, pooled historical average). |
-| `conditionalSimulateUniversal` | The process has a known polynomial drift (`"constant"`, `"linear"`, `"quadratic"`). |
-| `conditionalSimulateProjected` | Data is on planar `(x, y)` coordinates; optional 2-D geometric anisotropy. |
-| `conditionalSimulateBinomial` | Count data (`successes`, `trials`). Simulation happens on the logit scale; result is reported on **both** scales. |
+| `"ordinary"` | Unknown mean, no trend. |
+| `"simple"` | Externally known **mean** (climatology, pooled historical average). |
+| `"universal"` | Known polynomial drift (`"constant"`, `"linear"`, `"quadratic"`). |
+| `"binomial"` | Count data; use `conditioningSuccesses` / `conditioningTrials`. Simulation on the logit scale; result on **both** scales. |
+
+For projected geometry pass `geometry: "projected"` with `conditioningXs` / `conditioningYs` and optional `majorAngleDeg` / `rangeRatio`.
 
 ```ts
-import {
-  conditionalSimulate,
-  conditionalSimulateSimple,
-  conditionalSimulateUniversal,
-  conditionalSimulateProjected,
-  conditionalSimulateBinomial,
-} from "kriging-rs-wasm";
+import { simulate, conditionalSimulate } from "kriging-rs-wasm";
 
-// Ordinary (no trend)
+// Ordinary (no trend) — geometry/family optional on conditionalSimulate
 const sample = conditionalSimulate({
   conditioningLats: lats,
   conditioningLons: lons,
@@ -473,33 +473,37 @@ const sample = conditionalSimulate({
 // sample: Float64Array, length === targetLats.length
 
 // Simple (known mean)
-const simple = conditionalSimulateSimple({
+const simple = simulate({
+  geometry: "geo", family: "simple",
   conditioningLats: lats, conditioningLons: lons, conditioningValues: values,
   targetLats: gridLats, targetLons: gridLons,
   variogram, mean: 11.5, seed: 7,
 });
 
 // Universal (polynomial drift refit at each step)
-const uni = conditionalSimulateUniversal({
+const uni = simulate({
+  geometry: "geo", family: "universal",
   conditioningLats: lats, conditioningLons: lons, conditioningValues: values,
   targetLats: gridLats, targetLons: gridLons,
   variogram, trend: "linear", seed: 7,
 });
 
 // Projected (planar, optional anisotropy)
-const proj = conditionalSimulateProjected({
+const proj = simulate({
+  geometry: "projected", family: "ordinary",
   conditioningXs: xs, conditioningYs: ys, conditioningValues: values,
   targetXs: gridXs, targetYs: gridYs,
   variogram, majorAngleDeg: 30, rangeRatio: 0.5, seed: 7,
 });
 
 // Binomial (dual-scale output)
-const bin = conditionalSimulateBinomial({
+const bin = simulate({
+  geometry: "geo", family: "binomial",
   conditioningLats: lats, conditioningLons: lons,
-  successes, trials,
+  conditioningSuccesses: successes, conditioningTrials: trials,
   targetLats: gridLats, targetLons: gridLons,
   variogram, seed: 7,
-  // priorAlpha: 0.5, priorBeta: 0.5   // optional Jeffreys; default Beta(1, 1)
+  // prior: { alpha: 0.5, beta: 0.5 }   // optional Jeffreys; default Beta(1, 1)
 });
 bin.logitSamples;      // Float64Array — simulated logit values (unbounded)
 bin.prevalenceSamples; // Float64Array — logistic(logitSamples), in (0, 1)
@@ -541,12 +545,20 @@ const { values, variances } = interpolateOrdinaryToGrid({
 });
 
 // Binomial: count data + grid spec + variogram type; optional prior
-const { prevalences, variances } = interpolateBinomialToGrid({
+const {
+  prevalenceMedians,
+  prevalenceMeans,
+  logitValues,
+  logitVariances,
+  prevalenceVariances,
+} = interpolateBinomialToGrid({
   lats, lons, successes, trials,
   west: -122.5, south: 37.6, east: -122.3, north: 37.8,
   xCells: 50, yCells: 40,
   variogramType: "exponential",
+  nBins: 12,
   prior: { alpha: 1, beta: 1 },  // optional
+  relWeightEps: 1e-12,  // optional; calibrated pair-weight ε
 });
 ```
 
@@ -658,45 +670,38 @@ Universal space-time kriging adds a polynomial trend via `trend`: one of `"const
 `"quadraticInSpaceAndTime"`. Binomial space-time kriging takes `successes`/`trials`
 arrays in addition to `lats`/`lons`/`times` and reports prevalence on `[0, 1]`.
 
-Space-time cross-validation mirrors the 2-D surface — `leaveOneOutSpaceTime` / `kFoldSpaceTime`
-for ordinary, plus `_simple`, `_universal`, and `_binomial` variants (the last returns dual-scale
-logit+prevalence residuals):
+Space-time cross-validation uses `cv()` with `geometry: "spacetime"` and the appropriate
+`family` (`"ordinary"`, `"simple"`, `"universal"`, or `"binomial"`). Pass `spaceTimeVariogram`
+(not `variogram`):
 
 ```ts
-import { leaveOneOutSpaceTime, kFoldSpaceTimeBinomial } from "kriging-rs-wasm";
+import { cv, leaveOneOut } from "kriging-rs-wasm";
 
-const cv = leaveOneOutSpaceTime({
-  lats,
-  lons,
-  times,
-  values,
-  variogram: { family: "separable", spatial, temporal },
+const stVariogram = { family: "separable", spatial, temporal };
+
+const cvOrd = leaveOneOut({
+  geometry: "spacetime", family: "ordinary",
+  lats, lons, times, values, spaceTimeVariogram: stVariogram,
 });
-console.log(cv.summary.rmse, cv.summary.msdr);
+console.log(cvOrd.summary.rmse, cvOrd.summary.msdr);
 
-const bin = kFoldSpaceTimeBinomial({
-  lats,
-  lons,
-  times,
-  successes,
-  trials,
-  variogram: { family: "separable", spatial, temporal },
+const bin = cv({
+  geometry: "spacetime", family: "binomial",
+  lats, lons, times, successes, trials,
+  spaceTimeVariogram: stVariogram,
   k: 5,
 });
 console.log(bin.summary.logit.rmse, bin.summary.prevalence.rmse);
 ```
 
-Space-time conditional simulation (Sequential Gaussian Simulation) is also available for every
-ST variant; results are deterministic for a given `seed`. `conditionalSimulateSpaceTimeBinomial`
-samples on the logit scale and returns both logit and prevalence samples:
+Space-time conditional simulation uses `simulate()` with the same keys; results are
+deterministic for a given `seed`. Binomial simulation returns both logit and prevalence samples:
 
 ```ts
-import {
-  conditionalSimulateSpaceTime,
-  conditionalSimulateSpaceTimeBinomial,
-} from "kriging-rs-wasm";
+import { simulate } from "kriging-rs-wasm";
 
-const samples = conditionalSimulateSpaceTime({
+const samples = simulate({
+  geometry: "spacetime", family: "ordinary",
   conditioningLats: lats,
   conditioningLons: lons,
   conditioningTimes: times,
@@ -704,20 +709,21 @@ const samples = conditionalSimulateSpaceTime({
   targetLats,
   targetLons,
   targetTimes,
-  variogram: { family: "separable", spatial, temporal },
+  spaceTimeVariogram: stVariogram,
   seed: 42n,
 });
 
-const binSamples = conditionalSimulateSpaceTimeBinomial({
+const binSamples = simulate({
+  geometry: "spacetime", family: "binomial",
   conditioningLats: lats,
   conditioningLons: lons,
   conditioningTimes: times,
-  successes,
-  trials,
+  conditioningSuccesses: successes,
+  conditioningTrials: trials,
   targetLats,
   targetLons,
   targetTimes,
-  variogram: { family: "separable", spatial, temporal },
+  spaceTimeVariogram: stVariogram,
   prior: { alpha: 1, beta: 1 }, // optional; alpha and beta are set together
   seed: 42n,
 });
@@ -725,13 +731,14 @@ const binSamples = conditionalSimulateSpaceTimeBinomial({
 ```
 
 To draw multiple independent realizations in one call, use `conditionalSimulateMany`
-(2-D) or `conditionalSimulateManySpaceTime`. Each draw uses `baseSeed + k`, so the
+(or `simulate` with `nRealizations > 1`). Each draw uses `baseSeed + k`, so the
 result is deterministic and trivially reproducible:
 
 ```ts
-import { conditionalSimulateManySpaceTime } from "kriging-rs-wasm";
+import { conditionalSimulateMany } from "kriging-rs-wasm";
 
-const realizations = conditionalSimulateManySpaceTime({
+const realizations = conditionalSimulateMany({
+  geometry: "spacetime", family: "ordinary",
   conditioningLats: lats,
   conditioningLons: lons,
   conditioningTimes: times,
@@ -739,7 +746,7 @@ const realizations = conditionalSimulateManySpaceTime({
   targetLats,
   targetLons,
   targetTimes,
-  variogram: { family: "separable", spatial, temporal },
+  spaceTimeVariogram: stVariogram,
   nRealizations: 100,
   baseSeed: 42,
 });
@@ -771,10 +778,10 @@ const result = interpolateBinomialToGrid({
   xCells: 100, yCells: 100,
   variogramType: "exponential",
   prior: { alpha: 1, beta: 1 },           // optional Beta prior
-  estimator: "cressie-hawkins",            // robust empirical variogram
   withCv: { k: 5 },                        // optional 5-fold CV summary
 });
-result.prevalences;       // [yCells][xCells]
+// Variogram fit uses fitBinomialVariogram internally (classical estimator on calibrated logits).
+result.prevalenceMedians; // [yCells][xCells] predictive medians
 result.fittedVariogram;   // re-usable for simulation
 result.buildNotes;        // prior, dropped zero-trial rows, calibration version, …
 result.cv?.prevalence.rmse; // calibration on the prevalence scale
@@ -788,23 +795,22 @@ cheaper to fit once and reuse:
 ```ts
 import {
   BinomialKriging,
-  fitVariogram,
-  computeEmpiricalVariogram,
+  fitBinomialVariogram,
 } from "kriging-rs-wasm";
 
-// Empirical variogram on EB-smoothed logits is the recommended starting point;
-// fitVariogram does the smoothing internally for binomial inputs.
-const fitted = fitVariogram({
+const prior = { alpha: 1, beta: 1 };
+// fitBinomialVariogram: noise-calibrated empirical variogram on EB-smoothed logits
+// (classical estimator only; use the same prior in the model).
+const fitted = fitBinomialVariogram({
   sampleLats: lats, sampleLons: lons,
   successes, trials,
   variogramType: "exponential",
-  estimator: "cressie-hawkins",
-  prior: { alpha: 1, beta: 1 },
+  prior,
 });
 const model = BinomialKriging.fromFittedVariogramWithPrior({
   lats, lons, successes, trials,
   fittedVariogram: fitted,
-  prior: { alpha: 1, beta: 1 },
+  prior,
 });
 ```
 
@@ -815,17 +821,19 @@ underlying ordinary-kriging variance, calibratable via MSDR ≈ 1) and the
 prevalence scale (intuitive, delta-method variance):
 
 ```ts
-import { kFoldBinomial } from "kriging-rs-wasm";
+import { kFold } from "kriging-rs-wasm";
 
-const cv = kFoldBinomial({
+const cvResult = kFold({
+  geometry: "geo",
+  family: "binomial",
   lats, lons, successes, trials,
   k: 5,
   variogram: fitted,
   prior: { alpha: 1, beta: 1 },
 });
-cv.summary.logit.rmse;       // posterior calibration on the logit scale
-cv.summary.prevalence.rmse;  // and on prevalence
-cv.summary.logit.msdr;       // ≈ 1 means the variogram nugget/sill is well-tuned
+cvResult.summary.logit.rmse;       // posterior calibration on the logit scale
+cvResult.summary.prevalence.rmse;  // and on prevalence
+cvResult.summary.logit.msdr;       // ≈ 1 means the variogram nugget/sill is well-tuned
 ```
 
 ### 4. Sample an ensemble of plausible maps (SGS)
@@ -847,8 +855,8 @@ const ensemble = simulateBinomialGridEnsemble({
   nRealizations: 200,
   baseSeed: 42n,           // realization k uses seed = baseSeed + k
 });
-// ensemble.{logit,prevalence}Samples are flat row-major Float64Array
-// of length nRealizations * (xCells * yCells); ensemble.nTargets covers each.
+// ensemble.logitSamples and ensemble.prevalenceSamples are flat row-major Float64Array
+// of length nRealizations * (xCells * yCells); ensemble.nTargets === xCells * yCells.
 ```
 
 For a one-shot ensemble + per-cell reduction (mean, variance, quantiles,
@@ -910,8 +918,8 @@ use the projected variants — same workflow, planar distances, 2-D anisotropy:
 ```ts
 import {
   BinomialProjectedKriging,
-  kFoldBinomialProjected,
-  conditionalSimulateManyBinomialProjected,
+  conditionalSimulateMany,
+  kFold,
 } from "kriging-rs-wasm";
 
 const model = new BinomialProjectedKriging({
@@ -920,12 +928,27 @@ const model = new BinomialProjectedKriging({
   majorAngleDeg: 30,    // azimuth of long axis in degrees CCW from +x
   rangeRatio: 0.5,       // 1.0 = isotropic
 });
-const cv = kFoldBinomialProjected({ /* same shape; reports both scales */ });
-const ensemble = conditionalSimulateManyBinomialProjected({
-  conditioningXs: xs, conditioningYs: ys, successes, trials,
-  targetXs, targetYs,
+const cvResult = kFold({
+  geometry: "projected",
+  family: "binomial",
+  xs, ys, successes, trials,
+  k: 5,
   variogram: { variogramType: "exponential", nugget: 0.05, sill: 1, range: 1500 },
-  majorAngleDeg: 30, rangeRatio: 0.5,
+  majorAngleDeg: 30,
+  rangeRatio: 0.5,
+});
+const ensemble = conditionalSimulateMany({
+  geometry: "projected",
+  family: "binomial",
+  conditioningXs: xs,
+  conditioningYs: ys,
+  conditioningSuccesses: successes,
+  conditioningTrials: trials,
+  targetXs,
+  targetYs,
+  variogram: { variogramType: "exponential", nugget: 0.05, sill: 1, range: 1500 },
+  majorAngleDeg: 30,
+  rangeRatio: 0.5,
   nRealizations: 200,
 });
 ```
@@ -941,14 +964,19 @@ model:
 import {
   SpaceTimeBinomialKriging,
   fitSpaceTimeVariogram,
+  smoothedLogits,
   timesFromDates,
   simulateBinomialSpaceTimeGridSummaryAtDate,
 } from "kriging-rs-wasm";
 
+const prior = { alpha: 1, beta: 1 };
 const epoch = new Date(Date.UTC(2024, 0, 1));
 const times = timesFromDates(observationDates, "days", epoch);
+// No dedicated fitBinomialSpaceTimeVariogram yet — fit on EB-smoothed logits with
+// the same prior as the binomial model (or supply a hand-tuned spaceTimeVariogram).
+const logits = smoothedLogits(successes, trials, prior);
 const fit = fitSpaceTimeVariogram({
-  lats, lons, times, values: logits, // or use the binomial CV-driven workflow
+  lats, lons, times, values: logits,
   family: "separable",
   spatialModel: "exponential",
   temporalModel: "exponential",
@@ -987,6 +1015,8 @@ const summary = simulateBinomialSpaceTimeGridSummaryAtDate({
 
 - **Reuse the fitted variogram** across CV, simulation, and grids — it's the
   most expensive step.
+- **Use `fitBinomialVariogram` (not `fitVariogram`) for count data** — only the
+  classical empirical estimator is supported on the calibrated binomial path.
 - **Prefer `simulateBinomialGridEnsemble` over per-cell loops** when you need
   any aggregation (district means, exceedance maps, …); the row-major buffers
   feed straight into `ensembleMean` / `ensembleVariance` /
@@ -999,7 +1029,7 @@ const summary = simulateBinomialSpaceTimeGridSummaryAtDate({
 
 ## Error handling
 
-Constructors (`OrdinaryKriging`, `SimpleKriging`, `UniversalKriging`, `ProjectedKriging`, `BinomialKriging`, `BinomialKriging.newWithPrior`, `BinomialKriging.fromPrecomputedLogits`, the `SpaceTime*Kriging` classes), `fitVariogram`, `fitSpaceTimeVariogram`, and the top-level helpers (`computeEmpiricalVariogram`, `computeDirectionalEmpiricalVariogram`, `computeEmpiricalSpaceTimeVariogram`, `leaveOneOut`, `kFold`, `leaveOneOutSimple`, `kFoldSimple`, `leaveOneOutUniversal`, `kFoldUniversal`, `leaveOneOutProjected`, `kFoldProjected`, `leaveOneOutBinomial`, `kFoldBinomial`, `leaveOneOutSpaceTime`, `kFoldSpaceTime`, `leaveOneOutSpaceTimeSimple`, `kFoldSpaceTimeSimple`, `leaveOneOutSpaceTimeUniversal`, `kFoldSpaceTimeUniversal`, `leaveOneOutSpaceTimeBinomial`, `kFoldSpaceTimeBinomial`, `conditionalSimulate`, `conditionalSimulateSimple`, `conditionalSimulateUniversal`, `conditionalSimulateProjected`, `conditionalSimulateBinomial`, `conditionalSimulateSpaceTime`, `conditionalSimulateSpaceTimeSimple`, `conditionalSimulateSpaceTimeUniversal`, `conditionalSimulateSpaceTimeBinomial`, `evaluateNestedVariogram`) throw on invalid inputs or model build failure (e.g. singular covariance). Errors are rethrown as `KrigingError` with the underlying cause attached as `cause`. For UI-friendly messages, use the optional **`code`** property (when present), which is one of: `not_loaded`, `model_freed`, `mismatched_arrays`, `invalid_variogram`, `invalid_bins`, `singular_covariance`, `too_few_points`, `unknown_variogram`, `unknown_family`, `unknown_trend`, `unknown_estimator`, `invalid_input`, `backend_unavailable`, `internal_error`. Not every error has a code. `backend_unavailable` specifically indicates that the WASM package was built without the export in question (e.g. without the `gpu` feature), so the API can't fulfill the call in the current build.
+Constructors (`OrdinaryKriging`, `SimpleKriging`, `UniversalKriging`, `ProjectedKriging`, `BinomialKriging`, `BinomialKriging.newWithPrior`, `BinomialKriging.fromPrecomputedLogits`, the `SpaceTime*Kriging` classes), `fitVariogram`, `fitBinomialVariogram`, `fitSpaceTimeVariogram`, and the top-level helpers (`computeEmpiricalVariogram`, `computeDirectionalEmpiricalVariogram`, `computeEmpiricalSpaceTimeVariogram`, `cv`, `leaveOneOut`, `kFold`, `simulate`, `conditionalSimulate`, `conditionalSimulateMany`, `evaluateNestedVariogram`, `aggregatePrevalenceByPolygon`, `polygonCellsFromMask`, `interpolateOrdinaryToGrid`, `interpolateBinomialToGrid`) throw on invalid inputs or model build failure (e.g. singular covariance). Errors are rethrown as `KrigingError` with the underlying cause attached as `cause`. For UI-friendly messages, use the optional **`code`** property (when present), which is one of: `not_loaded`, `model_freed`, `mismatched_arrays`, `invalid_variogram`, `invalid_bins`, `singular_covariance`, `too_few_points`, `unknown_variogram`, `unknown_family`, `unknown_trend`, `unknown_estimator`, `invalid_input`, `backend_unavailable`, `internal_error`. Not every error has a code. `backend_unavailable` specifically indicates that the WASM package was built without the export in question (e.g. without the `gpu` feature), so the API can't fulfill the call in the current build.
 
 Typical causes:
 

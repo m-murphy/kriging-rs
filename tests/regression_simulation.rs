@@ -14,9 +14,10 @@ const TRAIN_POINTS: usize = 36;
 const TEST_POINTS: usize = 18;
 const ORDINARY_MAE_MAX: Real = 0.09;
 const ORDINARY_RMSE_MAX: Real = 0.14;
-// The Nelder–Mead refinement inside `fit_variogram` tightens the grid-search fit on the
-// training empirical variogram but occasionally shifts parameters just enough to inflate
-// held-out MAE by a couple percent for very small 36-point training sets. 0.08 keeps the
+// The Nelder–Mead refinement (and Matérn/Stable/Power shape hill-climb) inside `fit_variogram`
+// tightens the grid-search fit on the training empirical variogram but occasionally shifts
+// parameters just enough to inflate held-out MAE by a couple percent for very small 36-point
+// training sets. 0.08 keeps the
 // budget tight (well below the ~0.15 RMSE a globally biased predictor would produce) while
 // giving the fitter the headroom it now needs on this synthetic pipeline.
 const BINOMIAL_MAE_MAX: Real = 0.08;
@@ -183,10 +184,10 @@ fn binomial_pipeline_meets_regression_error_budget() {
         assert_eq!(preds.len(), TEST_POINTS);
 
         for (pred, truth_p) in preds.iter().zip(test_true_p.iter()) {
-            assert!(pred.prevalence.is_finite());
-            assert!(pred.logit_value.is_finite());
-            assert!(pred.variance.is_finite());
-            all_abs_errors.push((pred.prevalence - truth_p).abs());
+            assert!(pred.prevalence_median.is_finite());
+            assert!(pred.logit.is_finite());
+            assert!(pred.logit_variance.is_finite());
+            all_abs_errors.push((pred.prevalence_median - truth_p).abs());
         }
     }
 
@@ -260,7 +261,7 @@ fn binomial_pipeline_350_point_accuracy_regression_budget() {
     let mae = preds
         .iter()
         .zip(test_true_p.iter())
-        .map(|(pred, truth)| (pred.prevalence - truth).abs())
+        .map(|(pred, truth)| (pred.prevalence_median - truth).abs())
         .sum::<Real>()
         / preds.len() as Real;
     assert!(mae < 0.085, "350-point binomial mae={mae}");
@@ -307,8 +308,8 @@ fn binomial_pipeline_matches_manual_pipeline_at_fixed_seed() {
 
     assert_eq!(pipeline.len(), manual.len());
     for (q, m) in pipeline.iter().zip(manual.iter()) {
-        assert!((q.prevalence - m.prevalence).abs() < 1e-4);
-        assert!((q.logit_value - m.logit_value).abs() < 1e-4);
-        assert!((q.variance - m.variance).abs() < 1e-4);
+        assert!((q.prevalence_median - m.prevalence_median).abs() < 1e-4);
+        assert!((q.logit - m.logit).abs() < 1e-4);
+        assert!((q.logit_variance - m.logit_variance).abs() < 1e-4);
     }
 }

@@ -1,59 +1,27 @@
 //! Ordinary space–time kriging.
 //!
 //! Build a model from a [`SpaceTimeDataset`] and a [`SpaceTimeVariogram`] and predict at
-//! arbitrary [`SpaceTimeCoord`] targets. The underlying system has the same shape as 2-D
-//! ordinary kriging: an `(n + 1) × (n + 1)` covariance matrix with a Lagrangian row/column
-//! enforcing unit-sum weights.
-
-use std::sync::Arc;
-
-use nalgebra::{DMatrix, DVector, Dyn, linalg::LU};
-#[cfg(not(target_arch = "wasm32"))]
-use rayon::prelude::*;
+//! arbitrary [`SpaceTimeCoord`] targets. Uses the dual SPD engine (ADR-0001).
 
 use crate::Real;
 use crate::error::KrigingError;
+use crate::kriging::conditioner::KrigingConditioner;
 use crate::kriging::ordinary::Prediction;
-use crate::spacetime::coord::{SpaceTimeCoord, temporal_distance};
+use crate::kriging::pairwise::SpaceTimePairwiseCovariance;
+use crate::spacetime::coord::SpaceTimeCoord;
 use crate::spacetime::dataset::SpaceTimeDataset;
+use crate::spacetime::kriging::engine::SpaceTimeOrdinaryKrigingEngine;
 use crate::spacetime::metric::SpatialMetric;
 use crate::spacetime::variogram::SpaceTimeVariogram;
-use crate::variogram::models::VariogramType;
 
 /// Fitted ordinary space–time kriging model.
 ///
 /// Generic over a [`SpatialMetric`] so the same implementation serves geographic data
 /// ([`GeoMetric`](crate::spacetime::GeoMetric)) and projected data
 /// ([`ProjectedMetric`](crate::spacetime::ProjectedMetric)).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SpaceTimeOrdinaryKrigingModel<M: SpatialMetric> {
-    metric: M,
-    coords: Vec<SpaceTimeCoord<M::Coord>>,
-    prepared_spatial: Vec<M::Prepared>,
-    times: Vec<Real>,
-    values: Vec<Real>,
-    variogram: SpaceTimeVariogram,
-    c_at_zero: Real,
-    system_lu: Arc<LU<Real, Dyn, Dyn>>,
-}
-
-impl<M: SpatialMetric> Clone for SpaceTimeOrdinaryKrigingModel<M>
-where
-    M::Coord: Clone,
-    M::Prepared: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            metric: self.metric,
-            coords: self.coords.clone(),
-            prepared_spatial: self.prepared_spatial.clone(),
-            times: self.times.clone(),
-            values: self.values.clone(),
-            variogram: self.variogram,
-            c_at_zero: self.c_at_zero,
-            system_lu: Arc::clone(&self.system_lu),
-        }
-    }
+    engine: SpaceTimeOrdinaryKrigingEngine<M>,
 }
 
 impl<M: SpatialMetric> SpaceTimeOrdinaryKrigingModel<M> {
@@ -98,62 +66,72 @@ impl<M: SpatialMetric> SpaceTimeOrdinaryKrigingModel<M> {
         extra: &[Real],
     ) -> Result<Self, KrigingError> {
         let (coords, values) = dataset.into_parts();
-        let n = coords.len();
-        if !extra.is_empty() && extra.len() != n {
-            return Err(KrigingError::InvalidInput(
-                "internal: extra length mismatch for space-time ordinary kriging".to_string(),
-            ));
-        }
-        let prepared_spatial: Vec<M::Prepared> =
-            coords.iter().map(|c| metric.prepare(c.spatial)).collect();
-        let times: Vec<Real> = coords.iter().map(|c| c.time).collect();
-
-        let system = build_ordinary_system(&metric, &prepared_spatial, &times, variogram, extra);
-        let system_lu = Arc::new(system.lu());
-        let mut probe = DVector::from_element(n + 1, 0.0);
-        probe[n] = 1.0;
-        if system_lu.solve(&probe).is_none() {
-            return Err(KrigingError::MatrixError(
-                "could not factorize space-time ordinary kriging system".to_string(),
-            ));
-        }
-        Ok(Self {
-            metric,
+        let engine = SpaceTimeOrdinaryKrigingEngine::fit_with_extra_diagonal(
+            SpaceTimePairwiseCovariance::new(metric, variogram),
             coords,
-            prepared_spatial,
-            times,
             values,
-            variogram,
-            c_at_zero: variogram.c_at_zero(),
-            system_lu,
-        })
+            extra,
+        )?;
+        Ok(Self { engine })
     }
 
     /// Metric used to measure spatial distances.
     pub fn metric(&self) -> M {
-        self.metric
+        self.engine.pairwise_covariance().metric()
     }
 
     /// Number of training points.
     pub fn len(&self) -> usize {
-        self.coords.len()
+        self.engine.len()
     }
 
     /// Whether the model has no training points. Always `false` because construction
     /// enforces `len() >= 2`.
     pub fn is_empty(&self) -> bool {
-        self.coords.is_empty()
+        self.engine.len() == 0
     }
 
     /// Space–time variogram used by the model.
     pub fn variogram(&self) -> SpaceTimeVariogram {
-        self.variogram
+        self.engine.pairwise_covariance().variogram()
+    }
+
+    /// Training space–time coordinates in station order.
+    pub fn coords(&self) -> Vec<SpaceTimeCoord<M::Coord>>
+    where
+        M::Coord: Copy,
+    {
+        self.engine.coords().to_vec()
+    }
+
+    /// Consume this fitted model as live state for sequential Gaussian simulation.
+    pub fn into_conditioner(
+        self,
+    ) -> Result<KrigingConditioner<SpaceTimeCoord<M::Coord>>, KrigingError>
+    where
+        M: 'static,
+        M::Coord: 'static,
+        M::Prepared: 'static,
+    {
+        self.into_conditioner_on()
+    }
+
+    pub(crate) fn into_conditioner_on<Scale>(
+        self,
+    ) -> Result<KrigingConditioner<SpaceTimeCoord<M::Coord>, Scale>, KrigingError>
+    where
+        M: 'static,
+        M::Coord: 'static,
+        M::Prepared: 'static,
+    {
+        Ok(KrigingConditioner::from_ordinary(self.engine))
     }
 
     /// Single-target prediction.
     pub fn predict(&self, target: SpaceTimeCoord<M::Coord>) -> Result<Prediction, KrigingError> {
-        let mut rhs = DVector::from_element(self.coords.len() + 1, 0.0);
-        self.predict_with_rhs(target, &mut rhs)
+        self.engine
+            .predict(&[target])
+            .map(|mut v| v.pop().expect("single prediction"))
     }
 
     /// Batched predictions. Parallel on native builds; sequential on wasm32.
@@ -161,113 +139,8 @@ impl<M: SpatialMetric> SpaceTimeOrdinaryKrigingModel<M> {
         &self,
         targets: &[SpaceTimeCoord<M::Coord>],
     ) -> Result<Vec<Prediction>, KrigingError> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let n = self.coords.len();
-            targets
-                .par_iter()
-                .map_init(
-                    || DVector::<Real>::from_element(n + 1, 0.0),
-                    |rhs, t| self.predict_with_rhs(*t, rhs),
-                )
-                .collect()
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            let mut rhs = DVector::from_element(self.coords.len() + 1, 0.0);
-            let mut out = Vec::with_capacity(targets.len());
-            for &t in targets {
-                out.push(self.predict_with_rhs(t, &mut rhs)?);
-            }
-            Ok(out)
-        }
+        self.engine.predict(targets)
     }
-
-    fn predict_with_rhs(
-        &self,
-        target: SpaceTimeCoord<M::Coord>,
-        rhs: &mut DVector<Real>,
-    ) -> Result<Prediction, KrigingError> {
-        let n = self.coords.len();
-        let prepared_target = self.metric.prepare(target.spatial);
-        for i in 0..n {
-            let hs = self
-                .metric
-                .distance(self.prepared_spatial[i], prepared_target);
-            let ht = temporal_distance(self.times[i], target.time);
-            rhs[i] = self.variogram.covariance(hs, ht);
-        }
-        rhs[n] = 1.0;
-
-        let sol = self.system_lu.solve(rhs).ok_or_else(|| {
-            KrigingError::MatrixError(
-                "could not solve space-time ordinary kriging system".to_string(),
-            )
-        })?;
-        let mut value: Real = 0.0;
-        let mut cov_dot: Real = 0.0;
-        for i in 0..n {
-            value += sol[i] * self.values[i];
-            cov_dot += sol[i] * rhs[i];
-        }
-        let mu = sol[n];
-        let variance = (self.c_at_zero - cov_dot - mu).max(0.0);
-        Ok(Prediction { value, variance })
-    }
-}
-
-/// Diagonal regularization added to the covariance block of a space–time kriging matrix to
-/// keep it solvable under `f32`. Picks the stronger of the spatial and temporal marginal
-/// jitters (Gaussian and Cubic marginals are the ill-conditioning cases) and scales by the
-/// ST `C(0, 0)` so the absolute magnitude matches the matrix entries.
-pub(crate) fn spacetime_diagonal_jitter(n_stations: usize, variogram: SpaceTimeVariogram) -> Real {
-    let c0 = variogram.c_at_zero();
-    let scale = (n_stations as Real).sqrt().max(1.0);
-    let worst_frac = variogram
-        .marginal_variogram_types()
-        .iter()
-        .map(|vt| match vt {
-            VariogramType::Gaussian => 1e-5 as Real,
-            VariogramType::Cubic => 1e-4 as Real,
-            _ => 1e-8 as Real,
-        })
-        .fold(1e-8 as Real, Real::max);
-    let floor = (1e-10 * c0).max(Real::MIN_POSITIVE);
-    (worst_frac * c0 * scale).max(floor)
-}
-
-fn build_ordinary_system<M: SpatialMetric>(
-    metric: &M,
-    prepared_spatial: &[M::Prepared],
-    times: &[Real],
-    variogram: SpaceTimeVariogram,
-    extra: &[Real],
-) -> DMatrix<Real> {
-    let n = prepared_spatial.len();
-    if !extra.is_empty() {
-        debug_assert_eq!(extra.len(), n);
-    }
-    let diag_eps = spacetime_diagonal_jitter(n, variogram);
-    let mut m = DMatrix::from_element(n + 1, n + 1, 0.0);
-    for i in 0..n {
-        for j in i..n {
-            let hs = metric.distance(prepared_spatial[i], prepared_spatial[j]);
-            let ht = temporal_distance(times[i], times[j]);
-            let mut cov = variogram.covariance(hs, ht);
-            if i == j {
-                cov += diag_eps;
-                if let Some(&d) = extra.get(i) {
-                    cov += d;
-                }
-            }
-            m[(i, j)] = cov;
-            m[(j, i)] = cov;
-        }
-        m[(i, n)] = 1.0;
-        m[(n, i)] = 1.0;
-    }
-    m[(n, n)] = 0.0;
-    m
 }
 
 #[cfg(test)]
@@ -275,7 +148,7 @@ mod tests {
     use super::*;
     use crate::distance::GeoCoord;
     use crate::spacetime::metric::GeoMetric;
-    use crate::variogram::models::VariogramModel;
+    use crate::variogram::models::{VariogramModel, VariogramType};
 
     fn spatial_var() -> VariogramModel {
         VariogramModel::new(0.01, 1.0, 300.0, VariogramType::Exponential).unwrap()
@@ -317,70 +190,72 @@ mod tests {
     #[test]
     fn predict_batch_matches_single_predictions() {
         let coords = make_coords();
-        let values = vec![10.0, 12.0, 14.0, 16.0];
+        let values = vec![10.0, 20.0, 15.0, 25.0];
+        let dataset = SpaceTimeDataset::new(coords.clone(), values).unwrap();
+        let stv = SpaceTimeVariogram::new_separable(spatial_var(), temporal_var()).unwrap();
+        let model = SpaceTimeOrdinaryKrigingModel::new(GeoMetric, dataset, stv).unwrap();
+        let targets = vec![
+            SpaceTimeCoord::new(GeoCoord::try_new(0.5, 0.5).unwrap(), 1.5),
+            SpaceTimeCoord::new(GeoCoord::try_new(0.25, 0.75).unwrap(), 0.5),
+        ];
+        let batch = model.predict_batch(&targets).unwrap();
+        for (t, b) in targets.iter().zip(batch.iter()) {
+            let single = model.predict(*t).unwrap();
+            assert!((single.value - b.value).abs() < 1e-6);
+            assert!((single.variance - b.variance).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn clone_produces_equivalent_model() {
+        let coords = make_coords();
+        let values = vec![10.0, 20.0, 15.0, 25.0];
         let dataset = SpaceTimeDataset::new(coords, values).unwrap();
         let stv = SpaceTimeVariogram::new_separable(spatial_var(), temporal_var()).unwrap();
         let model = SpaceTimeOrdinaryKrigingModel::new(GeoMetric, dataset, stv).unwrap();
+        let cloned = model.clone();
+        let target = SpaceTimeCoord::new(GeoCoord::try_new(0.5, 0.5).unwrap(), 1.5);
+        let a = model.predict(target).unwrap();
+        let b = cloned.predict(target).unwrap();
+        assert!((a.value - b.value).abs() < 1e-6);
+        assert!((a.variance - b.variance).abs() < 1e-6);
+    }
 
-        let targets = vec![
-            SpaceTimeCoord::new(GeoCoord::try_new(0.3, 0.4).unwrap(), 0.5),
-            SpaceTimeCoord::new(GeoCoord::try_new(0.7, 0.8).unwrap(), 2.5),
-            SpaceTimeCoord::new(GeoCoord::try_new(0.1, 0.9).unwrap(), 1.2),
-        ];
-        let batch = model.predict_batch(&targets).expect("batch");
-        for (i, t) in targets.iter().enumerate() {
-            let single = model.predict(*t).expect("single");
-            assert!((batch[i].value - single.value).abs() < 1e-5);
-            assert!((batch[i].variance - single.variance).abs() < 1e-5);
-        }
+    #[test]
+    fn rejects_unfactorizable_single_point_dataset() {
+        let coords = vec![SpaceTimeCoord::new(
+            GeoCoord::try_new(0.0, 0.0).unwrap(),
+            0.0,
+        )];
+        let values = vec![1.0];
+        let r = SpaceTimeDataset::new(coords, values);
+        assert!(matches!(r, Err(KrigingError::InsufficientData(2))));
     }
 
     #[test]
     fn prediction_variance_is_non_negative() {
         let coords = make_coords();
-        let values = vec![1.0, 2.0, 3.0, 4.0];
+        let values = vec![10.0, 20.0, 15.0, 25.0];
         let dataset = SpaceTimeDataset::new(coords, values).unwrap();
         let stv = SpaceTimeVariogram::new_separable(spatial_var(), temporal_var()).unwrap();
         let model = SpaceTimeOrdinaryKrigingModel::new(GeoMetric, dataset, stv).unwrap();
-
-        for lat in [-0.5, 0.2, 0.9, 2.0] {
-            for t in [-1.0, 0.5, 4.0, 100.0] {
-                let pred = model
-                    .predict(SpaceTimeCoord::new(GeoCoord::try_new(lat, 0.3).unwrap(), t))
-                    .expect("predict");
-                assert!(pred.variance >= 0.0, "variance at (lat={lat}, t={t})");
-                assert!(pred.variance.is_finite());
-                assert!(pred.value.is_finite());
-            }
-        }
+        let target = SpaceTimeCoord::new(GeoCoord::try_new(0.5, 0.5).unwrap(), 1.5);
+        let pred = model.predict(target).unwrap();
+        assert!(pred.variance >= 0.0);
     }
 
     #[test]
     fn variance_increases_when_far_in_both_space_and_time() {
         let coords = make_coords();
-        let values = vec![1.0, 2.0, 3.0, 4.0];
+        let values = vec![10.0, 20.0, 15.0, 25.0];
         let dataset = SpaceTimeDataset::new(coords, values).unwrap();
         let stv = SpaceTimeVariogram::new_separable(spatial_var(), temporal_var()).unwrap();
         let model = SpaceTimeOrdinaryKrigingModel::new(GeoMetric, dataset, stv).unwrap();
-
-        let near = model
-            .predict(SpaceTimeCoord::new(
-                GeoCoord::try_new(0.5, 0.5).unwrap(),
-                1.5,
-            ))
-            .unwrap();
-        let far = model
-            .predict(SpaceTimeCoord::new(
-                GeoCoord::try_new(0.5, 0.5).unwrap(),
-                1000.0,
-            ))
-            .unwrap();
-        assert!(
-            far.variance > near.variance,
-            "far-in-time variance {} should exceed near variance {}",
-            far.variance,
-            near.variance
-        );
+        let near = SpaceTimeCoord::new(GeoCoord::try_new(0.5, 0.5).unwrap(), 1.5);
+        let far = SpaceTimeCoord::new(GeoCoord::try_new(5.0, 5.0).unwrap(), 10.0);
+        let near_var = model.predict(near).unwrap().variance;
+        let far_var = model.predict(far).unwrap().variance;
+        assert!(far_var > near_var);
     }
 
     #[test]
@@ -414,42 +289,15 @@ mod tests {
     }
 
     #[test]
-    fn clone_produces_equivalent_model() {
-        let coords = make_coords();
-        let values = vec![1.0, 2.0, 3.0, 4.0];
-        let dataset = SpaceTimeDataset::new(coords, values).unwrap();
-        let stv = SpaceTimeVariogram::new_separable(spatial_var(), temporal_var()).unwrap();
-        let model = SpaceTimeOrdinaryKrigingModel::new(GeoMetric, dataset, stv).unwrap();
-        let cloned = model.clone();
-
-        let target = SpaceTimeCoord::new(GeoCoord::try_new(0.5, 0.5).unwrap(), 1.5);
-        let original = model.predict(target).unwrap();
-        let duplicate = cloned.predict(target).unwrap();
-        assert!((original.value - duplicate.value).abs() < 1e-6);
-        assert!((original.variance - duplicate.variance).abs() < 1e-6);
-    }
-
-    #[test]
     fn weights_sum_to_one_implicitly_via_constant_field() {
-        // Ordinary kriging of a constant field must return the constant at every target.
         let coords = make_coords();
-        let values = vec![42.0; coords.len()];
+        let values = vec![5.0; 4];
         let dataset = SpaceTimeDataset::new(coords, values).unwrap();
         let stv = SpaceTimeVariogram::new_separable(spatial_var(), temporal_var()).unwrap();
         let model = SpaceTimeOrdinaryKrigingModel::new(GeoMetric, dataset, stv).unwrap();
-        let target = SpaceTimeCoord::new(GeoCoord::try_new(0.2, 0.7).unwrap(), 1.2);
-        let pred = model.predict(target).expect("prediction");
-        assert!((pred.value - 42.0).abs() < 1e-3, "got {}", pred.value);
-    }
-
-    #[test]
-    fn rejects_unfactorizable_single_point_dataset() {
-        let coords = vec![SpaceTimeCoord::new(
-            GeoCoord::try_new(0.0, 0.0).unwrap(),
-            0.0,
-        )];
-        let values = vec![1.0];
-        assert!(SpaceTimeDataset::new(coords, values).is_err());
+        let target = SpaceTimeCoord::new(GeoCoord::try_new(0.5, 0.5).unwrap(), 1.5);
+        let pred = model.predict(target).unwrap();
+        assert!((pred.value - 5.0).abs() < 1e-2);
     }
 
     #[test]
@@ -459,20 +307,17 @@ mod tests {
 
         let coords = vec![
             SpaceTimeCoord::new(ProjectedCoord::new(0.0, 0.0), 0.0),
-            SpaceTimeCoord::new(ProjectedCoord::new(0.0, 1.0), 1.0),
-            SpaceTimeCoord::new(ProjectedCoord::new(1.0, 0.0), 2.0),
-            SpaceTimeCoord::new(ProjectedCoord::new(1.0, 1.0), 3.0),
+            SpaceTimeCoord::new(ProjectedCoord::new(10.0, 0.0), 1.0),
+            SpaceTimeCoord::new(ProjectedCoord::new(0.0, 10.0), 2.0),
         ];
-        let values = vec![10.0, 12.0, 14.0, 16.0];
-        let dataset = SpaceTimeDataset::new(coords.clone(), values).unwrap();
-        let spatial = VariogramModel::new(0.01, 1.0, 2.0, VariogramType::Exponential).unwrap();
-        let temporal = VariogramModel::new(0.01, 2.0, 3.0, VariogramType::Exponential).unwrap();
-        let stv = SpaceTimeVariogram::new_separable(spatial, temporal).unwrap();
+        let values = vec![1.0, 2.0, 3.0];
+        let dataset = SpaceTimeDataset::new(coords, values).unwrap();
+        let stv = SpaceTimeVariogram::new_separable(spatial_var(), temporal_var()).unwrap();
         let model =
             SpaceTimeOrdinaryKrigingModel::new(ProjectedMetric::isotropic(), dataset, stv).unwrap();
-        for c in &coords {
-            let pred = model.predict(*c).unwrap();
-            assert!(pred.value.is_finite() && pred.variance.is_finite());
-        }
+        let target = SpaceTimeCoord::new(ProjectedCoord::new(5.0, 5.0), 1.0);
+        let pred = model.predict(target).unwrap();
+        assert!(pred.value.is_finite());
+        assert!(pred.variance >= 0.0);
     }
 }

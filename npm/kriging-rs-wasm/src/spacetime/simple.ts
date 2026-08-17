@@ -11,12 +11,14 @@ import {
   mapOrdinaryPrediction,
 } from "../internal/mappers.js";
 import { requireLoadedModule } from "../internal/module.js";
+import { modelKFold, modelLeaveOneOut } from "../internal/model-cv.js";
 import {
   fittedToSpaceTimeVariogramParams,
   packSpaceTimeVariogram,
 } from "../internal/spacetime.js";
-import type { WasmSpaceTimeInstance } from "../internal/wasm-shapes.js";
+import type { WasmKrigingModelHandle } from "../internal/wasm-shapes.js";
 import type {
+  CvResult,
   NumericArrayInput,
   OrdinaryBatchArrayOutput,
   OrdinaryPrediction,
@@ -32,12 +34,12 @@ const FREED = "SpaceTimeSimpleKriging model has been freed";
  * trend removed before kriging).
  */
 export class SpaceTimeSimpleKriging {
-  private inner: WasmSpaceTimeInstance | null;
+  private inner: WasmKrigingModelHandle | null;
 
   constructor(options: SpaceTimeSimpleKrigingOptions) {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmSpaceTimeSimpleKriging;
-    if (!ctor) {
+    const factory = mod.WasmKrigingModel?.spacetimeSimpleGeoFromArrays;
+    if (!factory) {
       throw new KrigingError(
         "SpaceTimeSimpleKriging is not available; rebuild the WASM package",
         { code: "backend_unavailable" }
@@ -45,7 +47,8 @@ export class SpaceTimeSimpleKriging {
     }
     const packed = packSpaceTimeVariogram(options.variogram);
     try {
-      this.inner = ctor.fromArrays(
+      this.inner = factory.call(
+        mod.WasmKrigingModel,
         toFloat64Array(options.lats),
         toFloat64Array(options.lons),
         toFloat64Array(options.times),
@@ -71,7 +74,7 @@ export class SpaceTimeSimpleKriging {
     }
   }
 
-  private requireInner(): WasmSpaceTimeInstance {
+  private requireInner(): WasmKrigingModelHandle {
     if (this.inner === null) {
       throw new KrigingError(FREED, { code: "model_freed" });
     }
@@ -104,7 +107,7 @@ export class SpaceTimeSimpleKriging {
   }
 
   predict(lat: number, lon: number, time: number): OrdinaryPrediction {
-    return mapOrdinaryPrediction(this.requireInner().predict(lat, lon, time));
+    return mapOrdinaryPrediction(this.requireInner().predictSpaceTime(lat, lon, time));
   }
 
   predictBatchArrays(
@@ -112,11 +115,27 @@ export class SpaceTimeSimpleKriging {
     lons: NumericArrayInput,
     times: NumericArrayInput
   ): OrdinaryBatchArrayOutput {
-    const out = this.requireInner().predictBatchArrays(
+    const out = this.requireInner().predictBatchArraysSpaceTime(
       toFloat64Array(lats),
       toFloat64Array(lons),
       toFloat64Array(times)
     );
     return mapOrdinaryBatchArrayOutput(out);
+  }
+
+  /**
+   * Leave-one-out CV on **this fitted model** (same training data and variogram).
+   * Prefer {@link leaveOneOut} when validating from raw arrays before building a model.
+   */
+  leaveOneOut(): CvResult {
+    return modelLeaveOneOut(this.requireInner(), "simple") as CvResult;
+  }
+
+  /**
+   * K-fold CV on **this fitted model** (deterministic round-robin folds).
+   * Prefer {@link kFold} when validating from raw arrays before building a model.
+   */
+  kFold(k: number): CvResult {
+    return modelKFold(this.requireInner(), k, "simple") as CvResult;
   }
 }

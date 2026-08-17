@@ -10,6 +10,7 @@ use kriging_rs::wasm::spacetime::{
 #[cfg(feature = "gpu")]
 use kriging_rs::wasm::wasm_webgpu_available;
 use kriging_rs::wasm::{WasmBinomialKriging, WasmOrdinaryKriging};
+use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
 
@@ -180,6 +181,37 @@ fn wasm_binomial_get_build_notes_includes_version() {
 }
 
 #[wasm_bindgen_test]
+fn wasm_binomial_one_step_laplace_sets_calibration_version_3() {
+    let lats = [0.0, 0.0, 1.0];
+    let lons = [0.0, 1.0, 0.0];
+    let successes = [1u32, 3, 4];
+    let trials = [5u32, 5, 5];
+    let js_opts = binomial_options(
+        &lats,
+        &lons,
+        &successes,
+        &trials,
+        "exponential",
+        0.01,
+        2.0,
+        300.0,
+    );
+    let opts: js_sys::Object = js_opts.dyn_into().expect("options must be object");
+    set(
+        &opts,
+        "oneStepLaplaceObservationVariance",
+        JsValue::from_bool(true),
+    );
+    let model = WasmBinomialKriging::new(opts.into()).expect("model should construct");
+    let notes = model.get_build_notes().expect("build notes");
+    let v = Reflect::get(&notes, &JsValue::from_str("calibrationVersion"))
+        .expect("calibrationVersion")
+        .as_f64()
+        .unwrap();
+    assert_eq!(v, 3.0);
+}
+
+#[wasm_bindgen_test]
 fn wasm_binomial_batch_returns_array() {
     let lats = [0.0, 0.0, 1.0];
     let lons = [0.0, 1.0, 0.0];
@@ -231,16 +263,17 @@ fn wasm_binomial_batch_arrays_returns_typed_arrays() {
     let js = model
         .predict_batch_arrays(&[0.2, 0.4], &[0.2, 0.4])
         .expect("batch arrays should succeed");
-    let prevalences =
-        Reflect::get(&js, &JsValue::from_str("prevalences")).expect("has prevalences");
+    let prevalence_medians =
+        Reflect::get(&js, &JsValue::from_str("prevalenceMedians")).expect("has prevalenceMedians");
     let logit_values =
         Reflect::get(&js, &JsValue::from_str("logitValues")).expect("has logit values");
-    let variances = Reflect::get(&js, &JsValue::from_str("variances")).expect("has variances");
+    let logit_variances =
+        Reflect::get(&js, &JsValue::from_str("logitVariances")).expect("has logit variances");
     let prevalence_variances = Reflect::get(&js, &JsValue::from_str("prevalenceVariances"))
         .expect("has prevalence variances");
-    assert!(prevalences.is_instance_of::<Float64Array>());
+    assert!(prevalence_medians.is_instance_of::<Float64Array>());
     assert!(logit_values.is_instance_of::<Float64Array>());
-    assert!(variances.is_instance_of::<Float64Array>());
+    assert!(logit_variances.is_instance_of::<Float64Array>());
     assert!(prevalence_variances.is_instance_of::<Float64Array>());
 }
 
@@ -438,6 +471,7 @@ fn wasm_spacetime_binomial_returns_unit_interval_prevalence() {
         0.05,
         1.0,
         5.0,
+        None,
         None,
         None,
         None,

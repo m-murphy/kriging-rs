@@ -11,6 +11,7 @@ import type {
   BinomialCvResidual,
   BinomialCvResult,
   BinomialCvSummary,
+  BinomialDiagnostics,
   BinomialPrediction,
   BinomialPriorParams,
   CvResidual,
@@ -22,6 +23,9 @@ import type {
   FittedSpaceTimeVariogram,
   OrdinaryBatchArrayOutput,
   OrdinaryPrediction,
+  PrevalenceCalibrationBin,
+  SpaceTimeBinomialDiagnostics,
+  SpaceTimeVariogramParams,
   VariogramParams,
   VariogramTypeName,
 } from "../types.js";
@@ -53,22 +57,20 @@ export function mapOrdinaryPredictionArray(
 
 export function mapBinomialPrediction(value: unknown): BinomialPrediction {
   const item = asRecord(value);
-  const maybeSnake = item.logit_value;
-  const maybeCamel = item.logitValue;
-  const logit = maybeCamel ?? maybeSnake;
-  const maybePrevalenceVariance =
-    item.prevalenceVariance ?? item.prevalence_variance;
-  const variance = requireNumber(item.variance);
-  const prevalence = requireNumber(item.prevalence);
+  const prevalenceMedian = requireNumber(item.prevalenceMedian);
+  const prevalenceMean = requireNumber(item.prevalenceMean);
+  const logit = requireNumber(item.logit);
+  const logitVariance = requireNumber(item.logitVariance);
+  const explicitPv = item.prevalenceVariance;
   const prevalenceVariance =
-    typeof maybePrevalenceVariance === "number" &&
-    Number.isFinite(maybePrevalenceVariance)
-      ? maybePrevalenceVariance
-      : deltaPrevalenceVariance(prevalence, variance);
+    typeof explicitPv === "number" && Number.isFinite(explicitPv)
+      ? explicitPv
+      : deltaPrevalenceVariance(prevalenceMedian, logitVariance);
   return {
-    prevalence,
-    logitValue: requireNumber(logit),
-    variance,
+    prevalenceMedian,
+    prevalenceMean,
+    logit,
+    logitVariance,
     prevalenceVariance,
   };
 }
@@ -101,19 +103,22 @@ function mapZeroTrialDroppedIndices(value: unknown): number[] {
 /** Map raw `getBuildNotes()` JSON from WASM to {@link BinomialBuildNotes}. */
 export function mapBinomialBuildNotes(value: unknown): BinomialBuildNotes {
   const rec = asRecord(value);
-  const priorRaw = rec.prior ?? rec.Prior;
-  const calVer =
-    rec.calibrationVersion ?? rec.calibration_version;
-  const logitInfl =
-    rec.logitInflation ?? rec.logit_inflation;
-  const nAttempts = rec.nBuildAttempts ?? rec.n_build_attempts;
-  const dropped =
-    rec.zeroTrialDroppedIndices ?? rec.zero_trial_dropped_indices;
-  const fromLogitsOnly =
-    rec.fromPrecomputedLogitsOnly ?? rec.from_precomputed_logits_only;
+  const priorRaw = rec.prior;
+  const calVer = rec.calibrationVersion;
+  const logitInfl = rec.logitInflation;
+  const nAttempts = rec.nBuildAttempts;
+  const dropped = rec.zeroTrialDroppedIndices;
+  const fromLogitsOnly = rec.fromPrecomputedLogitsOnly;
   if (typeof fromLogitsOnly !== "boolean") {
     throw new Error("Expected boolean fromPrecomputedLogitsOnly from WASM");
   }
+  const warningsRaw = rec.warnings;
+  const warnings =
+    warningsRaw === undefined || warningsRaw === null
+      ? []
+      : Array.isArray(warningsRaw)
+        ? warningsRaw.map((x) => String(x))
+        : [];
   return {
     calibrationVersion: requireNumber(calVer),
     logitInflation: requireNumber(logitInfl),
@@ -121,6 +126,68 @@ export function mapBinomialBuildNotes(value: unknown): BinomialBuildNotes {
     prior: mapBinomialPriorFromNotes(priorRaw),
     zeroTrialDroppedIndices: mapZeroTrialDroppedIndices(dropped),
     fromPrecomputedLogitsOnly: fromLogitsOnly,
+    warnings,
+    conditionNumber:
+      rec.conditionNumber === undefined || rec.conditionNumber === null
+        ? undefined
+        : requireNumber(rec.conditionNumber),
+    effectiveDof:
+      rec.effectiveDof === undefined || rec.effectiveDof === null
+        ? undefined
+        : requireNumber(rec.effectiveDof),
+    lastMsdr:
+      rec.lastMsdr === undefined || rec.lastMsdr === null
+        ? undefined
+        : requireNumber(rec.lastMsdr),
+  };
+}
+
+/** Map raw `getDiagnostics()` JSON from WASM to {@link BinomialDiagnostics}. */
+export function mapBinomialDiagnostics(value: unknown): BinomialDiagnostics {
+  const rec = asRecord(value);
+  const msdr = rec.logitLooMsdr;
+  return {
+    variogram: mapVariogramParams(rec.variogram),
+    buildNotes: mapBinomialBuildNotes(rec.buildNotes),
+    logitLooMsdr:
+      msdr === undefined || msdr === null ? undefined : requireNumber(msdr),
+  };
+}
+
+function mapSpaceTimeVariogramParamsFromDiagnostics(
+  value: unknown
+): SpaceTimeVariogramParams {
+  const rec = asRecord(value);
+  const fam = rec.family;
+  if (fam !== "separable" && fam !== "productSum") {
+    throw new Error("Expected variogram.family separable|productSum from WASM diagnostics");
+  }
+  const spatial = mapVariogramParams(rec.spatial);
+  const temporal = mapVariogramParams(rec.temporal);
+  if (fam === "separable") {
+    return { family: "separable", spatial, temporal };
+  }
+  return {
+    family: "productSum",
+    spatial,
+    temporal,
+    k1: requireNumber(rec.k1),
+    k2: requireNumber(rec.k2),
+    k3: requireNumber(rec.k3),
+  };
+}
+
+/** Map raw `getDiagnostics()` JSON from WASM space–time binomial. */
+export function mapSpaceTimeBinomialDiagnostics(
+  value: unknown
+): SpaceTimeBinomialDiagnostics {
+  const rec = asRecord(value);
+  const msdr = rec.logitLooMsdr;
+  return {
+    variogram: mapSpaceTimeVariogramParamsFromDiagnostics(rec.variogram),
+    buildNotes: mapBinomialBuildNotes(rec.buildNotes),
+    logitLooMsdr:
+      msdr === undefined || msdr === null ? undefined : requireNumber(msdr),
   };
 }
 
@@ -138,17 +205,20 @@ export function mapBinomialBatchArrayOutput(
   value: unknown
 ): BinomialBatchArrayOutput {
   const out = asRecord(value);
-  const prevalences = requireFloat64Array(out.prevalences);
-  const variances = requireFloat64Array(out.variances);
+  const prevalenceMedians = requireFloat64Array(out.prevalenceMedians);
+  const prevalenceMeans = requireFloat64Array(out.prevalenceMeans);
+  const logitValues = requireFloat64Array(out.logitValues);
+  const logitVariances = requireFloat64Array(out.logitVariances);
   const explicit = out.prevalenceVariances;
   const prevalenceVariances =
     explicit instanceof Float64Array
       ? explicit
-      : computeDeltaPrevalenceVariances(prevalences, variances);
+      : computeDeltaPrevalenceVariances(prevalenceMedians, logitVariances);
   return {
-    prevalences,
-    logitValues: requireFloat64Array(out.logitValues),
-    variances,
+    prevalenceMedians,
+    prevalenceMeans,
+    logitValues,
+    logitVariances,
     prevalenceVariances,
   };
 }
@@ -162,13 +232,13 @@ export function deltaPrevalenceVariance(
 }
 
 function computeDeltaPrevalenceVariances(
-  prevalences: Float64Array,
-  variances: Float64Array
+  prevalenceMedians: Float64Array,
+  logitVariances: Float64Array
 ): Float64Array {
-  const n = prevalences.length;
+  const n = prevalenceMedians.length;
   const out = new Float64Array(n);
   for (let i = 0; i < n; i++) {
-    out[i] = deltaPrevalenceVariance(prevalences[i], variances[i]);
+    out[i] = deltaPrevalenceVariance(prevalenceMedians[i], logitVariances[i]);
   }
   return out;
 }
@@ -224,6 +294,27 @@ function mapCvSummary(value: unknown): CvSummary {
   };
 }
 
+function mapPrevalenceCalibrationBin(value: unknown): PrevalenceCalibrationBin {
+  const rec = asRecord(value);
+  return {
+    binIndex: requireNumber(rec.binIndex),
+    predictedLo: requireFiniteOrNaN(rec.predictedLo),
+    predictedHi: requireFiniteOrNaN(rec.predictedHi),
+    nStations: requireNumber(rec.nStations),
+    sumTrials: requireNumber(rec.sumTrials),
+    sumSuccesses: requireNumber(rec.sumSuccesses),
+    meanPredicted: requireFiniteOrNaN(rec.meanPredicted),
+    pooledObservedPrevalence: requireFiniteOrNaN(rec.pooledObservedPrevalence),
+  };
+}
+
+function mapPrevalenceCalibrationBins(value: unknown): PrevalenceCalibrationBin[] {
+  if (!Array.isArray(value)) {
+    throw new Error("calibrationBins must be an array");
+  }
+  return value.map(mapPrevalenceCalibrationBin);
+}
+
 export function mapBinomialCvOutput(value: unknown): BinomialCvResult {
   const rec = asRecord(value);
   const indices = requireUint32Array(rec.indices);
@@ -241,6 +332,9 @@ export function mapBinomialCvOutput(value: unknown): BinomialCvResult {
     nEvaluated: requireNumber(summaryRec.nEvaluated),
     logit: mapCvSummary(summaryRec.logit),
     prevalence: mapCvSummary(summaryRec.prevalence),
+    brier: requireFiniteOrNaN(summaryRec.brier),
+    logScorePerTrial: requireFiniteOrNaN(summaryRec.logScorePerTrial),
+    calibrationBins: mapPrevalenceCalibrationBins(summaryRec.calibrationBins),
   };
   const residuals: BinomialCvResidual[] = [];
   for (let i = 0; i < indices.length; i++) {
@@ -277,7 +371,7 @@ export function mapBinomialCvOutput(value: unknown): BinomialCvResult {
 
 // ---------- Space-time mappers ----------
 
-function mapVariogramParams(value: unknown): VariogramParams {
+export function mapVariogramParams(value: unknown): VariogramParams {
   const rec = asRecord(value);
   const vt = requireVariogramType(rec.variogramType);
   const out: VariogramParams = {

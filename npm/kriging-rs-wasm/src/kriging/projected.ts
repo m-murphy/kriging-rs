@@ -13,8 +13,10 @@ import {
   mapOrdinaryPredictionArray,
 } from "../internal/mappers.js";
 import { requireLoadedModule } from "../internal/module.js";
-import type { WasmProjectedInstance } from "../internal/wasm-shapes.js";
+import { modelKFold, modelLeaveOneOut } from "../internal/model-cv.js";
+import type { WasmKrigingModelHandle } from "../internal/wasm-shapes.js";
 import type {
+  CvResult,
   NumericArrayInput,
   OrdinaryBatchArrayOutput,
   OrdinaryPrediction,
@@ -29,7 +31,7 @@ const PROJECTED_FREED = "ProjectedKriging model has been freed";
  * in a local coordinate system) and directional correlation matters.
  */
 export class ProjectedKriging {
-  private inner: WasmProjectedInstance | null;
+  private inner: WasmKrigingModelHandle | null;
 
   /**
    * Build a projected / planar ordinary kriging model with 2D anisotropy.
@@ -42,15 +44,16 @@ export class ProjectedKriging {
    */
   constructor(options: ProjectedKrigingOptions) {
     const mod = requireLoadedModule();
-    const ctor = mod.WasmProjectedKriging;
-    if (!ctor) {
+    const factory = mod.WasmKrigingModel?.projectedOrdinaryFromArrays;
+    if (!factory) {
       throw new KrigingError(
         "ProjectedKriging is not available; rebuild the WASM package",
         { code: "backend_unavailable" }
       );
     }
     try {
-      this.inner = ctor.fromArrays(
+      this.inner = factory.call(
+        mod.WasmKrigingModel,
         toFloat64Array(options.xs),
         toFloat64Array(options.ys),
         toFloat64Array(options.values),
@@ -67,7 +70,7 @@ export class ProjectedKriging {
     }
   }
 
-  private requireInner(): WasmProjectedInstance {
+  private requireInner(): WasmKrigingModelHandle {
     if (this.inner === null) {
       throw new KrigingError(PROJECTED_FREED, { code: "model_freed" });
     }
@@ -125,5 +128,21 @@ export class ProjectedKriging {
       toFloat64Array(ys)
     );
     return mapOrdinaryBatchArrayOutput(out);
+  }
+
+  /**
+   * Leave-one-out CV on **this fitted model** (same training data and variogram).
+   * Prefer {@link leaveOneOut} when validating from raw arrays before building a model.
+   */
+  leaveOneOut(): CvResult {
+    return modelLeaveOneOut(this.requireInner(), "ordinary") as CvResult;
+  }
+
+  /**
+   * K-fold CV on **this fitted model** (deterministic round-robin folds).
+   * Prefer {@link kFold} when validating from raw arrays before building a model.
+   */
+  kFold(k: number): CvResult {
+    return modelKFold(this.requireInner(), k, "ordinary") as CvResult;
   }
 }

@@ -1,19 +1,17 @@
 //! Cross-validation for kriging models.
 //!
-//! Per-variant entry points are provided for every kriging flavor shipped by this crate:
-//!
-//! - Ordinary: [`leave_one_out`] / [`k_fold`]
-//! - Simple (known mean): [`leave_one_out_simple`] / [`k_fold_simple`]
-//! - Universal (polynomial drift): [`leave_one_out_universal`] / [`k_fold_universal`]
-//! - Projected / planar (anisotropy): [`leave_one_out_projected`] / [`k_fold_projected`]
-//! - Binomial (successes / trials): [`leave_one_out_binomial`] / [`k_fold_binomial`]
-//! - Space–time ordinary / simple / universal / binomial:
-//!   [`leave_one_out_spacetime`] / [`k_fold_spacetime`] and friends.
+//! Fold iteration is generic over [`KrigingPredictor`](crate::predictor::cv::KrigingPredictor)
+//! backends in [`crate::predictor::cv`]. Construct a predictor struct (e.g.
+//! [`OrdinaryGeoPredictor`](crate::predictor::cv::OrdinaryGeoPredictor)) and call
+//! [`leave_one_out_cv`](crate::predictor::cv::leave_one_out_cv) or
+//! [`k_fold_cv`](crate::predictor::cv::k_fold_cv).
 //!
 //! The continuous variants share [`CvResidual`] / [`CvSummary`]. Binomial CV returns
 //! [`BinomialCvResidual`] values that carry **both** the logit-scale residual (directly
 //! comparable to continuous kriging and MSDR-calibratable) **and** the prevalence-scale
-//! residual (intuitive; delta-method variance). [`BinomialCvSummary`] aggregates both.
+//! residual (intuitive; delta-method variance). [`BinomialCvSummary`] aggregates both plus
+//! trial-weighted **log score per trial**, **Brier** (mean squared prevalence error), and
+//! **calibration bins** over predicted prevalence.
 //!
 //! All routines assume the supplied variogram / drift / mean / anisotropy is held fixed
 //! across folds; only the kriging system is refit per fold. Callers who want to refit
@@ -24,31 +22,6 @@
 //! who want randomization can shuffle inputs before calling.
 
 use crate::Real;
-use crate::distance::GeoCoord;
-use crate::error::KrigingError;
-use crate::geo_dataset::GeoDataset;
-use crate::kriging::binomial::{BinomialKrigingModel, BinomialObservation, BinomialPrior};
-use crate::kriging::ordinary::OrdinaryKrigingModel;
-use crate::kriging::simple::SimpleKrigingModel;
-use crate::kriging::universal::{UniversalKrigingModel, UniversalTrend};
-use crate::projected::{
-    Anisotropy2D, BinomialProjectedKrigingModel, ProjectedBinomialObservation, ProjectedCoord,
-    ProjectedDataset, ProjectedKrigingModel,
-};
-use crate::spacetime::coord::SpaceTimeCoord;
-use crate::spacetime::dataset::SpaceTimeDataset;
-use crate::spacetime::kriging::binomial::{
-    SpaceTimeBinomialKrigingModel, SpaceTimeBinomialObservation,
-};
-use crate::spacetime::kriging::ordinary::SpaceTimeOrdinaryKrigingModel;
-use crate::spacetime::kriging::simple::SpaceTimeSimpleKrigingModel;
-use crate::spacetime::kriging::universal::{
-    SpaceTimeUniversalKrigingModel, SpaceTimeUniversalTrend,
-};
-use crate::spacetime::metric::{SpatialBasis, SpatialMetric};
-use crate::spacetime::variogram::SpaceTimeVariogram;
-use crate::utils::{logistic, logit_clamped};
-use crate::variogram::models::VariogramModel;
 
 /// A single cross-validation residual.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -140,341 +113,6 @@ impl CvSummary {
 }
 
 // ---------------------------------------------------------------------------
-// Shared fold iteration
-// ---------------------------------------------------------------------------
-
-fn validate_len(n_coords: usize, n_values: usize) -> Result<(), KrigingError> {
-    if n_coords != n_values {
-        return Err(KrigingError::DimensionMismatch(format!(
-            "coords ({n_coords}) and values ({n_values}) must have equal length"
-        )));
-    }
-    if n_coords < 2 {
-        return Err(KrigingError::InsufficientData(2));
-    }
-    Ok(())
-}
-
-fn validate_k(n: usize, k: usize) -> Result<(), KrigingError> {
-    if k < 2 || k > n {
-        return Err(KrigingError::InvalidInput(format!(
-            "k must satisfy 2 <= k <= n (n={n}, k={k})"
-        )));
-    }
-    Ok(())
-}
-
-/// Run a function once per leave-one-out fold: for each held-out index `i`, the closure
-/// receives the complement indices as `train` and the singleton `[i]` as `test`. Indices
-/// are pushed in the natural `0..n` order.
-fn for_each_loo_fold<F>(n: usize, mut body: F) -> Result<(), KrigingError>
-where
-    F: FnMut(&[usize], &[usize]) -> Result<(), KrigingError>,
-{
-    let mut train = Vec::with_capacity(n.saturating_sub(1));
-    for i in 0..n {
-        train.clear();
-        for j in 0..n {
-            if j != i {
-                train.push(j);
-            }
-        }
-        let test = [i];
-        body(&train, &test)?;
-    }
-    Ok(())
-}
-
-/// Run a function once per k-fold, with deterministic round-robin assignment
-/// (station `i` goes to fold `i % k`). The closure receives the train and test indices
-/// for each fold.
-fn for_each_k_fold<F>(n: usize, k: usize, mut body: F) -> Result<(), KrigingError>
-where
-    F: FnMut(&[usize], &[usize]) -> Result<(), KrigingError>,
-{
-    let mut train = Vec::new();
-    let mut test = Vec::new();
-    for fold in 0..k {
-        train.clear();
-        test.clear();
-        for i in 0..n {
-            if i % k == fold {
-                test.push(i);
-            } else {
-                train.push(i);
-            }
-        }
-        if train.is_empty() || test.is_empty() {
-            continue;
-        }
-        body(&train, &test)?;
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Ordinary kriging CV
-// ---------------------------------------------------------------------------
-
-/// Leave-one-out cross-validation: for each station `i`, fit an ordinary kriging model on
-/// the remaining `n − 1` stations and predict station `i`. Returns residuals in input order.
-///
-/// Requires at least 2 stations. `O(n)` model builds — suitable for small-to-moderate `n`.
-pub fn leave_one_out(
-    coords: &[GeoCoord],
-    values: &[Real],
-    variogram: VariogramModel,
-) -> Result<Vec<CvResidual>, KrigingError> {
-    validate_len(coords.len(), values.len())?;
-    let n = coords.len();
-    let mut out = Vec::with_capacity(n);
-    for_each_loo_fold(n, |train, test| {
-        let i = test[0];
-        let fold_coords: Vec<GeoCoord> = train.iter().map(|&j| coords[j]).collect();
-        let fold_values: Vec<Real> = train.iter().map(|&j| values[j]).collect();
-        let dataset = GeoDataset::new(fold_coords, fold_values)?;
-        let model = OrdinaryKrigingModel::new(dataset, variogram)?;
-        let pred = model.predict(coords[i])?;
-        out.push(CvResidual {
-            index: i,
-            observed: values[i],
-            predicted: pred.value,
-            variance: pred.variance,
-        });
-        Ok(())
-    })?;
-    Ok(out)
-}
-
-/// K-fold cross-validation over ordinary kriging. See module-level docs for fold assignment.
-pub fn k_fold(
-    coords: &[GeoCoord],
-    values: &[Real],
-    variogram: VariogramModel,
-    k: usize,
-) -> Result<Vec<CvResidual>, KrigingError> {
-    validate_len(coords.len(), values.len())?;
-    let n = coords.len();
-    validate_k(n, k)?;
-    let mut results: Vec<Option<CvResidual>> = vec![None; n];
-    for_each_k_fold(n, k, |train, test| {
-        let fold_coords: Vec<GeoCoord> = train.iter().map(|&j| coords[j]).collect();
-        let fold_values: Vec<Real> = train.iter().map(|&j| values[j]).collect();
-        let dataset = GeoDataset::new(fold_coords, fold_values)?;
-        let model = OrdinaryKrigingModel::new(dataset, variogram)?;
-        let test_coords: Vec<GeoCoord> = test.iter().map(|&j| coords[j]).collect();
-        let preds = model.predict_batch(&test_coords)?;
-        for (&idx, pred) in test.iter().zip(preds.iter()) {
-            results[idx] = Some(CvResidual {
-                index: idx,
-                observed: values[idx],
-                predicted: pred.value,
-                variance: pred.variance,
-            });
-        }
-        Ok(())
-    })?;
-    Ok(results.into_iter().flatten().collect())
-}
-
-// ---------------------------------------------------------------------------
-// Simple kriging CV (known mean)
-// ---------------------------------------------------------------------------
-
-/// Leave-one-out CV for [`SimpleKrigingModel`]. The supplied `mean` is treated as known
-/// (same value for every fold) — this matches how simple kriging is used in practice and
-/// keeps the CV cost proportional to one system solve per fold.
-pub fn leave_one_out_simple(
-    coords: &[GeoCoord],
-    values: &[Real],
-    variogram: VariogramModel,
-    mean: Real,
-) -> Result<Vec<CvResidual>, KrigingError> {
-    validate_len(coords.len(), values.len())?;
-    let n = coords.len();
-    let mut out = Vec::with_capacity(n);
-    for_each_loo_fold(n, |train, test| {
-        let i = test[0];
-        let fold_coords: Vec<GeoCoord> = train.iter().map(|&j| coords[j]).collect();
-        let fold_values: Vec<Real> = train.iter().map(|&j| values[j]).collect();
-        let dataset = GeoDataset::new(fold_coords, fold_values)?;
-        let model = SimpleKrigingModel::new(dataset, variogram, mean)?;
-        let pred = model.predict(coords[i])?;
-        out.push(CvResidual {
-            index: i,
-            observed: values[i],
-            predicted: pred.value,
-            variance: pred.variance,
-        });
-        Ok(())
-    })?;
-    Ok(out)
-}
-
-/// K-fold CV for [`SimpleKrigingModel`]. See [`leave_one_out_simple`] for mean semantics.
-pub fn k_fold_simple(
-    coords: &[GeoCoord],
-    values: &[Real],
-    variogram: VariogramModel,
-    mean: Real,
-    k: usize,
-) -> Result<Vec<CvResidual>, KrigingError> {
-    validate_len(coords.len(), values.len())?;
-    let n = coords.len();
-    validate_k(n, k)?;
-    let mut results: Vec<Option<CvResidual>> = vec![None; n];
-    for_each_k_fold(n, k, |train, test| {
-        let fold_coords: Vec<GeoCoord> = train.iter().map(|&j| coords[j]).collect();
-        let fold_values: Vec<Real> = train.iter().map(|&j| values[j]).collect();
-        let dataset = GeoDataset::new(fold_coords, fold_values)?;
-        let model = SimpleKrigingModel::new(dataset, variogram, mean)?;
-        let test_coords: Vec<GeoCoord> = test.iter().map(|&j| coords[j]).collect();
-        let preds = model.predict_batch(&test_coords)?;
-        for (&idx, pred) in test.iter().zip(preds.iter()) {
-            results[idx] = Some(CvResidual {
-                index: idx,
-                observed: values[idx],
-                predicted: pred.value,
-                variance: pred.variance,
-            });
-        }
-        Ok(())
-    })?;
-    Ok(results.into_iter().flatten().collect())
-}
-
-// ---------------------------------------------------------------------------
-// Universal kriging CV (polynomial drift)
-// ---------------------------------------------------------------------------
-
-/// Leave-one-out CV for [`UniversalKrigingModel`] with the given drift basis. Drift
-/// coefficients are re-estimated inside each fold from the training stations, so there is
-/// no in-sample leakage from the drift.
-pub fn leave_one_out_universal(
-    coords: &[GeoCoord],
-    values: &[Real],
-    variogram: VariogramModel,
-    trend: UniversalTrend,
-) -> Result<Vec<CvResidual>, KrigingError> {
-    validate_len(coords.len(), values.len())?;
-    let n = coords.len();
-    let mut out = Vec::with_capacity(n);
-    for_each_loo_fold(n, |train, test| {
-        let i = test[0];
-        let fold_coords: Vec<GeoCoord> = train.iter().map(|&j| coords[j]).collect();
-        let fold_values: Vec<Real> = train.iter().map(|&j| values[j]).collect();
-        let dataset = GeoDataset::new(fold_coords, fold_values)?;
-        let model = UniversalKrigingModel::new(dataset, variogram, trend)?;
-        let pred = model.predict(coords[i])?;
-        out.push(CvResidual {
-            index: i,
-            observed: values[i],
-            predicted: pred.value,
-            variance: pred.variance,
-        });
-        Ok(())
-    })?;
-    Ok(out)
-}
-
-/// K-fold CV for [`UniversalKrigingModel`] with the given drift basis.
-pub fn k_fold_universal(
-    coords: &[GeoCoord],
-    values: &[Real],
-    variogram: VariogramModel,
-    trend: UniversalTrend,
-    k: usize,
-) -> Result<Vec<CvResidual>, KrigingError> {
-    validate_len(coords.len(), values.len())?;
-    let n = coords.len();
-    validate_k(n, k)?;
-    let mut results: Vec<Option<CvResidual>> = vec![None; n];
-    for_each_k_fold(n, k, |train, test| {
-        let fold_coords: Vec<GeoCoord> = train.iter().map(|&j| coords[j]).collect();
-        let fold_values: Vec<Real> = train.iter().map(|&j| values[j]).collect();
-        let dataset = GeoDataset::new(fold_coords, fold_values)?;
-        let model = UniversalKrigingModel::new(dataset, variogram, trend)?;
-        let test_coords: Vec<GeoCoord> = test.iter().map(|&j| coords[j]).collect();
-        let preds = model.predict_batch(&test_coords)?;
-        for (&idx, pred) in test.iter().zip(preds.iter()) {
-            results[idx] = Some(CvResidual {
-                index: idx,
-                observed: values[idx],
-                predicted: pred.value,
-                variance: pred.variance,
-            });
-        }
-        Ok(())
-    })?;
-    Ok(results.into_iter().flatten().collect())
-}
-
-// ---------------------------------------------------------------------------
-// Projected kriging CV (planar, optional 2-D anisotropy)
-// ---------------------------------------------------------------------------
-
-/// Leave-one-out CV for [`ProjectedKrigingModel`]. Coordinates are planar `(x, y)`;
-/// Euclidean distances (optionally anisotropy-deformed) are used inside each fold.
-pub fn leave_one_out_projected(
-    coords: &[ProjectedCoord],
-    values: &[Real],
-    variogram: VariogramModel,
-    anisotropy: Anisotropy2D,
-) -> Result<Vec<CvResidual>, KrigingError> {
-    validate_len(coords.len(), values.len())?;
-    let n = coords.len();
-    let mut out = Vec::with_capacity(n);
-    for_each_loo_fold(n, |train, test| {
-        let i = test[0];
-        let fold_coords: Vec<ProjectedCoord> = train.iter().map(|&j| coords[j]).collect();
-        let fold_values: Vec<Real> = train.iter().map(|&j| values[j]).collect();
-        let dataset = ProjectedDataset::new(fold_coords, fold_values)?;
-        let model = ProjectedKrigingModel::new(dataset, variogram, anisotropy)?;
-        let pred = model.predict(coords[i])?;
-        out.push(CvResidual {
-            index: i,
-            observed: values[i],
-            predicted: pred.value,
-            variance: pred.variance,
-        });
-        Ok(())
-    })?;
-    Ok(out)
-}
-
-/// K-fold CV for [`ProjectedKrigingModel`]. See [`leave_one_out_projected`] for coord semantics.
-pub fn k_fold_projected(
-    coords: &[ProjectedCoord],
-    values: &[Real],
-    variogram: VariogramModel,
-    anisotropy: Anisotropy2D,
-    k: usize,
-) -> Result<Vec<CvResidual>, KrigingError> {
-    validate_len(coords.len(), values.len())?;
-    let n = coords.len();
-    validate_k(n, k)?;
-    let mut results: Vec<Option<CvResidual>> = vec![None; n];
-    for_each_k_fold(n, k, |train, test| {
-        let fold_coords: Vec<ProjectedCoord> = train.iter().map(|&j| coords[j]).collect();
-        let fold_values: Vec<Real> = train.iter().map(|&j| values[j]).collect();
-        let dataset = ProjectedDataset::new(fold_coords, fold_values)?;
-        let model = ProjectedKrigingModel::new(dataset, variogram, anisotropy)?;
-        let test_coords: Vec<ProjectedCoord> = test.iter().map(|&j| coords[j]).collect();
-        let preds = model.predict_batch(&test_coords)?;
-        for (&idx, pred) in test.iter().zip(preds.iter()) {
-            results[idx] = Some(CvResidual {
-                index: idx,
-                observed: values[idx],
-                predicted: pred.value,
-                variance: pred.variance,
-            });
-        }
-        Ok(())
-    })?;
-    Ok(results.into_iter().flatten().collect())
-}
-
-// ---------------------------------------------------------------------------
 // Binomial kriging CV (reports BOTH logit and prevalence scales)
 // ---------------------------------------------------------------------------
 
@@ -522,6 +160,23 @@ impl BinomialCvResidual {
     }
 }
 
+/// One calibration bin for prevalence-scale CV: stations whose **predicted** prevalence
+/// falls in `[predicted_lo, predicted_hi)` (last bin includes the upper endpoint at 1).
+///
+/// `pooled_observed_prevalence` is `sum(successes) / sum(trials)` over stations in the bin
+/// (trial-weighted). Empty bins report `n_stations == 0` and `NaN` means.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrevalenceCalibrationBin {
+    pub bin_index: usize,
+    pub predicted_lo: Real,
+    pub predicted_hi: Real,
+    pub n_stations: usize,
+    pub sum_trials: u64,
+    pub sum_successes: u64,
+    pub mean_predicted: Real,
+    pub pooled_observed_prevalence: Real,
+}
+
 /// Aggregate summary for binomial CV, reported on **both** scales.
 ///
 /// - `n` — total residuals (including any with `trials == 0`).
@@ -529,13 +184,24 @@ impl BinomialCvResidual {
 ///   `logit` / `prevalence`.
 /// - `logit` — summary statistics on the logit scale (bias / RMSE / MSDR).
 /// - `prevalence` — summary statistics on the prevalence scale.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// - `brier` — mean squared error `(ŷ − y)²` over evaluated stations, one term per station
+///   (`y = successes / trials`). `NaN` when `n_evaluated == 0`.
+/// - `log_score_per_trial` — trial-weighted mean log predictive mass
+///   `(∑ᵢ sᵢ log ŷᵢ + (nᵢ−sᵢ) log(1−ŷᵢ)) / (∑ᵢ nᵢ)` with `ŷ` clamped to `(ε, 1−ε)` for
+///   stability. Higher is better (larger log-likelihood per trial). `NaN` when no trials.
+/// - `calibration_bins` — ten equal-width bins on predicted prevalence in `[0, 1]`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BinomialCvSummary {
     pub n: usize,
     pub n_evaluated: usize,
     pub logit: CvSummary,
     pub prevalence: CvSummary,
+    pub brier: Real,
+    pub log_score_per_trial: Real,
+    pub calibration_bins: Vec<PrevalenceCalibrationBin>,
 }
+
+const PREVALENCE_CALIBRATION_BIN_COUNT: usize = 10;
 
 impl BinomialCvSummary {
     pub fn from_residuals(residuals: &[BinomialCvResidual]) -> Self {
@@ -553,561 +219,113 @@ impl BinomialCvSummary {
                 .iter()
                 .map(|r| (r.prevalence_error(), r.prevalence_variance)),
         );
+        let eps = (1e-12 as Real).max(Real::EPSILON * 8.0);
+        let mut sum_brier = 0.0 as Real;
+        let mut n_brier = 0usize;
+        let mut sum_ll = 0.0 as Real;
+        let mut sum_trials_w = 0u64;
+
+        let mut bin_n = [0usize; PREVALENCE_CALIBRATION_BIN_COUNT];
+        let mut bin_sum_pred = [0.0 as Real; PREVALENCE_CALIBRATION_BIN_COUNT];
+        let mut bin_sum_s = [0u64; PREVALENCE_CALIBRATION_BIN_COUNT];
+        let mut bin_sum_t = [0u64; PREVALENCE_CALIBRATION_BIN_COUNT];
+
+        for r in residuals {
+            if r.trials == 0 {
+                continue;
+            }
+            let y = r.observed_prevalence;
+            let p_hat = r.predicted_prevalence;
+            sum_brier += (p_hat - y) * (p_hat - y);
+            n_brier += 1;
+
+            let pc = p_hat.clamp(eps, 1.0 - eps);
+            let s = r.successes as Real;
+            let nt = r.trials as Real;
+            sum_ll += s * pc.ln() + (nt - s) * (1.0 - pc).ln();
+            sum_trials_w += r.trials as u64;
+
+            let p_bin = p_hat.clamp(0.0 as Real, 1.0 as Real);
+            let mut k = (p_bin * PREVALENCE_CALIBRATION_BIN_COUNT as Real).floor() as usize;
+            if k >= PREVALENCE_CALIBRATION_BIN_COUNT {
+                k = PREVALENCE_CALIBRATION_BIN_COUNT - 1;
+            }
+            bin_n[k] += 1;
+            bin_sum_pred[k] += p_hat;
+            bin_sum_s[k] += r.successes as u64;
+            bin_sum_t[k] += r.trials as u64;
+        }
+
+        let brier = if n_brier > 0 {
+            sum_brier / n_brier as Real
+        } else {
+            Real::NAN
+        };
+        let log_score_per_trial = if sum_trials_w > 0 {
+            sum_ll / sum_trials_w as Real
+        } else {
+            Real::NAN
+        };
+
+        let mut calibration_bins = Vec::with_capacity(PREVALENCE_CALIBRATION_BIN_COUNT);
+        for i in 0..PREVALENCE_CALIBRATION_BIN_COUNT {
+            let predicted_lo = i as Real / PREVALENCE_CALIBRATION_BIN_COUNT as Real;
+            let predicted_hi = if i + 1 == PREVALENCE_CALIBRATION_BIN_COUNT {
+                1.0 as Real
+            } else {
+                (i + 1) as Real / PREVALENCE_CALIBRATION_BIN_COUNT as Real
+            };
+            let ns = bin_n[i];
+            let mean_predicted = if ns > 0 {
+                bin_sum_pred[i] / ns as Real
+            } else {
+                Real::NAN
+            };
+            let st = bin_sum_t[i];
+            let pooled_observed_prevalence = if st > 0 {
+                bin_sum_s[i] as Real / st as Real
+            } else {
+                Real::NAN
+            };
+            calibration_bins.push(PrevalenceCalibrationBin {
+                bin_index: i,
+                predicted_lo,
+                predicted_hi,
+                n_stations: ns,
+                sum_trials: st,
+                sum_successes: bin_sum_s[i],
+                mean_predicted,
+                pooled_observed_prevalence,
+            });
+        }
+
         Self {
             n,
             n_evaluated,
             logit,
             prevalence,
+            brier,
+            log_score_per_trial,
+            calibration_bins,
         }
     }
 }
 
-fn observed_logit_and_prevalence(successes: u32, trials: u32) -> (Real, Real) {
-    if trials == 0 {
-        (Real::NAN, Real::NAN)
-    } else {
-        let p = successes as Real / trials as Real;
-        // `logit_clamped` applies the same `(ε, 1−ε)` clamp used by binomial model training,
-        // so the observed-vs-predicted scale is consistent when `successes` equals `0` or
-        // `trials`. `observed_prevalence` itself is reported *unclamped* so users can see the
-        // raw proportion.
-        (logit_clamped(p), p)
-    }
-}
-
-fn delta_prevalence_variance(prevalence: Real, logit_variance: Real) -> Real {
-    let factor = prevalence * (1.0 - prevalence);
-    factor * factor * logit_variance.max(0.0)
-}
-
-fn make_binomial_residual(
-    index: usize,
-    successes: u32,
-    trials: u32,
-    predicted_logit: Real,
-    logit_variance: Real,
-) -> BinomialCvResidual {
-    let (observed_logit, observed_prevalence) = observed_logit_and_prevalence(successes, trials);
-    let predicted_prevalence = logistic(predicted_logit);
-    let prevalence_variance = delta_prevalence_variance(predicted_prevalence, logit_variance);
-    BinomialCvResidual {
-        index,
-        successes,
-        trials,
-        observed_logit,
-        predicted_logit,
-        logit_variance,
-        observed_prevalence,
-        predicted_prevalence,
-        prevalence_variance,
-    }
-}
-
-fn build_binomial_observations(
-    coords: &[GeoCoord],
-    successes: &[u32],
-    trials: &[u32],
-    indices: &[usize],
-) -> Result<Vec<BinomialObservation>, KrigingError> {
-    indices
-        .iter()
-        .filter(|&&i| trials[i] > 0)
-        .map(|&i| BinomialObservation::new(coords[i], successes[i], trials[i]))
-        .collect()
-}
-
-fn validate_binomial_lengths(
-    n_coords: usize,
-    n_successes: usize,
-    n_trials: usize,
-) -> Result<(), KrigingError> {
-    if n_coords != n_successes || n_coords != n_trials {
-        return Err(KrigingError::DimensionMismatch(format!(
-            "coords ({n_coords}), successes ({n_successes}), and trials ({n_trials}) must have equal length"
-        )));
-    }
-    if n_coords < 2 {
-        return Err(KrigingError::InsufficientData(2));
-    }
-    Ok(())
-}
-
-/// Leave-one-out CV for [`BinomialKrigingModel`]. Returns [`BinomialCvResidual`] with both
-/// logit- and prevalence-scale residuals. Held-out stations with `trials == 0` contribute
-/// a residual whose *observed* fields are `NaN` (predictions still populated); downstream
-/// summarization via [`BinomialCvSummary`] skips them.
-///
-/// Training folds drop stations with `trials == 0` (the underlying model requires
-/// `trials > 0`), so those stations never participate in any training fold either.
-pub fn leave_one_out_binomial(
-    coords: &[GeoCoord],
-    successes: &[u32],
-    trials: &[u32],
-    variogram: VariogramModel,
-    prior: BinomialPrior,
-) -> Result<Vec<BinomialCvResidual>, KrigingError> {
-    validate_binomial_lengths(coords.len(), successes.len(), trials.len())?;
-    let n = coords.len();
-    let mut out = Vec::with_capacity(n);
-    for_each_loo_fold(n, |train, test| {
-        let i = test[0];
-        let observations = build_binomial_observations(coords, successes, trials, train)?;
-        if observations.len() < 2 {
-            return Err(KrigingError::InsufficientData(2));
-        }
-        let model =
-            BinomialKrigingModel::new_with_prior(observations, variogram, prior)?.into_model();
-        let pred = model.predict(coords[i])?;
-        out.push(make_binomial_residual(
-            i,
-            successes[i],
-            trials[i],
-            pred.logit_value,
-            pred.variance,
-        ));
-        Ok(())
-    })?;
-    Ok(out)
-}
-
-/// K-fold CV for [`BinomialKrigingModel`]. See [`leave_one_out_binomial`] for semantics.
-pub fn k_fold_binomial(
-    coords: &[GeoCoord],
-    successes: &[u32],
-    trials: &[u32],
-    variogram: VariogramModel,
-    prior: BinomialPrior,
-    k: usize,
-) -> Result<Vec<BinomialCvResidual>, KrigingError> {
-    validate_binomial_lengths(coords.len(), successes.len(), trials.len())?;
-    let n = coords.len();
-    validate_k(n, k)?;
-    let mut results: Vec<Option<BinomialCvResidual>> = vec![None; n];
-    for_each_k_fold(n, k, |train, test| {
-        let observations = build_binomial_observations(coords, successes, trials, train)?;
-        if observations.len() < 2 {
-            return Err(KrigingError::InsufficientData(2));
-        }
-        let model =
-            BinomialKrigingModel::new_with_prior(observations, variogram, prior)?.into_model();
-        let test_coords: Vec<GeoCoord> = test.iter().map(|&j| coords[j]).collect();
-        let preds = model.predict_batch(&test_coords)?;
-        for (&idx, pred) in test.iter().zip(preds.iter()) {
-            results[idx] = Some(make_binomial_residual(
-                idx,
-                successes[idx],
-                trials[idx],
-                pred.logit_value,
-                pred.variance,
-            ));
-        }
-        Ok(())
-    })?;
-    Ok(results.into_iter().flatten().collect())
-}
-
-// ---------------------------------------------------------------------------
-// Binomial projected kriging CV (planar / anisotropic)
-// ---------------------------------------------------------------------------
-
-fn build_projected_binomial_observations(
-    coords: &[ProjectedCoord],
-    successes: &[u32],
-    trials: &[u32],
-    indices: &[usize],
-) -> Result<Vec<ProjectedBinomialObservation>, KrigingError> {
-    indices
-        .iter()
-        .filter(|&&i| trials[i] > 0)
-        .map(|&i| ProjectedBinomialObservation::new(coords[i], successes[i], trials[i]))
-        .collect()
-}
-
-fn validate_projected_binomial_lengths(
-    n_coords: usize,
-    n_successes: usize,
-    n_trials: usize,
-) -> Result<(), KrigingError> {
-    if n_coords != n_successes || n_successes != n_trials {
-        return Err(KrigingError::DimensionMismatch(format!(
-            "binomial projected CV: coords ({}), successes ({}), trials ({}) must match",
-            n_coords, n_successes, n_trials
-        )));
-    }
-    Ok(())
-}
-
-/// Leave-one-out CV for [`BinomialProjectedKrigingModel`]. Returns
-/// [`BinomialCvResidual`]s with both logit- and prevalence-scale residuals,
-/// matching the geographic [`leave_one_out_binomial`] semantics. Stations with
-/// `trials == 0` produce residuals whose observed fields are `NaN` and never
-/// participate in any training fold.
-pub fn leave_one_out_binomial_projected(
-    coords: &[ProjectedCoord],
-    successes: &[u32],
-    trials: &[u32],
-    variogram: VariogramModel,
-    anisotropy: Anisotropy2D,
-    prior: BinomialPrior,
-) -> Result<Vec<BinomialCvResidual>, KrigingError> {
-    validate_projected_binomial_lengths(coords.len(), successes.len(), trials.len())?;
-    let n = coords.len();
-    let mut out = Vec::with_capacity(n);
-    for_each_loo_fold(n, |train, test| {
-        let i = test[0];
-        let observations = build_projected_binomial_observations(coords, successes, trials, train)?;
-        if observations.len() < 2 {
-            return Err(KrigingError::InsufficientData(2));
-        }
-        let model = BinomialProjectedKrigingModel::new_with_prior(
-            observations,
-            variogram,
-            anisotropy,
-            prior,
-        )?
-        .into_model();
-        let pred = model.predict(coords[i])?;
-        out.push(make_binomial_residual(
-            i,
-            successes[i],
-            trials[i],
-            pred.logit_value,
-            pred.variance,
-        ));
-        Ok(())
-    })?;
-    Ok(out)
-}
-
-/// K-fold CV for [`BinomialProjectedKrigingModel`]. See
-/// [`leave_one_out_binomial_projected`] for fold semantics.
-pub fn k_fold_binomial_projected(
-    coords: &[ProjectedCoord],
-    successes: &[u32],
-    trials: &[u32],
-    variogram: VariogramModel,
-    anisotropy: Anisotropy2D,
-    prior: BinomialPrior,
-    k: usize,
-) -> Result<Vec<BinomialCvResidual>, KrigingError> {
-    validate_projected_binomial_lengths(coords.len(), successes.len(), trials.len())?;
-    let n = coords.len();
-    validate_k(n, k)?;
-    let mut results: Vec<Option<BinomialCvResidual>> = vec![None; n];
-    for_each_k_fold(n, k, |train, test| {
-        let observations = build_projected_binomial_observations(coords, successes, trials, train)?;
-        if observations.len() < 2 {
-            return Err(KrigingError::InsufficientData(2));
-        }
-        let model = BinomialProjectedKrigingModel::new_with_prior(
-            observations,
-            variogram,
-            anisotropy,
-            prior,
-        )?
-        .into_model();
-        let test_coords: Vec<ProjectedCoord> = test.iter().map(|&j| coords[j]).collect();
-        let preds = model.predict_batch(&test_coords)?;
-        for (&idx, pred) in test.iter().zip(preds.iter()) {
-            results[idx] = Some(make_binomial_residual(
-                idx,
-                successes[idx],
-                trials[idx],
-                pred.logit_value,
-                pred.variance,
-            ));
-        }
-        Ok(())
-    })?;
-    Ok(results.into_iter().flatten().collect())
-}
-
-// ---------------------------------------------------------------------------
-// Space–time kriging CV
-// ---------------------------------------------------------------------------
-
-fn build_st_binomial_observations<C: Copy>(
-    coords: &[SpaceTimeCoord<C>],
-    successes: &[u32],
-    trials: &[u32],
-    indices: &[usize],
-) -> Result<Vec<SpaceTimeBinomialObservation<C>>, KrigingError> {
-    indices
-        .iter()
-        .filter(|&&i| trials[i] > 0)
-        .map(|&i| SpaceTimeBinomialObservation::new(coords[i], successes[i], trials[i]))
-        .collect()
-}
-
-/// Leave-one-out CV for [`SpaceTimeOrdinaryKrigingModel`]. Generic over
-/// [`SpatialMetric`] so the same routine serves geographic
-/// ([`GeoMetric`](crate::spacetime::GeoMetric)) and projected
-/// ([`ProjectedMetric`](crate::spacetime::ProjectedMetric)) data.
-pub fn leave_one_out_spacetime<M: SpatialMetric>(
-    metric: M,
-    coords: &[SpaceTimeCoord<M::Coord>],
-    values: &[Real],
-    variogram: SpaceTimeVariogram,
-) -> Result<Vec<CvResidual>, KrigingError> {
-    validate_len(coords.len(), values.len())?;
-    let n = coords.len();
-    let mut out = Vec::with_capacity(n);
-    for_each_loo_fold(n, |train, test| {
-        let i = test[0];
-        let fold_coords: Vec<SpaceTimeCoord<M::Coord>> = train.iter().map(|&j| coords[j]).collect();
-        let fold_values: Vec<Real> = train.iter().map(|&j| values[j]).collect();
-        let dataset = SpaceTimeDataset::new(fold_coords, fold_values)?;
-        let model = SpaceTimeOrdinaryKrigingModel::new(metric, dataset, variogram)?;
-        let pred = model.predict(coords[i])?;
-        out.push(CvResidual {
-            index: i,
-            observed: values[i],
-            predicted: pred.value,
-            variance: pred.variance,
-        });
-        Ok(())
-    })?;
-    Ok(out)
-}
-
-/// K-fold CV for [`SpaceTimeOrdinaryKrigingModel`]. See module-level docs for fold assignment.
-pub fn k_fold_spacetime<M: SpatialMetric>(
-    metric: M,
-    coords: &[SpaceTimeCoord<M::Coord>],
-    values: &[Real],
-    variogram: SpaceTimeVariogram,
-    k: usize,
-) -> Result<Vec<CvResidual>, KrigingError> {
-    validate_len(coords.len(), values.len())?;
-    let n = coords.len();
-    validate_k(n, k)?;
-    let mut results: Vec<Option<CvResidual>> = vec![None; n];
-    for_each_k_fold(n, k, |train, test| {
-        let fold_coords: Vec<SpaceTimeCoord<M::Coord>> = train.iter().map(|&j| coords[j]).collect();
-        let fold_values: Vec<Real> = train.iter().map(|&j| values[j]).collect();
-        let dataset = SpaceTimeDataset::new(fold_coords, fold_values)?;
-        let model = SpaceTimeOrdinaryKrigingModel::new(metric, dataset, variogram)?;
-        let test_coords: Vec<SpaceTimeCoord<M::Coord>> = test.iter().map(|&j| coords[j]).collect();
-        let preds = model.predict_batch(&test_coords)?;
-        for (&idx, pred) in test.iter().zip(preds.iter()) {
-            results[idx] = Some(CvResidual {
-                index: idx,
-                observed: values[idx],
-                predicted: pred.value,
-                variance: pred.variance,
-            });
-        }
-        Ok(())
-    })?;
-    Ok(results.into_iter().flatten().collect())
-}
-
-/// Leave-one-out CV for [`SpaceTimeSimpleKrigingModel`]. The supplied `mean` is treated as
-/// known (same value for every fold).
-pub fn leave_one_out_spacetime_simple<M: SpatialMetric>(
-    metric: M,
-    coords: &[SpaceTimeCoord<M::Coord>],
-    values: &[Real],
-    variogram: SpaceTimeVariogram,
-    mean: Real,
-) -> Result<Vec<CvResidual>, KrigingError> {
-    validate_len(coords.len(), values.len())?;
-    let n = coords.len();
-    let mut out = Vec::with_capacity(n);
-    for_each_loo_fold(n, |train, test| {
-        let i = test[0];
-        let fold_coords: Vec<SpaceTimeCoord<M::Coord>> = train.iter().map(|&j| coords[j]).collect();
-        let fold_values: Vec<Real> = train.iter().map(|&j| values[j]).collect();
-        let dataset = SpaceTimeDataset::new(fold_coords, fold_values)?;
-        let model = SpaceTimeSimpleKrigingModel::new(metric, dataset, variogram, mean)?;
-        let pred = model.predict(coords[i])?;
-        out.push(CvResidual {
-            index: i,
-            observed: values[i],
-            predicted: pred.value,
-            variance: pred.variance,
-        });
-        Ok(())
-    })?;
-    Ok(out)
-}
-
-/// K-fold CV for [`SpaceTimeSimpleKrigingModel`].
-pub fn k_fold_spacetime_simple<M: SpatialMetric>(
-    metric: M,
-    coords: &[SpaceTimeCoord<M::Coord>],
-    values: &[Real],
-    variogram: SpaceTimeVariogram,
-    mean: Real,
-    k: usize,
-) -> Result<Vec<CvResidual>, KrigingError> {
-    validate_len(coords.len(), values.len())?;
-    let n = coords.len();
-    validate_k(n, k)?;
-    let mut results: Vec<Option<CvResidual>> = vec![None; n];
-    for_each_k_fold(n, k, |train, test| {
-        let fold_coords: Vec<SpaceTimeCoord<M::Coord>> = train.iter().map(|&j| coords[j]).collect();
-        let fold_values: Vec<Real> = train.iter().map(|&j| values[j]).collect();
-        let dataset = SpaceTimeDataset::new(fold_coords, fold_values)?;
-        let model = SpaceTimeSimpleKrigingModel::new(metric, dataset, variogram, mean)?;
-        let test_coords: Vec<SpaceTimeCoord<M::Coord>> = test.iter().map(|&j| coords[j]).collect();
-        let preds = model.predict_batch(&test_coords)?;
-        for (&idx, pred) in test.iter().zip(preds.iter()) {
-            results[idx] = Some(CvResidual {
-                index: idx,
-                observed: values[idx],
-                predicted: pred.value,
-                variance: pred.variance,
-            });
-        }
-        Ok(())
-    })?;
-    Ok(results.into_iter().flatten().collect())
-}
-
-/// Leave-one-out CV for [`SpaceTimeUniversalKrigingModel`]. Drift coefficients are
-/// re-estimated inside each fold so there is no in-sample leakage from the trend.
-pub fn leave_one_out_spacetime_universal<M: SpatialBasis>(
-    metric: M,
-    coords: &[SpaceTimeCoord<M::Coord>],
-    values: &[Real],
-    variogram: SpaceTimeVariogram,
-    trend: SpaceTimeUniversalTrend,
-) -> Result<Vec<CvResidual>, KrigingError> {
-    validate_len(coords.len(), values.len())?;
-    let n = coords.len();
-    let mut out = Vec::with_capacity(n);
-    for_each_loo_fold(n, |train, test| {
-        let i = test[0];
-        let fold_coords: Vec<SpaceTimeCoord<M::Coord>> = train.iter().map(|&j| coords[j]).collect();
-        let fold_values: Vec<Real> = train.iter().map(|&j| values[j]).collect();
-        let dataset = SpaceTimeDataset::new(fold_coords, fold_values)?;
-        let model = SpaceTimeUniversalKrigingModel::new(metric, dataset, variogram, trend)?;
-        let pred = model.predict(coords[i])?;
-        out.push(CvResidual {
-            index: i,
-            observed: values[i],
-            predicted: pred.value,
-            variance: pred.variance,
-        });
-        Ok(())
-    })?;
-    Ok(out)
-}
-
-/// K-fold CV for [`SpaceTimeUniversalKrigingModel`].
-pub fn k_fold_spacetime_universal<M: SpatialBasis>(
-    metric: M,
-    coords: &[SpaceTimeCoord<M::Coord>],
-    values: &[Real],
-    variogram: SpaceTimeVariogram,
-    trend: SpaceTimeUniversalTrend,
-    k: usize,
-) -> Result<Vec<CvResidual>, KrigingError> {
-    validate_len(coords.len(), values.len())?;
-    let n = coords.len();
-    validate_k(n, k)?;
-    let mut results: Vec<Option<CvResidual>> = vec![None; n];
-    for_each_k_fold(n, k, |train, test| {
-        let fold_coords: Vec<SpaceTimeCoord<M::Coord>> = train.iter().map(|&j| coords[j]).collect();
-        let fold_values: Vec<Real> = train.iter().map(|&j| values[j]).collect();
-        let dataset = SpaceTimeDataset::new(fold_coords, fold_values)?;
-        let model = SpaceTimeUniversalKrigingModel::new(metric, dataset, variogram, trend)?;
-        let test_coords: Vec<SpaceTimeCoord<M::Coord>> = test.iter().map(|&j| coords[j]).collect();
-        let preds = model.predict_batch(&test_coords)?;
-        for (&idx, pred) in test.iter().zip(preds.iter()) {
-            results[idx] = Some(CvResidual {
-                index: idx,
-                observed: values[idx],
-                predicted: pred.value,
-                variance: pred.variance,
-            });
-        }
-        Ok(())
-    })?;
-    Ok(results.into_iter().flatten().collect())
-}
-
-/// Leave-one-out CV for [`SpaceTimeBinomialKrigingModel`]. Held-out stations with
-/// `trials == 0` contribute a residual whose observed fields are `NaN` (predictions still
-/// populated); downstream summarization via [`BinomialCvSummary`] skips them. Training
-/// folds drop stations with `trials == 0` (the underlying model requires `trials > 0`).
-pub fn leave_one_out_spacetime_binomial<M: SpatialMetric>(
-    metric: M,
-    coords: &[SpaceTimeCoord<M::Coord>],
-    successes: &[u32],
-    trials: &[u32],
-    variogram: SpaceTimeVariogram,
-    prior: BinomialPrior,
-) -> Result<Vec<BinomialCvResidual>, KrigingError> {
-    validate_binomial_lengths(coords.len(), successes.len(), trials.len())?;
-    let n = coords.len();
-    let mut out = Vec::with_capacity(n);
-    for_each_loo_fold(n, |train, test| {
-        let i = test[0];
-        let observations = build_st_binomial_observations(coords, successes, trials, train)?;
-        if observations.len() < 2 {
-            return Err(KrigingError::InsufficientData(2));
-        }
-        let model =
-            SpaceTimeBinomialKrigingModel::new_with_prior(metric, observations, variogram, prior)?
-                .into_model();
-        let pred = model.predict(coords[i])?;
-        out.push(make_binomial_residual(
-            i,
-            successes[i],
-            trials[i],
-            pred.logit_value,
-            pred.variance,
-        ));
-        Ok(())
-    })?;
-    Ok(out)
-}
-
-/// K-fold CV for [`SpaceTimeBinomialKrigingModel`]. See
-/// [`leave_one_out_spacetime_binomial`] for semantics.
-pub fn k_fold_spacetime_binomial<M: SpatialMetric>(
-    metric: M,
-    coords: &[SpaceTimeCoord<M::Coord>],
-    successes: &[u32],
-    trials: &[u32],
-    variogram: SpaceTimeVariogram,
-    prior: BinomialPrior,
-    k: usize,
-) -> Result<Vec<BinomialCvResidual>, KrigingError> {
-    validate_binomial_lengths(coords.len(), successes.len(), trials.len())?;
-    let n = coords.len();
-    validate_k(n, k)?;
-    let mut results: Vec<Option<BinomialCvResidual>> = vec![None; n];
-    for_each_k_fold(n, k, |train, test| {
-        let observations = build_st_binomial_observations(coords, successes, trials, train)?;
-        if observations.len() < 2 {
-            return Err(KrigingError::InsufficientData(2));
-        }
-        let model =
-            SpaceTimeBinomialKrigingModel::new_with_prior(metric, observations, variogram, prior)?
-                .into_model();
-        let test_coords: Vec<SpaceTimeCoord<M::Coord>> = test.iter().map(|&j| coords[j]).collect();
-        let preds = model.predict_batch(&test_coords)?;
-        for (&idx, pred) in test.iter().zip(preds.iter()) {
-            results[idx] = Some(make_binomial_residual(
-                idx,
-                successes[idx],
-                trials[idx],
-                pred.logit_value,
-                pred.variance,
-            ));
-        }
-        Ok(())
-    })?;
-    Ok(results.into_iter().flatten().collect())
-}
+// Generic CV harness — see [`crate::predictor::cv`].
+pub use crate::predictor::cv::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::variogram::models::VariogramType;
+    use crate::distance::GeoCoord;
+    use crate::kriging::binomial::BinomialPrior;
+    use crate::kriging::universal::UniversalTrend;
+    use crate::projected::{Anisotropy2D, ProjectedCoord};
+    use crate::spacetime::coord::SpaceTimeCoord;
+    use crate::spacetime::kriging::universal::SpaceTimeUniversalTrend;
+    use crate::spacetime::variogram::SpaceTimeVariogram;
+    use crate::utils::{logistic, logit_clamped};
+    use crate::variogram::models::{VariogramModel, VariogramType};
 
     fn grid_points() -> (Vec<GeoCoord>, Vec<Real>) {
         // A small 4x4 grid with a smooth linear trend in both coordinates.
@@ -1162,7 +380,12 @@ mod tests {
     fn leave_one_out_returns_one_residual_per_station_in_order() {
         let (coords, values) = grid_points();
         let variogram = VariogramModel::new(0.1, 5.0, 200.0, VariogramType::Exponential).unwrap();
-        let residuals = leave_one_out(&coords, &values, variogram).unwrap();
+        let residuals = leave_one_out_cv(&OrdinaryGeoPredictor {
+            coords: &coords,
+            values: &values,
+            variogram,
+        })
+        .unwrap();
         assert_eq!(residuals.len(), coords.len());
         for (i, r) in residuals.iter().enumerate() {
             assert_eq!(r.index, i);
@@ -1176,7 +399,12 @@ mod tests {
     fn leave_one_out_has_small_rmse_for_smooth_linear_field() {
         let (coords, values) = grid_points();
         let variogram = VariogramModel::new(0.01, 10.0, 500.0, VariogramType::Exponential).unwrap();
-        let residuals = leave_one_out(&coords, &values, variogram).unwrap();
+        let residuals = leave_one_out_cv(&OrdinaryGeoPredictor {
+            coords: &coords,
+            values: &values,
+            variogram,
+        })
+        .unwrap();
         let summary = CvSummary::from_residuals(&residuals);
         assert_eq!(summary.n, coords.len());
         assert!(
@@ -1190,7 +418,15 @@ mod tests {
     fn k_fold_covers_every_station_exactly_once() {
         let (coords, values) = grid_points();
         let variogram = VariogramModel::new(0.1, 5.0, 200.0, VariogramType::Exponential).unwrap();
-        let residuals = k_fold(&coords, &values, variogram, 4).unwrap();
+        let residuals = k_fold_cv(
+            &OrdinaryGeoPredictor {
+                coords: &coords,
+                values: &values,
+                variogram,
+            },
+            4,
+        )
+        .unwrap();
         assert_eq!(residuals.len(), coords.len());
         let mut seen = vec![false; coords.len()];
         for r in &residuals {
@@ -1204,8 +440,28 @@ mod tests {
     fn k_fold_rejects_invalid_k() {
         let (coords, values) = grid_points();
         let variogram = VariogramModel::new(0.1, 5.0, 200.0, VariogramType::Exponential).unwrap();
-        assert!(k_fold(&coords, &values, variogram, 1).is_err());
-        assert!(k_fold(&coords, &values, variogram, coords.len() + 1).is_err());
+        assert!(
+            k_fold_cv(
+                &OrdinaryGeoPredictor {
+                    coords: &coords,
+                    values: &values,
+                    variogram
+                },
+                1
+            )
+            .is_err()
+        );
+        assert!(
+            k_fold_cv(
+                &OrdinaryGeoPredictor {
+                    coords: &coords,
+                    values: &values,
+                    variogram
+                },
+                coords.len() + 1
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1213,7 +469,14 @@ mod tests {
         let coords = vec![GeoCoord::try_new(0.0, 0.0).unwrap()];
         let values = vec![1.0];
         let variogram = VariogramModel::new(0.1, 5.0, 200.0, VariogramType::Exponential).unwrap();
-        assert!(leave_one_out(&coords, &values, variogram).is_err());
+        assert!(
+            leave_one_out_cv(&OrdinaryGeoPredictor {
+                coords: &coords,
+                values: &values,
+                variogram
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -1247,7 +510,13 @@ mod tests {
         let (coords, values) = grid_points();
         let variogram = VariogramModel::new(0.01, 5.0, 300.0, VariogramType::Exponential).unwrap();
         let mean = values.iter().copied().sum::<Real>() / values.len() as Real;
-        let residuals = leave_one_out_simple(&coords, &values, variogram, mean).unwrap();
+        let residuals = leave_one_out_cv(&SimpleGeoPredictor {
+            coords: &coords,
+            values: &values,
+            variogram,
+            mean,
+        })
+        .unwrap();
         assert_eq!(residuals.len(), coords.len());
         for r in &residuals {
             assert!(r.predicted.is_finite());
@@ -1260,7 +529,16 @@ mod tests {
         let (coords, values) = grid_points();
         let variogram = VariogramModel::new(0.1, 5.0, 200.0, VariogramType::Exponential).unwrap();
         let mean = values.iter().copied().sum::<Real>() / values.len() as Real;
-        let residuals = k_fold_simple(&coords, &values, variogram, mean, 4).unwrap();
+        let residuals = k_fold_cv(
+            &SimpleGeoPredictor {
+                coords: &coords,
+                values: &values,
+                variogram,
+                mean,
+            },
+            4,
+        )
+        .unwrap();
         assert_eq!(residuals.len(), coords.len());
         let mut seen = vec![false; coords.len()];
         for r in &residuals {
@@ -1274,13 +552,25 @@ mod tests {
     fn universal_loo_matches_ordinary_for_constant_trend_within_tol() {
         let (coords, values) = grid_points();
         let variogram = VariogramModel::new(0.01, 5.0, 300.0, VariogramType::Exponential).unwrap();
-        let ok = leave_one_out(&coords, &values, variogram).unwrap();
-        let uk =
-            leave_one_out_universal(&coords, &values, variogram, UniversalTrend::Constant).unwrap();
+        let ok = leave_one_out_cv(&OrdinaryGeoPredictor {
+            coords: &coords,
+            values: &values,
+            variogram,
+        })
+        .unwrap();
+        let uk = leave_one_out_cv(&UniversalGeoPredictor {
+            coords: &coords,
+            values: &values,
+            variogram,
+            trend: UniversalTrend::Constant,
+        })
+        .unwrap();
         assert_eq!(ok.len(), uk.len());
         for (a, b) in ok.iter().zip(uk.iter()) {
+            // Dual SPD ordinary kriging (ADR-0001) can differ from bordered LU at the last
+            // few f32 ULPs; constant-trend universal delegates to the ordinary engine.
             assert!(
-                (a.predicted - b.predicted).abs() < 1e-6,
+                (a.predicted - b.predicted).abs() < 5e-6,
                 "constant-trend UK should match OK at station {} (ok={}, uk={})",
                 a.index,
                 a.predicted,
@@ -1293,8 +583,16 @@ mod tests {
     fn universal_k_fold_runs_with_linear_trend() {
         let (coords, values) = grid_points();
         let variogram = VariogramModel::new(0.01, 5.0, 300.0, VariogramType::Exponential).unwrap();
-        let residuals =
-            k_fold_universal(&coords, &values, variogram, UniversalTrend::Linear, 4).unwrap();
+        let residuals = k_fold_cv(
+            &UniversalGeoPredictor {
+                coords: &coords,
+                values: &values,
+                variogram,
+                trend: UniversalTrend::Linear,
+            },
+            4,
+        )
+        .unwrap();
         assert_eq!(residuals.len(), coords.len());
         for r in &residuals {
             assert!(r.predicted.is_finite());
@@ -1308,9 +606,13 @@ mod tests {
         // produce finite residuals and pass structural checks.
         let (coords, values) = projected_grid_points();
         let variogram = VariogramModel::new(0.01, 5.0, 5.0, VariogramType::Exponential).unwrap();
-        let residuals =
-            leave_one_out_projected(&coords, &values, variogram, Anisotropy2D::isotropic())
-                .unwrap();
+        let residuals = leave_one_out_cv(&ProjectedOrdinaryPredictor {
+            coords: &coords,
+            values: &values,
+            variogram,
+            anisotropy: Anisotropy2D::isotropic(),
+        })
+        .unwrap();
         assert_eq!(residuals.len(), coords.len());
         for (i, r) in residuals.iter().enumerate() {
             assert_eq!(r.index, i);
@@ -1323,8 +625,16 @@ mod tests {
     fn projected_k_fold_covers_every_station_exactly_once() {
         let (coords, values) = projected_grid_points();
         let variogram = VariogramModel::new(0.01, 5.0, 5.0, VariogramType::Exponential).unwrap();
-        let residuals =
-            k_fold_projected(&coords, &values, variogram, Anisotropy2D::isotropic(), 4).unwrap();
+        let residuals = k_fold_cv(
+            &ProjectedOrdinaryPredictor {
+                coords: &coords,
+                values: &values,
+                variogram,
+                anisotropy: Anisotropy2D::isotropic(),
+            },
+            4,
+        )
+        .unwrap();
         assert_eq!(residuals.len(), coords.len());
         let mut seen = vec![false; coords.len()];
         for r in &residuals {
@@ -1338,13 +648,13 @@ mod tests {
     fn binomial_loo_reports_both_scales_in_input_order() {
         let (coords, successes, trials) = binomial_grid_points();
         let variogram = VariogramModel::new(0.05, 2.0, 5.0, VariogramType::Exponential).unwrap();
-        let residuals = leave_one_out_binomial(
-            &coords,
-            &successes,
-            &trials,
+        let residuals = leave_one_out_cv(&BinomialGeoPredictor {
+            coords: &coords,
+            successes: &successes,
+            trials: &trials,
             variogram,
-            BinomialPrior::default(),
-        )
+            prior: BinomialPrior::default(),
+        })
         .unwrap();
         assert_eq!(residuals.len(), coords.len());
         for (i, r) in residuals.iter().enumerate() {
@@ -1372,13 +682,13 @@ mod tests {
         successes[0] = 0;
         trials[0] = 0;
         let variogram = VariogramModel::new(0.05, 2.0, 5.0, VariogramType::Exponential).unwrap();
-        let residuals = leave_one_out_binomial(
-            &coords,
-            &successes,
-            &trials,
+        let residuals = leave_one_out_cv(&BinomialGeoPredictor {
+            coords: &coords,
+            successes: &successes,
+            trials: &trials,
             variogram,
-            BinomialPrior::default(),
-        )
+            prior: BinomialPrior::default(),
+        })
         .unwrap();
         assert_eq!(residuals.len(), coords.len());
         // First station: observed should be NaN, prediction should still be finite.
@@ -1407,12 +717,14 @@ mod tests {
     fn binomial_k_fold_covers_every_station_exactly_once() {
         let (coords, successes, trials) = binomial_grid_points();
         let variogram = VariogramModel::new(0.05, 2.0, 5.0, VariogramType::Exponential).unwrap();
-        let residuals = k_fold_binomial(
-            &coords,
-            &successes,
-            &trials,
-            variogram,
-            BinomialPrior::default(),
+        let residuals = k_fold_cv(
+            &BinomialGeoPredictor {
+                coords: &coords,
+                successes: &successes,
+                trials: &trials,
+                variogram,
+                prior: BinomialPrior::default(),
+            },
             4,
         )
         .unwrap();
@@ -1448,14 +760,14 @@ mod tests {
     fn binomial_projected_loo_returns_one_residual_per_station_in_order() {
         let (coords, successes, trials) = binomial_projected_grid_points();
         let variogram = VariogramModel::new(0.05, 2.0, 5.0, VariogramType::Exponential).unwrap();
-        let residuals = leave_one_out_binomial_projected(
-            &coords,
-            &successes,
-            &trials,
+        let residuals = leave_one_out_cv(&BinomialProjectedPredictor {
+            coords: &coords,
+            successes: &successes,
+            trials: &trials,
             variogram,
-            Anisotropy2D::isotropic(),
-            BinomialPrior::default(),
-        )
+            anisotropy: Anisotropy2D::isotropic(),
+            prior: BinomialPrior::default(),
+        })
         .unwrap();
         assert_eq!(residuals.len(), coords.len());
         for (i, r) in residuals.iter().enumerate() {
@@ -1471,13 +783,15 @@ mod tests {
     fn binomial_projected_k_fold_covers_every_station_exactly_once() {
         let (coords, successes, trials) = binomial_projected_grid_points();
         let variogram = VariogramModel::new(0.05, 2.0, 5.0, VariogramType::Exponential).unwrap();
-        let residuals = k_fold_binomial_projected(
-            &coords,
-            &successes,
-            &trials,
-            variogram,
-            Anisotropy2D::isotropic(),
-            BinomialPrior::default(),
+        let residuals = k_fold_cv(
+            &BinomialProjectedPredictor {
+                coords: &coords,
+                successes: &successes,
+                trials: &trials,
+                variogram,
+                anisotropy: Anisotropy2D::isotropic(),
+                prior: BinomialPrior::default(),
+            },
             4,
         )
         .unwrap();
@@ -1529,6 +843,27 @@ mod tests {
         );
         // Logit error = logit(0.3) - logit(0.2); finite.
         assert!(summary.logit.rmse.is_finite() && summary.logit.rmse > 0.0);
+        // Brier = (0.2 − 0.3)² on the single evaluated station.
+        assert!(
+            (summary.brier - 0.01).abs() < 1e-5,
+            "expected Brier ~0.01, got {}",
+            summary.brier
+        );
+        let p_c = 0.2 as Real;
+        let expected_llpt =
+            (3.0 as Real * p_c.ln() + 7.0 as Real * (1.0 - p_c).ln()) / 10.0 as Real;
+        assert!(
+            (summary.log_score_per_trial - expected_llpt).abs() < 1e-5,
+            "log_score_per_trial mismatch: got {}",
+            summary.log_score_per_trial
+        );
+        assert_eq!(summary.calibration_bins.len(), 10);
+        let bin2 = &summary.calibration_bins[2];
+        assert_eq!(bin2.n_stations, 1);
+        assert_eq!(bin2.sum_trials, 10);
+        assert_eq!(bin2.sum_successes, 3);
+        assert!((bin2.mean_predicted - 0.2).abs() < 1e-6);
+        assert!((bin2.pooled_observed_prevalence - 0.3).abs() < 1e-6);
     }
 
     // ----- Space–time CV ----------------------------------------------------
@@ -1589,7 +924,13 @@ mod tests {
     fn st_leave_one_out_returns_one_residual_per_station_in_order() {
         let (coords, values) = st_grid_points();
         let variogram = st_variogram();
-        let residuals = leave_one_out_spacetime(GeoMetric, &coords, &values, variogram).unwrap();
+        let residuals = leave_one_out_cv(&SpacetimeOrdinaryPredictor {
+            metric: GeoMetric,
+            coords: &coords,
+            values: &values,
+            variogram,
+        })
+        .unwrap();
         assert_eq!(residuals.len(), coords.len());
         for (i, r) in residuals.iter().enumerate() {
             assert_eq!(r.index, i);
@@ -1603,7 +944,16 @@ mod tests {
     fn st_k_fold_covers_every_station_exactly_once() {
         let (coords, values) = st_grid_points();
         let variogram = st_variogram();
-        let residuals = k_fold_spacetime(GeoMetric, &coords, &values, variogram, 4).unwrap();
+        let residuals = k_fold_cv(
+            &SpacetimeOrdinaryPredictor {
+                metric: GeoMetric,
+                coords: &coords,
+                values: &values,
+                variogram,
+            },
+            4,
+        )
+        .unwrap();
         assert_eq!(residuals.len(), coords.len());
         let mut seen = vec![false; coords.len()];
         for r in &residuals {
@@ -1619,16 +969,44 @@ mod tests {
             vec![SpaceTimeCoord::try_new(GeoCoord::try_new(0.0, 0.0).unwrap(), 0.0).unwrap()];
         let values = vec![1.0];
         let variogram = st_variogram();
-        assert!(leave_one_out_spacetime(GeoMetric, &coords, &values, variogram).is_err());
+        assert!(
+            leave_one_out_cv(&SpacetimeOrdinaryPredictor {
+                metric: GeoMetric,
+                coords: &coords,
+                values: &values,
+                variogram
+            })
+            .is_err()
+        );
     }
 
     #[test]
     fn st_k_fold_rejects_invalid_k() {
         let (coords, values) = st_grid_points();
         let variogram = st_variogram();
-        assert!(k_fold_spacetime(GeoMetric, &coords, &values, variogram, 1).is_err());
         assert!(
-            k_fold_spacetime(GeoMetric, &coords, &values, variogram, coords.len() + 1).is_err()
+            k_fold_cv(
+                &SpacetimeOrdinaryPredictor {
+                    metric: GeoMetric,
+                    coords: &coords,
+                    values: &values,
+                    variogram
+                },
+                1
+            )
+            .is_err()
+        );
+        assert!(
+            k_fold_cv(
+                &SpacetimeOrdinaryPredictor {
+                    metric: GeoMetric,
+                    coords: &coords,
+                    values: &values,
+                    variogram
+                },
+                coords.len() + 1
+            )
+            .is_err()
         );
     }
 
@@ -1637,8 +1015,14 @@ mod tests {
         let (coords, values) = st_grid_points();
         let variogram = st_variogram();
         let mean = values.iter().copied().sum::<Real>() / values.len() as Real;
-        let residuals =
-            leave_one_out_spacetime_simple(GeoMetric, &coords, &values, variogram, mean).unwrap();
+        let residuals = leave_one_out_cv(&SpacetimeSimplePredictor {
+            metric: GeoMetric,
+            coords: &coords,
+            values: &values,
+            variogram,
+            mean,
+        })
+        .unwrap();
         assert_eq!(residuals.len(), coords.len());
         for r in &residuals {
             assert!(r.predicted.is_finite());
@@ -1651,8 +1035,17 @@ mod tests {
         let (coords, values) = st_grid_points();
         let variogram = st_variogram();
         let mean = values.iter().copied().sum::<Real>() / values.len() as Real;
-        let residuals =
-            k_fold_spacetime_simple(GeoMetric, &coords, &values, variogram, mean, 4).unwrap();
+        let residuals = k_fold_cv(
+            &SpacetimeSimplePredictor {
+                metric: GeoMetric,
+                coords: &coords,
+                values: &values,
+                variogram,
+                mean,
+            },
+            4,
+        )
+        .unwrap();
         assert_eq!(residuals.len(), coords.len());
         let mut seen = vec![false; coords.len()];
         for r in &residuals {
@@ -1666,14 +1059,20 @@ mod tests {
     fn st_universal_loo_matches_ordinary_for_constant_trend_within_tol() {
         let (coords, values) = st_grid_points();
         let variogram = st_variogram();
-        let ok = leave_one_out_spacetime(GeoMetric, &coords, &values, variogram).unwrap();
-        let uk = leave_one_out_spacetime_universal(
-            GeoMetric,
-            &coords,
-            &values,
+        let ok = leave_one_out_cv(&SpacetimeOrdinaryPredictor {
+            metric: GeoMetric,
+            coords: &coords,
+            values: &values,
             variogram,
-            SpaceTimeUniversalTrend::Constant,
-        )
+        })
+        .unwrap();
+        let uk = leave_one_out_cv(&SpacetimeUniversalPredictor {
+            metric: GeoMetric,
+            coords: &coords,
+            values: &values,
+            variogram,
+            trend: SpaceTimeUniversalTrend::Constant,
+        })
         .unwrap();
         assert_eq!(ok.len(), uk.len());
         for (a, b) in ok.iter().zip(uk.iter()) {
@@ -1691,12 +1090,14 @@ mod tests {
     fn st_universal_k_fold_runs_with_linear_in_time_trend() {
         let (coords, values) = st_grid_points();
         let variogram = st_variogram();
-        let residuals = k_fold_spacetime_universal(
-            GeoMetric,
-            &coords,
-            &values,
-            variogram,
-            SpaceTimeUniversalTrend::LinearInTime,
+        let residuals = k_fold_cv(
+            &SpacetimeUniversalPredictor {
+                metric: GeoMetric,
+                coords: &coords,
+                values: &values,
+                variogram,
+                trend: SpaceTimeUniversalTrend::LinearInTime,
+            },
             3,
         )
         .unwrap();
@@ -1711,14 +1112,14 @@ mod tests {
     fn st_binomial_loo_reports_both_scales_in_input_order() {
         let (coords, successes, trials) = st_binomial_grid_points();
         let variogram = st_variogram();
-        let residuals = leave_one_out_spacetime_binomial(
-            GeoMetric,
-            &coords,
-            &successes,
-            &trials,
+        let residuals = leave_one_out_cv(&SpacetimeBinomialPredictor {
+            metric: GeoMetric,
+            coords: &coords,
+            successes: &successes,
+            trials: &trials,
             variogram,
-            BinomialPrior::default(),
-        )
+            prior: BinomialPrior::default(),
+        })
         .unwrap();
         assert_eq!(residuals.len(), coords.len());
         for (i, r) in residuals.iter().enumerate() {
@@ -1743,14 +1144,14 @@ mod tests {
         successes[0] = 0;
         trials[0] = 0;
         let variogram = st_variogram();
-        let residuals = leave_one_out_spacetime_binomial(
-            GeoMetric,
-            &coords,
-            &successes,
-            &trials,
+        let residuals = leave_one_out_cv(&SpacetimeBinomialPredictor {
+            metric: GeoMetric,
+            coords: &coords,
+            successes: &successes,
+            trials: &trials,
             variogram,
-            BinomialPrior::default(),
-        )
+            prior: BinomialPrior::default(),
+        })
         .unwrap();
         assert_eq!(residuals.len(), coords.len());
         let r0 = residuals[0];
@@ -1772,13 +1173,15 @@ mod tests {
     fn st_binomial_k_fold_covers_every_station_exactly_once() {
         let (coords, successes, trials) = st_binomial_grid_points();
         let variogram = st_variogram();
-        let residuals = k_fold_spacetime_binomial(
-            GeoMetric,
-            &coords,
-            &successes,
-            &trials,
-            variogram,
-            BinomialPrior::default(),
+        let residuals = k_fold_cv(
+            &SpacetimeBinomialPredictor {
+                metric: GeoMetric,
+                coords: &coords,
+                successes: &successes,
+                trials: &trials,
+                variogram,
+                prior: BinomialPrior::default(),
+            },
             3,
         )
         .unwrap();

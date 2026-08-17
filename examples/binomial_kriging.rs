@@ -13,8 +13,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = BinomialKrigingModel::new(observations, variogram)?;
     let pred = model.predict(GeoCoord::try_new(40.715, -74.005)?)?;
 
-    println!("Predicted prevalence: {:.4}", pred.prevalence);
-    println!("Predicted logit: {:.4}", pred.logit_value);
-    println!("Prediction variance: {:.6}", pred.variance);
+    println!(
+        "Predicted prevalence (median): {:.4}",
+        pred.prevalence_median
+    );
+    println!("Predicted prevalence (mean): {:.4}", pred.prevalence_mean);
+    println!("Predicted logit: {:.4}", pred.logit);
+    println!("Logit prediction variance: {:.6}", pred.logit_variance);
     Ok(())
 }
