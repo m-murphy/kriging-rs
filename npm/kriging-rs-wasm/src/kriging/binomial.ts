@@ -4,7 +4,7 @@
  * @module
  */
 
-import { KrigingError, wrapThrown } from "../errors.js";
+import { wrapThrown } from "../errors.js";
 import { toFloat64Array, toUint32Array } from "../internal/convert.js";
 import {
   attachBinomialHandle,
