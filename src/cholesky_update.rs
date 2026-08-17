@@ -325,7 +325,7 @@ mod tests {
         let chol = a.clone().cholesky().expect("SPD");
         let l = chol.l();
         let v = DVector::from_column_slice(&[0.75, -0.5, 0.25]);
-        let alpha = 2.5_f32;
+        let alpha = 2.5 as Real;
         let mut a_ext = DMatrix::zeros(4, 4);
         a_ext.view_mut((0, 0), (3, 3)).copy_from(&a);
         for i in 0..3 {
@@ -408,8 +408,8 @@ mod tests {
     fn extend_rejects_indefinite_schur() {
         let a = spd_3x3();
         let l = a.cholesky().unwrap().l();
-        let v = DVector::from_column_slice(&[10.0_f32, 10.0, 10.0]);
-        let alpha = 1.0_f32;
+        let v = DVector::from_column_slice(&[10.0 as Real, 10.0, 10.0]);
+        let alpha = 1.0 as Real;
         assert!(cholesky_extend_spd_lower(&l, &v, alpha).is_err());
     }
 
@@ -418,7 +418,7 @@ mod tests {
         let a = spd_3x3();
         let chol = a.clone().cholesky().expect("SPD");
         let l = chol.l();
-        let x = DVector::from_column_slice(&[0.3_f32, -0.2, 0.1]);
+        let x = DVector::from_column_slice(&[0.3 as Real, -0.2, 0.1]);
         let mut l_copy = l.clone();
         let mut x_copy = x.clone();
         cholesky_rank1_update_lower_inplace(&mut l_copy, &mut x_copy);
