@@ -6,7 +6,7 @@ use wasm_bindgen::prelude::*;
 use crate::Real;
 use crate::projected::{Anisotropy2D, ProjectedCoord};
 use crate::simulation::{
-    BinomialGeoSimulator, BinomialProjectedSimulator, OrdinaryGeoSimulator,
+    BinomialGeoSimulator, BinomialProjectedSimulator, KrigingSimulator, OrdinaryGeoSimulator,
     ProjectedOrdinarySimulator, SimpleGeoSimulator, SimulationOptions, UniversalGeoSimulator,
     sequential_binomial_simulate, sequential_binomial_simulate_many, sequential_gaussian_simulate,
     sequential_gaussian_simulate_many,
@@ -50,6 +50,30 @@ fn samples_to_js(samples: Vec<Real>) -> JsValue {
     Float64Array::from(samples_f64.as_slice()).into()
 }
 
+pub(super) fn run_continuous_simulate<S>(
+    simulator: S,
+    targets: &[S::Target],
+    opts: &UnifiedSimulateOptions,
+) -> Result<JsValue, JsValue>
+where
+    S: KrigingSimulator + Clone,
+    S::Target: Copy,
+{
+    let samples = if opts.is_many() {
+        sequential_gaussian_simulate_many(
+            simulator,
+            targets,
+            opts.realization_count() as usize,
+            opts.effective_base_seed(),
+            target_order_usize(opts),
+        )
+    } else {
+        sequential_gaussian_simulate(simulator, targets, simulation_options(opts))
+    }
+    .map_err(kriging_err_to_js)?;
+    Ok(samples_to_js(samples))
+}
+
 fn run_simulate_2d(opts: &UnifiedSimulateOptions) -> Result<JsValue, JsValue> {
     let geometry = opts.geometry.as_str();
     let family = opts.family.as_str();
@@ -82,22 +106,7 @@ fn run_simulate_2d(opts: &UnifiedSimulateOptions) -> Result<JsValue, JsValue> {
             let targets = to_coords(&opts.target_lats, &opts.target_lons)?;
             let simulator = OrdinaryGeoSimulator::new(&cond_coords, &cond_values, variogram)
                 .map_err(kriging_err_to_js)?;
-            if opts.is_many() {
-                let samples = sequential_gaussian_simulate_many(
-                    simulator,
-                    &targets,
-                    opts.realization_count() as usize,
-                    opts.effective_base_seed(),
-                    target_order_usize(opts),
-                )
-                .map_err(kriging_err_to_js)?;
-                Ok(samples_to_js(samples))
-            } else {
-                let samples =
-                    sequential_gaussian_simulate(simulator, &targets, simulation_options(opts))
-                        .map_err(kriging_err_to_js)?;
-                Ok(samples_to_js(samples))
-            }
+            run_continuous_simulate(simulator, &targets, opts)
         }
         ("geo", "simple") => {
             let mean = opts
@@ -119,10 +128,7 @@ fn run_simulate_2d(opts: &UnifiedSimulateOptions) -> Result<JsValue, JsValue> {
             let simulator =
                 SimpleGeoSimulator::new(&cond_coords, &cond_values, variogram, mean as Real)
                     .map_err(kriging_err_to_js)?;
-            let samples =
-                sequential_gaussian_simulate(simulator, &targets, simulation_options(opts))
-                    .map_err(kriging_err_to_js)?;
-            Ok(samples_to_js(samples))
+            run_continuous_simulate(simulator, &targets, opts)
         }
         ("geo", "universal") => {
             let trend_str = opts.trend.as_deref().ok_or_else(|| {
@@ -145,10 +151,7 @@ fn run_simulate_2d(opts: &UnifiedSimulateOptions) -> Result<JsValue, JsValue> {
             let simulator =
                 UniversalGeoSimulator::new(&cond_coords, &cond_values, variogram, trend)
                     .map_err(kriging_err_to_js)?;
-            let samples =
-                sequential_gaussian_simulate(simulator, &targets, simulation_options(opts))
-                    .map_err(kriging_err_to_js)?;
-            Ok(samples_to_js(samples))
+            run_continuous_simulate(simulator, &targets, opts)
         }
         ("geo", "binomial") => {
             if opts.conditioning_lats.len() != opts.conditioning_lons.len()
@@ -224,10 +227,7 @@ fn run_simulate_2d(opts: &UnifiedSimulateOptions) -> Result<JsValue, JsValue> {
             let simulator =
                 ProjectedOrdinarySimulator::new(&cond_coords, &cond_values, variogram, anisotropy)
                     .map_err(kriging_err_to_js)?;
-            let samples =
-                sequential_gaussian_simulate(simulator, &targets, simulation_options(opts))
-                    .map_err(kriging_err_to_js)?;
-            Ok(samples_to_js(samples))
+            run_continuous_simulate(simulator, &targets, opts)
         }
         ("projected", "binomial") => {
             if opts.conditioning_xs.len() != opts.conditioning_ys.len()

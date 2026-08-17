@@ -23,7 +23,6 @@ use crate::projected::{Anisotropy2D, ProjectedCoord};
 use crate::simulation::{
     SpacetimeBinomialSimulator, SpacetimeOrdinarySimulator, SpacetimeSimpleSimulator,
     SpacetimeUniversalSimulator, sequential_binomial_simulate, sequential_binomial_simulate_many,
-    sequential_gaussian_simulate, sequential_gaussian_simulate_many,
 };
 use crate::spacetime::{
     EmpiricalSpaceTimeVariogram, GeoMetric, ProjectedMetric, SpaceTimeBinomialKrigingModel,
@@ -38,6 +37,7 @@ use crate::variogram::models::{VariogramModel, VariogramType};
 
 use super::cv_options::UnifiedCvOptions;
 use super::model_cv;
+use super::simulate_dispatch::run_continuous_simulate;
 use super::simulate_options::UnifiedSimulateOptions;
 use super::{
     JsBinomialPrediction, JsPrediction, binomial_cv_result_to_js, binomial_many_simulation_to_js,
@@ -1722,24 +1722,7 @@ pub(super) fn run_spacetime_simulate(opts: &UnifiedSimulateOptions) -> Result<Js
             let simulator =
                 SpacetimeOrdinarySimulator::new(GeoMetric, &cond_coords, &cond_values, vg)
                     .map_err(kriging_err_to_js)?;
-            if opts.is_many() {
-                let samples = sequential_gaussian_simulate_many(
-                    simulator,
-                    &targets,
-                    opts.realization_count() as usize,
-                    opts.effective_base_seed(),
-                    st_target_order_usize(opts),
-                )
-                .map_err(kriging_err_to_js)?;
-                let samples_f64: Vec<f64> = samples.iter().map(|v| *v as f64).collect();
-                Ok(Float64Array::from(samples_f64.as_slice()).into())
-            } else {
-                let samples =
-                    sequential_gaussian_simulate(simulator, &targets, st_simulation_options(opts))
-                        .map_err(kriging_err_to_js)?;
-                let samples_f64: Vec<f64> = samples.iter().map(|v| *v as f64).collect();
-                Ok(Float64Array::from(samples_f64.as_slice()).into())
-            }
+            run_continuous_simulate(simulator, &targets, opts)
         }
         "simple" => {
             if opts.conditioning_values.len() != opts.conditioning_lats.len() {
@@ -1767,11 +1750,7 @@ pub(super) fn run_spacetime_simulate(opts: &UnifiedSimulateOptions) -> Result<Js
                 mean as Real,
             )
             .map_err(kriging_err_to_js)?;
-            let samples =
-                sequential_gaussian_simulate(simulator, &targets, st_simulation_options(opts))
-                    .map_err(kriging_err_to_js)?;
-            let samples_f64: Vec<f64> = samples.iter().map(|v| *v as f64).collect();
-            Ok(Float64Array::from(samples_f64.as_slice()).into())
+            run_continuous_simulate(simulator, &targets, opts)
         }
         "universal" => {
             if opts.conditioning_values.len() != opts.conditioning_lats.len() {
@@ -1795,11 +1774,7 @@ pub(super) fn run_spacetime_simulate(opts: &UnifiedSimulateOptions) -> Result<Js
             let simulator =
                 SpacetimeUniversalSimulator::new(GeoMetric, &cond_coords, &cond_values, vg, trend)
                     .map_err(kriging_err_to_js)?;
-            let samples =
-                sequential_gaussian_simulate(simulator, &targets, st_simulation_options(opts))
-                    .map_err(kriging_err_to_js)?;
-            let samples_f64: Vec<f64> = samples.iter().map(|v| *v as f64).collect();
-            Ok(Float64Array::from(samples_f64.as_slice()).into())
+            run_continuous_simulate(simulator, &targets, opts)
         }
         "binomial" => {
             if opts.conditioning_lats.len() != opts.conditioning_successes.len()
