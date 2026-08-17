@@ -226,8 +226,12 @@ export function packSimulateOptions(
   assignNumeric("targetYs", normalized.targetYs);
   assignNumeric("targetTimes", normalized.targetTimes);
 
-  const conditioningSuccesses = packUintField(normalized.conditioningSuccesses);
-  const conditioningTrials = packUintField(normalized.conditioningTrials);
+  const conditioningSuccesses = packUintField(
+    normalized.conditioningSuccesses ?? normalized.successes
+  );
+  const conditioningTrials = packUintField(
+    normalized.conditioningTrials ?? normalized.trials
+  );
   if (conditioningSuccesses) payload.conditioningSuccesses = conditioningSuccesses;
   if (conditioningTrials) payload.conditioningTrials = conditioningTrials;
 
@@ -251,8 +255,8 @@ export function packSimulateOptions(
   Object.assign(
     payload,
     packPrior(normalized.prior, {
-      successes: normalized.conditioningSuccesses,
-      trials: normalized.conditioningTrials,
+      successes: normalized.conditioningSuccesses ?? normalized.successes,
+      trials: normalized.conditioningTrials ?? normalized.trials,
     })
   );
 
