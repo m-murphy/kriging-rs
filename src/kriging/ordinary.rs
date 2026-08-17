@@ -7,6 +7,7 @@ use crate::Real;
 use crate::distance::GeoCoord;
 use crate::error::KrigingError;
 use crate::geo_dataset::GeoDataset;
+use crate::kriging::conditioner::KrigingConditioner;
 use crate::kriging::engine::OrdinaryKrigingEngine;
 use crate::kriging::numerics::select_neighborhood_indices;
 use crate::kriging::pairwise::SpatialPairwiseCovariance;
@@ -174,6 +175,23 @@ impl OrdinaryKrigingModel {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Consume this fitted model as live state for sequential Gaussian simulation.
+    pub fn into_conditioner(self) -> Result<KrigingConditioner<GeoCoord>, KrigingError> {
+        self.into_conditioner_on()
+    }
+
+    pub(crate) fn into_conditioner_on<Scale>(
+        self,
+    ) -> Result<KrigingConditioner<GeoCoord, Scale>, KrigingError> {
+        if self.neighborhood.is_some() {
+            return Err(KrigingError::InvalidInput(
+                "a kriging conditioner must use all conditioning sites; clear the neighborhood before conversion"
+                    .to_string(),
+            ));
+        }
+        Ok(KrigingConditioner::from_ordinary(self.engine))
     }
 
     pub fn predict(&self, coord: GeoCoord) -> Result<Prediction, KrigingError> {

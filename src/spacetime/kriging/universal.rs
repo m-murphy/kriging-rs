@@ -7,6 +7,7 @@
 
 use crate::Real;
 use crate::error::KrigingError;
+use crate::kriging::conditioner::KrigingConditioner;
 use crate::kriging::ordinary::Prediction;
 use crate::kriging::pairwise::SpaceTimePairwiseCovariance;
 use crate::spacetime::coord::SpaceTimeCoord;
@@ -144,6 +145,21 @@ impl<M: SpatialBasis> SpaceTimeUniversalKrigingModel<M> {
             SpaceTimeUniversalInner::Constant(engine) => engine.pairwise_covariance().variogram(),
             SpaceTimeUniversalInner::Drift(engine) => engine.pairwise_covariance().variogram(),
         }
+    }
+
+    /// Consume this fitted model as live state for sequential Gaussian simulation.
+    pub fn into_conditioner(
+        self,
+    ) -> Result<KrigingConditioner<SpaceTimeCoord<M::Coord>>, KrigingError>
+    where
+        M: 'static,
+        M::Coord: 'static,
+        M::Prepared: 'static,
+    {
+        Ok(match self.inner {
+            SpaceTimeUniversalInner::Constant(engine) => KrigingConditioner::from_ordinary(engine),
+            SpaceTimeUniversalInner::Drift(engine) => KrigingConditioner::from_universal(engine),
+        })
     }
 
     pub fn predict(&self, target: SpaceTimeCoord<M::Coord>) -> Result<Prediction, KrigingError> {

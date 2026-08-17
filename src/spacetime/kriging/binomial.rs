@@ -11,6 +11,7 @@ use crate::kriging::binomial::{
     BinomialPrediction, BinomialPrior, HeteroskedasticBinomialConfig, binomial_logit_loo_msdr,
     binomial_prediction_from_ordinary, build_calibrated_logit_ordinary, finish_binomial_notes,
 };
+use crate::kriging::conditioner::{KrigingConditioner, LogitScale};
 use crate::predictor::cv::SpacetimeBinomialPredictor;
 use crate::spacetime::SpaceTimeCoord;
 use crate::spacetime::dataset::SpaceTimeDataset;
@@ -261,6 +262,18 @@ impl<M: SpatialMetric> SpaceTimeBinomialKrigingModel<M> {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Consume this fitted model as live logit-scale state for binomial SGS.
+    pub fn into_conditioner(
+        self,
+    ) -> Result<KrigingConditioner<SpaceTimeCoord<M::Coord>, LogitScale>, KrigingError>
+    where
+        M: 'static,
+        M::Coord: 'static,
+        M::Prepared: 'static,
+    {
+        self.inner.into_conditioner_on()
     }
 
     pub fn predict(

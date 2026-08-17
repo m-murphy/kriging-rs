@@ -116,16 +116,6 @@ impl<K: PairwiseCovariance, T: TrendBasis<Site = K::Site>> UniversalKrigingEngin
         }
     }
 
-    pub fn condition(
-        mut self,
-        site: K::Site,
-        value: Real,
-        obs_var: Real,
-    ) -> Result<Self, KrigingError> {
-        self.append_condition(site, value, obs_var)?;
-        Ok(self)
-    }
-
     pub(crate) fn append_condition(
         &mut self,
         site: K::Site,

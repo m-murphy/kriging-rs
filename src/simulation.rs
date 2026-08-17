@@ -17,11 +17,9 @@
 //!
 //! ## Harness
 //!
-//! Sequential Gaussian simulation is generic over [`KrigingSimulator`](crate::predictor::simulation::KrigingSimulator)
-//! backends in [`crate::predictor::simulation`]. Construct a simulator (e.g.
-//! [`OrdinaryGeoSimulator`](crate::predictor::simulation::OrdinaryGeoSimulator)) and call
-//! [`sequential_gaussian_simulate`](crate::predictor::simulation::sequential_gaussian_simulate)
-//! or the binomial analogue [`sequential_binomial_simulate`](crate::predictor::simulation::sequential_binomial_simulate).
+//! Convert a fitted kriging model with its `into_conditioner` method, then pass the resulting
+//! [`KrigingConditioner`] to [`sequential_gaussian_simulate`] or
+//! [`sequential_binomial_simulate`].
 //!
 //! All paths accept a shared [`SimulationOptions`] (seed + optional target visit order).
 //!
@@ -32,6 +30,9 @@
 //! number quality, callers can post-process or wrap this module's scalar outputs.
 
 use crate::Real;
+use crate::error::KrigingError;
+use crate::kriging::conditioner::{KrigingConditioner, LogitScale};
+use crate::utils::logistic;
 
 /// Options controlling conditional simulation.
 #[derive(Debug, Clone)]
@@ -84,27 +85,263 @@ pub struct BinomialSimulationManyResult {
     pub prevalence_samples: Vec<Real>,
 }
 
-// Generic SGS harness — see [`crate::predictor::simulation`].
-pub use crate::predictor::simulation::*;
+/// Alias for [`BinomialSimulationResult`] in SGS harness docs.
+pub type BinomialSgsOutput = BinomialSimulationResult;
+
+/// Kriging variance below this threshold means the target is already conditioned.
+const SGS_CONDITIONED_VARIANCE_EPS: Real = 1e-10;
+
+/// One continuous SGS realization in original target input order.
+pub fn sequential_gaussian_simulate<S>(
+    mut conditioner: KrigingConditioner<S>,
+    targets: &[S],
+    options: SimulationOptions,
+) -> Result<Vec<Real>, KrigingError>
+where
+    S: Copy,
+{
+    let n_targets = targets.len();
+    let order = resolve_target_order(n_targets, options.target_order)?;
+    let mut rng = Rng::new(options.seed);
+    let mut out = vec![0.0 as Real; n_targets];
+
+    for &target_idx in &order {
+        let target = targets[target_idx];
+        let conditional = conditioner.predict(target)?;
+        let sigma = conditional.variance.max(0.0).sqrt();
+        let sampled = conditional.mean + sigma * rng.next_standard_normal();
+        out[target_idx] = sampled;
+        if conditional.variance > SGS_CONDITIONED_VARIANCE_EPS {
+            conditioner.append_condition(target, sampled)?;
+        }
+    }
+
+    Ok(out)
+}
+
+/// One binomial SGS realization (logit + prevalence) in original target input order.
+pub fn sequential_binomial_simulate<S>(
+    mut conditioner: KrigingConditioner<S, LogitScale>,
+    targets: &[S],
+    options: SimulationOptions,
+) -> Result<BinomialSimulationResult, KrigingError>
+where
+    S: Copy,
+{
+    let n_targets = targets.len();
+    let order = resolve_target_order(n_targets, options.target_order)?;
+    let mut rng = Rng::new(options.seed);
+    let mut logit_out = vec![0.0 as Real; n_targets];
+    let mut prevalence_out = vec![0.0 as Real; n_targets];
+
+    for &target_idx in &order {
+        let target = targets[target_idx];
+        let conditional = conditioner.predict(target)?;
+        let sigma = conditional.variance.max(0.0).sqrt();
+        let logit_sample = conditional.mean + sigma * rng.next_standard_normal();
+        logit_out[target_idx] = logit_sample;
+        prevalence_out[target_idx] = logistic(logit_sample);
+        if conditional.variance > SGS_CONDITIONED_VARIANCE_EPS {
+            conditioner.append_condition(target, logit_sample)?;
+        }
+    }
+
+    Ok(BinomialSimulationResult {
+        logit_samples: logit_out,
+        prevalence_samples: prevalence_out,
+    })
+}
+
+/// Multi-realization continuous SGS. Row `k` matches [`sequential_gaussian_simulate`] with
+/// `seed = base_seed + k`.
+pub fn sequential_gaussian_simulate_many<S>(
+    template: KrigingConditioner<S>,
+    targets: &[S],
+    n_realizations: usize,
+    base_seed: u64,
+    target_order: Option<Vec<usize>>,
+) -> Result<Vec<Real>, KrigingError>
+where
+    S: Copy,
+{
+    validate_n_realizations(n_realizations)?;
+    let n_targets = targets.len();
+    let order = resolve_target_order(n_targets, target_order)?;
+    let mut out = vec![0.0 as Real; n_realizations * n_targets];
+
+    for k in 0..n_realizations {
+        let mut rng = Rng::new(base_seed.wrapping_add(k as u64));
+        let mut conditioner = template.clone();
+        let row_offset = k * n_targets;
+        for &target_idx in &order {
+            let target = targets[target_idx];
+            let conditional = conditioner.predict(target)?;
+            let sigma = conditional.variance.max(0.0).sqrt();
+            let sampled = conditional.mean + sigma * rng.next_standard_normal();
+            out[row_offset + target_idx] = sampled;
+            if conditional.variance > SGS_CONDITIONED_VARIANCE_EPS {
+                conditioner.append_condition(target, sampled)?;
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Multi-realization binomial SGS. Row `k` matches [`sequential_binomial_simulate`] with
+/// `seed = base_seed + k`.
+pub fn sequential_binomial_simulate_many<S>(
+    template: KrigingConditioner<S, LogitScale>,
+    targets: &[S],
+    n_realizations: usize,
+    base_seed: u64,
+    target_order: Option<Vec<usize>>,
+) -> Result<BinomialSimulationManyResult, KrigingError>
+where
+    S: Copy,
+{
+    validate_n_realizations(n_realizations)?;
+    let n_targets = targets.len();
+    let order = resolve_target_order(n_targets, target_order)?;
+    let mut logit_out = vec![0.0 as Real; n_realizations * n_targets];
+    let mut prevalence_out = vec![0.0 as Real; n_realizations * n_targets];
+
+    for k in 0..n_realizations {
+        let mut rng = Rng::new(base_seed.wrapping_add(k as u64));
+        let mut conditioner = template.clone();
+        let row_offset = k * n_targets;
+        for &target_idx in &order {
+            let target = targets[target_idx];
+            let conditional = conditioner.predict(target)?;
+            let sigma = conditional.variance.max(0.0).sqrt();
+            let logit_sample = conditional.mean + sigma * rng.next_standard_normal();
+            logit_out[row_offset + target_idx] = logit_sample;
+            prevalence_out[row_offset + target_idx] = logistic(logit_sample);
+            if conditional.variance > SGS_CONDITIONED_VARIANCE_EPS {
+                conditioner.append_condition(target, logit_sample)?;
+            }
+        }
+    }
+
+    Ok(BinomialSimulationManyResult {
+        n_realizations,
+        n_targets,
+        logit_samples: logit_out,
+        prevalence_samples: prevalence_out,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct Rng {
+    state: [u64; 4],
+}
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        let mut splitmix_state = seed;
+        let mut next = || {
+            splitmix_state = splitmix_state.wrapping_add(0x9E3779B97F4A7C15);
+            let mut value = splitmix_state;
+            value = (value ^ (value >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94D049BB133111EB);
+            value ^ (value >> 31)
+        };
+        Self {
+            state: [next(), next(), next(), next()],
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let result = self.state[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+        let temporary = self.state[1] << 17;
+        self.state[2] ^= self.state[0];
+        self.state[3] ^= self.state[1];
+        self.state[1] ^= self.state[2];
+        self.state[0] ^= self.state[3];
+        self.state[2] ^= temporary;
+        self.state[3] = self.state[3].rotate_left(45);
+        result
+    }
+
+    fn next_unit(&mut self) -> Real {
+        let value = (self.next_u64() >> 11) as Real;
+        let scale = (1u64 << 53) as Real;
+        (value + 0.5) / scale
+    }
+
+    fn next_standard_normal(&mut self) -> Real {
+        let u1 = self.next_unit();
+        let u2 = self.next_unit();
+        let radius = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * (std::f64::consts::PI as Real) * u2;
+        radius * theta.cos()
+    }
+}
+
+fn resolve_target_order(
+    n_targets: usize,
+    target_order: Option<Vec<usize>>,
+) -> Result<Vec<usize>, KrigingError> {
+    match target_order {
+        None => Ok((0..n_targets).collect()),
+        Some(order) => {
+            if order.len() != n_targets {
+                return Err(KrigingError::InvalidInput(format!(
+                    "target_order length ({}) must equal number of targets ({n_targets})",
+                    order.len()
+                )));
+            }
+            let mut seen = vec![false; n_targets];
+            for &index in &order {
+                if index >= n_targets {
+                    return Err(KrigingError::InvalidInput(format!(
+                        "target_order contains out-of-range index {index} (n_targets={n_targets})"
+                    )));
+                }
+                if seen[index] {
+                    return Err(KrigingError::InvalidInput(format!(
+                        "target_order contains duplicate index {index}"
+                    )));
+                }
+                seen[index] = true;
+            }
+            Ok(order)
+        }
+    }
+}
+
+fn validate_n_realizations(n_realizations: usize) -> Result<(), KrigingError> {
+    if n_realizations == 0 {
+        return Err(KrigingError::InvalidInput(
+            "n_realizations must be >= 1".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::distance::GeoCoord;
     use crate::error::KrigingError;
-    use crate::kriging::binomial::BinomialPrior;
-    use crate::kriging::universal::UniversalTrend;
-    use crate::predictor::simulation::{
-        BinomialGeoSimulator, BinomialProjectedSimulator, OrdinaryGeoSimulator,
-        ProjectedOrdinarySimulator, SimpleGeoSimulator, SpacetimeBinomialSimulator,
-        SpacetimeOrdinarySimulator, SpacetimeSimpleSimulator, SpacetimeUniversalSimulator,
-        UniversalGeoSimulator, sequential_binomial_simulate, sequential_binomial_simulate_many,
-        sequential_gaussian_simulate, sequential_gaussian_simulate_many,
+    use crate::geo_dataset::GeoDataset;
+    use crate::kriging::binomial::{
+        BinomialKrigingModel, BinomialObservation, BinomialPrior, HeteroskedasticBinomialConfig,
     };
-    use crate::projected::{Anisotropy2D, ProjectedCoord};
-    use crate::spacetime::coord::SpaceTimeCoord;
-    use crate::spacetime::kriging::universal::SpaceTimeUniversalTrend;
-    use crate::spacetime::variogram::SpaceTimeVariogram;
+    use crate::kriging::conditioner::{KrigingConditioner, LogitScale};
+    use crate::kriging::ordinary::OrdinaryKrigingModel;
+    use crate::kriging::simple::SimpleKrigingModel;
+    use crate::kriging::universal::UniversalKrigingModel;
+    use crate::kriging::universal::UniversalTrend;
+    use crate::projected::{
+        Anisotropy2D, BinomialProjectedKrigingModel, ProjectedBinomialObservation, ProjectedCoord,
+        ProjectedDataset, ProjectedKrigingModel,
+    };
+    use crate::spacetime::{
+        GeoMetric, SpaceTimeBinomialKrigingModel, SpaceTimeBinomialObservation, SpaceTimeCoord,
+        SpaceTimeDataset, SpaceTimeOrdinaryKrigingModel, SpaceTimeSimpleKrigingModel,
+        SpaceTimeUniversalKrigingModel, SpaceTimeUniversalTrend, SpaceTimeVariogram,
+    };
     use crate::utils::logistic;
     use crate::variogram::models::{VariogramModel, VariogramType};
 
@@ -120,6 +357,219 @@ mod tests {
         (coords, values, variogram)
     }
 
+    fn ordinary_conditioner(
+        coords: &[GeoCoord],
+        values: &[Real],
+        variogram: VariogramModel,
+    ) -> Result<KrigingConditioner<GeoCoord>, KrigingError> {
+        OrdinaryKrigingModel::new(
+            GeoDataset::new(coords.to_vec(), values.to_vec())?,
+            variogram,
+        )?
+        .into_conditioner()
+    }
+
+    fn simple_conditioner(
+        coords: &[GeoCoord],
+        values: &[Real],
+        variogram: VariogramModel,
+        mean: Real,
+    ) -> Result<KrigingConditioner<GeoCoord>, KrigingError> {
+        SimpleKrigingModel::new(
+            GeoDataset::new(coords.to_vec(), values.to_vec())?,
+            variogram,
+            mean,
+        )?
+        .into_conditioner()
+    }
+
+    fn universal_conditioner(
+        coords: &[GeoCoord],
+        values: &[Real],
+        variogram: VariogramModel,
+        trend: UniversalTrend,
+    ) -> Result<KrigingConditioner<GeoCoord>, KrigingError> {
+        UniversalKrigingModel::new(
+            GeoDataset::new(coords.to_vec(), values.to_vec())?,
+            variogram,
+            trend,
+        )?
+        .into_conditioner()
+    }
+
+    fn projected_conditioner(
+        coords: &[ProjectedCoord],
+        values: &[Real],
+        variogram: VariogramModel,
+        anisotropy: Anisotropy2D,
+    ) -> Result<KrigingConditioner<ProjectedCoord>, KrigingError> {
+        ProjectedKrigingModel::new(
+            ProjectedDataset::new(coords.to_vec(), values.to_vec())?,
+            variogram,
+            anisotropy,
+        )?
+        .into_conditioner()
+    }
+
+    fn binomial_conditioner(
+        coords: &[GeoCoord],
+        successes: &[u32],
+        trials: &[u32],
+        variogram: VariogramModel,
+        prior: BinomialPrior,
+    ) -> Result<KrigingConditioner<GeoCoord, LogitScale>, KrigingError> {
+        if coords.len() != successes.len() || coords.len() != trials.len() {
+            return Err(KrigingError::DimensionMismatch(
+                "conditioning arrays must have equal length".to_string(),
+            ));
+        }
+        let observations = coords
+            .iter()
+            .copied()
+            .zip(successes.iter().copied())
+            .zip(trials.iter().copied())
+            .filter(|(_, trials)| *trials > 0)
+            .map(|((coord, successes), trials)| BinomialObservation::new(coord, successes, trials))
+            .collect::<Result<Vec<_>, _>>()?;
+        BinomialKrigingModel::new_with_prior(observations, variogram, prior)?
+            .into_model()
+            .into_conditioner()
+    }
+
+    fn projected_binomial_conditioner(
+        coords: &[ProjectedCoord],
+        successes: &[u32],
+        trials: &[u32],
+        variogram: VariogramModel,
+        anisotropy: Anisotropy2D,
+        prior: BinomialPrior,
+    ) -> Result<KrigingConditioner<ProjectedCoord, LogitScale>, KrigingError> {
+        if coords.len() != successes.len() || coords.len() != trials.len() {
+            return Err(KrigingError::DimensionMismatch(
+                "conditioning arrays must have equal length".to_string(),
+            ));
+        }
+        let observations = coords
+            .iter()
+            .copied()
+            .zip(successes.iter().copied())
+            .zip(trials.iter().copied())
+            .filter(|(_, trials)| *trials > 0)
+            .map(|((coord, successes), trials)| {
+                ProjectedBinomialObservation::new(coord, successes, trials)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        BinomialProjectedKrigingModel::new_with_prior(
+            observations,
+            variogram,
+            anisotropy,
+            prior,
+            HeteroskedasticBinomialConfig::default(),
+        )?
+        .into_model()
+        .into_conditioner()
+    }
+
+    fn spacetime_ordinary_conditioner<M>(
+        metric: M,
+        coords: &[SpaceTimeCoord<M::Coord>],
+        values: &[Real],
+        variogram: SpaceTimeVariogram,
+    ) -> Result<KrigingConditioner<SpaceTimeCoord<M::Coord>>, KrigingError>
+    where
+        M: crate::spacetime::SpatialMetric + 'static,
+        M::Coord: 'static,
+        M::Prepared: 'static,
+    {
+        SpaceTimeOrdinaryKrigingModel::new(
+            metric,
+            SpaceTimeDataset::new(coords.to_vec(), values.to_vec())?,
+            variogram,
+        )?
+        .into_conditioner()
+    }
+
+    fn spacetime_simple_conditioner<M>(
+        metric: M,
+        coords: &[SpaceTimeCoord<M::Coord>],
+        values: &[Real],
+        variogram: SpaceTimeVariogram,
+        mean: Real,
+    ) -> Result<KrigingConditioner<SpaceTimeCoord<M::Coord>>, KrigingError>
+    where
+        M: crate::spacetime::SpatialMetric + 'static,
+        M::Coord: 'static,
+        M::Prepared: 'static,
+    {
+        SpaceTimeSimpleKrigingModel::new(
+            metric,
+            SpaceTimeDataset::new(coords.to_vec(), values.to_vec())?,
+            variogram,
+            mean,
+        )?
+        .into_conditioner()
+    }
+
+    fn spacetime_universal_conditioner<M>(
+        metric: M,
+        coords: &[SpaceTimeCoord<M::Coord>],
+        values: &[Real],
+        variogram: SpaceTimeVariogram,
+        trend: SpaceTimeUniversalTrend,
+    ) -> Result<KrigingConditioner<SpaceTimeCoord<M::Coord>>, KrigingError>
+    where
+        M: crate::spacetime::SpatialBasis + 'static,
+        M::Coord: 'static,
+        M::Prepared: 'static,
+    {
+        SpaceTimeUniversalKrigingModel::new(
+            metric,
+            SpaceTimeDataset::new(coords.to_vec(), values.to_vec())?,
+            variogram,
+            trend,
+        )?
+        .into_conditioner()
+    }
+
+    fn spacetime_binomial_conditioner<M>(
+        metric: M,
+        coords: &[SpaceTimeCoord<M::Coord>],
+        successes: &[u32],
+        trials: &[u32],
+        variogram: SpaceTimeVariogram,
+        prior: BinomialPrior,
+    ) -> Result<KrigingConditioner<SpaceTimeCoord<M::Coord>, LogitScale>, KrigingError>
+    where
+        M: crate::spacetime::SpatialMetric + 'static,
+        M::Coord: 'static,
+        M::Prepared: 'static,
+    {
+        if coords.len() != successes.len() || coords.len() != trials.len() {
+            return Err(KrigingError::DimensionMismatch(
+                "conditioning arrays must have equal length".to_string(),
+            ));
+        }
+        let observations = coords
+            .iter()
+            .copied()
+            .zip(successes.iter().copied())
+            .zip(trials.iter().copied())
+            .filter(|(_, trials)| *trials > 0)
+            .map(|((coord, successes), trials)| {
+                SpaceTimeBinomialObservation::new(coord, successes, trials)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        SpaceTimeBinomialKrigingModel::new_with_prior(
+            metric,
+            observations,
+            variogram,
+            prior,
+            HeteroskedasticBinomialConfig::default(),
+        )?
+        .into_model()
+        .into_conditioner()
+    }
+
     // ---- Ordinary ----------------------------------------------------------
 
     #[test]
@@ -130,13 +580,13 @@ mod tests {
             GeoCoord::try_new(0.25, 0.75).unwrap(),
         ];
         let a = sequential_gaussian_simulate(
-            OrdinaryGeoSimulator::new(&c, &v, vg).unwrap(),
+            ordinary_conditioner(&c, &v, vg).unwrap(),
             &targets,
             SimulationOptions::new(42),
         )
         .unwrap();
         let b = sequential_gaussian_simulate(
-            OrdinaryGeoSimulator::new(&c, &v, vg).unwrap(),
+            ordinary_conditioner(&c, &v, vg).unwrap(),
             &targets,
             SimulationOptions::new(42),
         )
@@ -152,13 +602,13 @@ mod tests {
             GeoCoord::try_new(0.25, 0.75).unwrap(),
         ];
         let a = sequential_gaussian_simulate(
-            OrdinaryGeoSimulator::new(&c, &v, vg).unwrap(),
+            ordinary_conditioner(&c, &v, vg).unwrap(),
             &targets,
             SimulationOptions::new(1),
         )
         .unwrap();
         let b = sequential_gaussian_simulate(
-            OrdinaryGeoSimulator::new(&c, &v, vg).unwrap(),
+            ordinary_conditioner(&c, &v, vg).unwrap(),
             &targets,
             SimulationOptions::new(2),
         )
@@ -171,7 +621,7 @@ mod tests {
         let (c, v, vg) = setup();
         let targets = vec![c[2]];
         let out = sequential_gaussian_simulate(
-            OrdinaryGeoSimulator::new(&c, &v, vg).unwrap(),
+            ordinary_conditioner(&c, &v, vg).unwrap(),
             &targets,
             SimulationOptions::new(123),
         )
@@ -194,12 +644,9 @@ mod tests {
         ];
         let mut opts = SimulationOptions::new(7);
         opts.target_order = Some(vec![2, 0, 1]);
-        let out = sequential_gaussian_simulate(
-            OrdinaryGeoSimulator::new(&c, &v, vg).unwrap(),
-            &targets,
-            opts,
-        )
-        .unwrap();
+        let out =
+            sequential_gaussian_simulate(ordinary_conditioner(&c, &v, vg).unwrap(), &targets, opts)
+                .unwrap();
         assert_eq!(out.len(), targets.len());
         for v in out {
             assert!(v.is_finite());
@@ -213,34 +660,22 @@ mod tests {
         let mut opts = SimulationOptions::new(0);
         opts.target_order = Some(vec![0, 0, 1]);
         assert!(
-            sequential_gaussian_simulate(
-                OrdinaryGeoSimulator::new(&c, &v, vg).unwrap(),
-                &targets,
-                opts
-            )
-            .is_err()
+            sequential_gaussian_simulate(ordinary_conditioner(&c, &v, vg).unwrap(), &targets, opts)
+                .is_err()
         );
 
         let mut opts = SimulationOptions::new(0);
         opts.target_order = Some(vec![0, 1, 5]);
         assert!(
-            sequential_gaussian_simulate(
-                OrdinaryGeoSimulator::new(&c, &v, vg).unwrap(),
-                &targets,
-                opts
-            )
-            .is_err()
+            sequential_gaussian_simulate(ordinary_conditioner(&c, &v, vg).unwrap(), &targets, opts)
+                .is_err()
         );
 
         let mut opts = SimulationOptions::new(0);
         opts.target_order = Some(vec![0, 1]);
         assert!(
-            sequential_gaussian_simulate(
-                OrdinaryGeoSimulator::new(&c, &v, vg).unwrap(),
-                &targets,
-                opts
-            )
-            .is_err()
+            sequential_gaussian_simulate(ordinary_conditioner(&c, &v, vg).unwrap(), &targets, opts)
+                .is_err()
         );
     }
 
@@ -255,13 +690,13 @@ mod tests {
         ];
         let mean = 2.5;
         let a = sequential_gaussian_simulate(
-            SimpleGeoSimulator::new(&c, &v, vg, mean).unwrap(),
+            simple_conditioner(&c, &v, vg, mean).unwrap(),
             &targets,
             SimulationOptions::new(9),
         )
         .unwrap();
         let b = sequential_gaussian_simulate(
-            SimpleGeoSimulator::new(&c, &v, vg, mean).unwrap(),
+            simple_conditioner(&c, &v, vg, mean).unwrap(),
             &targets,
             SimulationOptions::new(9),
         )
@@ -278,7 +713,7 @@ mod tests {
         let (c, v, vg) = setup();
         let targets = vec![c[1]];
         let out = sequential_gaussian_simulate(
-            SimpleGeoSimulator::new(&c, &v, vg, 2.5).unwrap(),
+            simple_conditioner(&c, &v, vg, 2.5).unwrap(),
             &targets,
             SimulationOptions::new(33),
         )
@@ -302,13 +737,13 @@ mod tests {
         ];
         let trend = UniversalTrend::Linear;
         let a = sequential_gaussian_simulate(
-            UniversalGeoSimulator::new(&c, &v, vg, trend).unwrap(),
+            universal_conditioner(&c, &v, vg, trend).unwrap(),
             &targets,
             SimulationOptions::new(11),
         )
         .unwrap();
         let b = sequential_gaussian_simulate(
-            UniversalGeoSimulator::new(&c, &v, vg, trend).unwrap(),
+            universal_conditioner(&c, &v, vg, trend).unwrap(),
             &targets,
             SimulationOptions::new(11),
         )
@@ -330,7 +765,7 @@ mod tests {
         let v = vec![1.0, 2.0, 3.0];
         let vg = VariogramModel::new(0.1, 5.0, 200.0, VariogramType::Exponential).unwrap();
         let targets = vec![GeoCoord::try_new(0.5, 0.5).unwrap()];
-        let result = UniversalGeoSimulator::new(&c, &v, vg, UniversalTrend::Linear)
+        let result = universal_conditioner(&c, &v, vg, UniversalTrend::Linear)
             .and_then(|sim| sequential_gaussian_simulate(sim, &targets, SimulationOptions::new(0)));
         match result {
             Err(KrigingError::InsufficientData(n)) => assert_eq!(n, 4),
@@ -356,13 +791,13 @@ mod tests {
         ];
         let aniso = Anisotropy2D::isotropic();
         let a = sequential_gaussian_simulate(
-            ProjectedOrdinarySimulator::new(&coords, &values, vg, aniso).unwrap(),
+            projected_conditioner(&coords, &values, vg, aniso).unwrap(),
             &targets,
             SimulationOptions::new(5),
         )
         .unwrap();
         let b = sequential_gaussian_simulate(
-            ProjectedOrdinarySimulator::new(&coords, &values, vg, aniso).unwrap(),
+            projected_conditioner(&coords, &values, vg, aniso).unwrap(),
             &targets,
             SimulationOptions::new(5),
         )
@@ -393,7 +828,7 @@ mod tests {
         let (coords, successes, trials, vg) = binomial_projected_setup();
         let targets = vec![ProjectedCoord::new(0.5, 0.5)];
         let a = sequential_binomial_simulate(
-            BinomialProjectedSimulator::new(
+            projected_binomial_conditioner(
                 &coords,
                 &successes,
                 &trials,
@@ -407,7 +842,7 @@ mod tests {
         )
         .unwrap();
         let b = sequential_binomial_simulate(
-            BinomialProjectedSimulator::new(
+            projected_binomial_conditioner(
                 &coords,
                 &successes,
                 &trials,
@@ -437,7 +872,7 @@ mod tests {
         let n_real = 3usize;
         let base = 100u64;
         let many = sequential_binomial_simulate_many(
-            BinomialProjectedSimulator::new(
+            projected_binomial_conditioner(
                 &coords,
                 &successes,
                 &trials,
@@ -456,7 +891,7 @@ mod tests {
         assert_eq!(many.n_targets, targets.len());
         for k in 0..n_real {
             let one = sequential_binomial_simulate(
-                BinomialProjectedSimulator::new(
+                projected_binomial_conditioner(
                     &coords,
                     &successes,
                     &trials,
@@ -501,7 +936,7 @@ mod tests {
         ];
         let prior = BinomialPrior::default();
         let result = sequential_binomial_simulate(
-            BinomialGeoSimulator::new(&c, &s, &t, vg, prior).unwrap(),
+            binomial_conditioner(&c, &s, &t, vg, prior).unwrap(),
             &targets,
             SimulationOptions::new(17),
         )
@@ -531,13 +966,13 @@ mod tests {
         ];
         let prior = BinomialPrior::default();
         let a = sequential_binomial_simulate(
-            BinomialGeoSimulator::new(&c, &s, &t, vg, prior).unwrap(),
+            binomial_conditioner(&c, &s, &t, vg, prior).unwrap(),
             &targets,
             SimulationOptions::new(17),
         )
         .unwrap();
         let b = sequential_binomial_simulate(
-            BinomialGeoSimulator::new(&c, &s, &t, vg, prior).unwrap(),
+            binomial_conditioner(&c, &s, &t, vg, prior).unwrap(),
             &targets,
             SimulationOptions::new(17),
         )
@@ -558,7 +993,7 @@ mod tests {
         let targets = vec![GeoCoord::try_new(0.75, 0.25).unwrap()];
         let prior = BinomialPrior::default();
         let with_zero = sequential_binomial_simulate(
-            BinomialGeoSimulator::new(&c, &s, &t, vg, prior).unwrap(),
+            binomial_conditioner(&c, &s, &t, vg, prior).unwrap(),
             &targets,
             SimulationOptions::new(4),
         )
@@ -566,7 +1001,7 @@ mod tests {
 
         let (c2, s2, t2, _) = binomial_setup();
         let without = sequential_binomial_simulate(
-            BinomialGeoSimulator::new(&c2, &s2, &t2, vg, prior).unwrap(),
+            binomial_conditioner(&c2, &s2, &t2, vg, prior).unwrap(),
             &targets,
             SimulationOptions::new(4),
         )
@@ -586,7 +1021,7 @@ mod tests {
         let vg = VariogramModel::new(0.1, 5.0, 200.0, VariogramType::Exponential).unwrap();
         let targets = vec![GeoCoord::try_new(0.5, 0.5).unwrap()];
         let result =
-            BinomialGeoSimulator::new(&coords, &successes, &trials, vg, BinomialPrior::default())
+            binomial_conditioner(&coords, &successes, &trials, vg, BinomialPrior::default())
                 .and_then(|sim| {
                     sequential_binomial_simulate(sim, &targets, SimulationOptions::new(0))
                 });
@@ -603,13 +1038,13 @@ mod tests {
         let default_prior = BinomialPrior::default();
         let custom_prior = BinomialPrior::new(2.0, 5.0).unwrap();
         let a = sequential_binomial_simulate(
-            BinomialGeoSimulator::new(&c, &s, &t, vg, default_prior).unwrap(),
+            binomial_conditioner(&c, &s, &t, vg, default_prior).unwrap(),
             &targets,
             SimulationOptions::new(21),
         )
         .unwrap();
         let b = sequential_binomial_simulate(
-            BinomialGeoSimulator::new(&c, &s, &t, vg, custom_prior).unwrap(),
+            binomial_conditioner(&c, &s, &t, vg, custom_prior).unwrap(),
             &targets,
             SimulationOptions::new(21),
         )
@@ -621,8 +1056,6 @@ mod tests {
     }
 
     // ----- Space–time SGS ---------------------------------------------------
-
-    use crate::spacetime::GeoMetric;
 
     fn st_setup() -> (Vec<SpaceTimeCoord<GeoCoord>>, Vec<Real>, SpaceTimeVariogram) {
         let coords = vec![
@@ -648,13 +1081,13 @@ mod tests {
             SpaceTimeCoord::try_new(GeoCoord::try_new(0.25, 0.75).unwrap(), 0.5).unwrap(),
         ];
         let a = sequential_gaussian_simulate(
-            SpacetimeOrdinarySimulator::new(GeoMetric, &c, &v, vg).unwrap(),
+            spacetime_ordinary_conditioner(GeoMetric, &c, &v, vg).unwrap(),
             &targets,
             SimulationOptions::new(42),
         )
         .unwrap();
         let b = sequential_gaussian_simulate(
-            SpacetimeOrdinarySimulator::new(GeoMetric, &c, &v, vg).unwrap(),
+            spacetime_ordinary_conditioner(GeoMetric, &c, &v, vg).unwrap(),
             &targets,
             SimulationOptions::new(42),
         )
@@ -670,13 +1103,13 @@ mod tests {
             SpaceTimeCoord::try_new(GeoCoord::try_new(0.25, 0.75).unwrap(), 0.5).unwrap(),
         ];
         let a = sequential_gaussian_simulate(
-            SpacetimeOrdinarySimulator::new(GeoMetric, &c, &v, vg).unwrap(),
+            spacetime_ordinary_conditioner(GeoMetric, &c, &v, vg).unwrap(),
             &targets,
             SimulationOptions::new(1),
         )
         .unwrap();
         let b = sequential_gaussian_simulate(
-            SpacetimeOrdinarySimulator::new(GeoMetric, &c, &v, vg).unwrap(),
+            spacetime_ordinary_conditioner(GeoMetric, &c, &v, vg).unwrap(),
             &targets,
             SimulationOptions::new(2),
         )
@@ -689,7 +1122,7 @@ mod tests {
         let (c, v, vg) = st_setup();
         let targets = vec![c[2]];
         let out = sequential_gaussian_simulate(
-            SpacetimeOrdinarySimulator::new(GeoMetric, &c, &v, vg).unwrap(),
+            spacetime_ordinary_conditioner(GeoMetric, &c, &v, vg).unwrap(),
             &targets,
             SimulationOptions::new(7),
         )
@@ -711,7 +1144,7 @@ mod tests {
         let targets =
             vec![SpaceTimeCoord::try_new(GeoCoord::try_new(0.5, 0.5).unwrap(), 0.5).unwrap()];
         assert!(
-            SpacetimeOrdinarySimulator::new(GeoMetric, &c, &v_bad, vg)
+            spacetime_ordinary_conditioner(GeoMetric, &c, &v_bad, vg)
                 .and_then(|sim| sequential_gaussian_simulate(
                     sim,
                     &targets,
@@ -730,7 +1163,7 @@ mod tests {
         ];
         let mean = v.iter().copied().sum::<Real>() / v.len() as Real;
         let out = sequential_gaussian_simulate(
-            SpacetimeSimpleSimulator::new(GeoMetric, &c, &v, vg, mean).unwrap(),
+            spacetime_simple_conditioner(GeoMetric, &c, &v, vg, mean).unwrap(),
             &targets,
             SimulationOptions::new(3),
         )
@@ -747,7 +1180,7 @@ mod tests {
             SpaceTimeCoord::try_new(GeoCoord::try_new(0.25, 0.75).unwrap(), 0.5).unwrap(),
         ];
         let out = sequential_gaussian_simulate(
-            SpacetimeUniversalSimulator::new(
+            spacetime_universal_conditioner(
                 GeoMetric,
                 &c,
                 &v,
@@ -776,7 +1209,7 @@ mod tests {
         let targets =
             vec![SpaceTimeCoord::try_new(GeoCoord::try_new(0.5, 0.5).unwrap(), 0.0).unwrap()];
         // LinearInSpaceAndTime requires 4 basis terms → at least 5 points.
-        let r = SpacetimeUniversalSimulator::new(
+        let r = spacetime_universal_conditioner(
             GeoMetric,
             &c,
             &v,
@@ -807,7 +1240,7 @@ mod tests {
         let temporal = VariogramModel::new(0.05, 1.0, 2.0, VariogramType::Exponential).unwrap();
         let vg = SpaceTimeVariogram::new_separable(spatial, temporal).unwrap();
         let out = sequential_binomial_simulate(
-            SpacetimeBinomialSimulator::new(
+            spacetime_binomial_conditioner(
                 GeoMetric,
                 &c,
                 &successes,
@@ -848,7 +1281,7 @@ mod tests {
         let temporal = VariogramModel::new(0.05, 1.0, 2.0, VariogramType::Exponential).unwrap();
         let vg = SpaceTimeVariogram::new_separable(spatial, temporal).unwrap();
         let out = sequential_binomial_simulate(
-            SpacetimeBinomialSimulator::new(
+            spacetime_binomial_conditioner(
                 GeoMetric,
                 &c,
                 &successes,
@@ -878,7 +1311,7 @@ mod tests {
         let spatial = VariogramModel::new(0.1, 5.0, 200.0, VariogramType::Exponential).unwrap();
         let temporal = VariogramModel::new(0.05, 1.0, 2.0, VariogramType::Exponential).unwrap();
         let vg = SpaceTimeVariogram::new_separable(spatial, temporal).unwrap();
-        let r = SpacetimeBinomialSimulator::new(
+        let r = spacetime_binomial_conditioner(
             GeoMetric,
             &c,
             &successes,
@@ -906,7 +1339,7 @@ mod tests {
         let n_real = 4usize;
         let base_seed = 100u64;
         let many = sequential_gaussian_simulate_many(
-            OrdinaryGeoSimulator::new(&c, &v, vg).unwrap(),
+            ordinary_conditioner(&c, &v, vg).unwrap(),
             &targets,
             n_real,
             base_seed,
@@ -916,7 +1349,7 @@ mod tests {
         assert_eq!(many.len(), n_real * targets.len());
         for k in 0..n_real {
             let one = sequential_gaussian_simulate(
-                OrdinaryGeoSimulator::new(&c, &v, vg).unwrap(),
+                ordinary_conditioner(&c, &v, vg).unwrap(),
                 &targets,
                 SimulationOptions::new(base_seed + k as u64),
             )
@@ -935,7 +1368,7 @@ mod tests {
         let (c, v, vg) = setup();
         let targets = vec![GeoCoord::try_new(0.5, 0.5).unwrap()];
         let r = sequential_gaussian_simulate_many(
-            OrdinaryGeoSimulator::new(&c, &v, vg).unwrap(),
+            ordinary_conditioner(&c, &v, vg).unwrap(),
             &targets,
             0,
             0,
@@ -955,7 +1388,7 @@ mod tests {
         let n_real = 3usize;
         let base_seed = 555u64;
         let many = sequential_binomial_simulate_many(
-            BinomialGeoSimulator::new(&c, &s, &t, vg, prior).unwrap(),
+            binomial_conditioner(&c, &s, &t, vg, prior).unwrap(),
             &targets,
             n_real,
             base_seed,
@@ -968,7 +1401,7 @@ mod tests {
         assert_eq!(many.prevalence_samples.len(), n_real * targets.len());
         for k in 0..n_real {
             let one = sequential_binomial_simulate(
-                BinomialGeoSimulator::new(&c, &s, &t, vg, prior).unwrap(),
+                binomial_conditioner(&c, &s, &t, vg, prior).unwrap(),
                 &targets,
                 SimulationOptions::new(base_seed + k as u64),
             )
@@ -997,7 +1430,7 @@ mod tests {
         let targets = vec![GeoCoord::try_new(0.75, 0.25).unwrap()];
         let prior = BinomialPrior::default();
         let with_zero = sequential_binomial_simulate_many(
-            BinomialGeoSimulator::new(&c, &s, &t, vg, prior).unwrap(),
+            binomial_conditioner(&c, &s, &t, vg, prior).unwrap(),
             &targets,
             2,
             9,
@@ -1006,7 +1439,7 @@ mod tests {
         .unwrap();
         let (c2, s2, t2, _) = binomial_setup();
         let without = sequential_binomial_simulate_many(
-            BinomialGeoSimulator::new(&c2, &s2, &t2, vg, prior).unwrap(),
+            binomial_conditioner(&c2, &s2, &t2, vg, prior).unwrap(),
             &targets,
             2,
             9,
@@ -1027,7 +1460,7 @@ mod tests {
         let n_real = 3usize;
         let base_seed = 12345u64;
         let many = sequential_gaussian_simulate_many(
-            SpacetimeOrdinarySimulator::new(GeoMetric, &c, &v, vg).unwrap(),
+            spacetime_ordinary_conditioner(GeoMetric, &c, &v, vg).unwrap(),
             &targets,
             n_real,
             base_seed,
@@ -1037,7 +1470,7 @@ mod tests {
         assert_eq!(many.len(), n_real * targets.len());
         for k in 0..n_real {
             let one = sequential_gaussian_simulate(
-                SpacetimeOrdinarySimulator::new(GeoMetric, &c, &v, vg).unwrap(),
+                spacetime_ordinary_conditioner(GeoMetric, &c, &v, vg).unwrap(),
                 &targets,
                 SimulationOptions::new(base_seed + k as u64),
             )
@@ -1070,7 +1503,7 @@ mod tests {
         let n_real = 3usize;
         let base_seed = 77u64;
         let many = sequential_binomial_simulate_many(
-            SpacetimeBinomialSimulator::new(GeoMetric, &c, &successes, &trials, vg, prior).unwrap(),
+            spacetime_binomial_conditioner(GeoMetric, &c, &successes, &trials, vg, prior).unwrap(),
             &targets,
             n_real,
             base_seed,
@@ -1081,7 +1514,7 @@ mod tests {
         assert_eq!(many.n_targets, targets.len());
         for k in 0..n_real {
             let one = sequential_binomial_simulate(
-                SpacetimeBinomialSimulator::new(GeoMetric, &c, &successes, &trials, vg, prior)
+                spacetime_binomial_conditioner(GeoMetric, &c, &successes, &trials, vg, prior)
                     .unwrap(),
                 &targets,
                 SimulationOptions::new(base_seed + k as u64),

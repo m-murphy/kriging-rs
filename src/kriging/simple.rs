@@ -18,6 +18,7 @@ use crate::Real;
 use crate::distance::GeoCoord;
 use crate::error::KrigingError;
 use crate::geo_dataset::GeoDataset;
+use crate::kriging::conditioner::KrigingConditioner;
 use crate::kriging::ordinary::Prediction;
 use crate::kriging::pairwise::SpatialPairwiseCovariance;
 use crate::kriging::simple_engine::SimpleKrigingEngine;
@@ -62,6 +63,11 @@ impl SimpleKrigingModel {
 
     pub fn variogram(&self) -> VariogramModel {
         self.engine.pairwise_covariance().variogram()
+    }
+
+    /// Consume this fitted model as live state for sequential Gaussian simulation.
+    pub fn into_conditioner(self) -> Result<KrigingConditioner<GeoCoord>, KrigingError> {
+        Ok(KrigingConditioner::from_simple(self.engine))
     }
 
     /// Predict at a single target.

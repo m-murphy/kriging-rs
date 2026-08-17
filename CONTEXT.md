@@ -6,26 +6,29 @@ Vocabulary for geostatistical kriging concepts as they exist in this crate, plus
 
 ### Geostatistics
 
-**Kriging family**:
+**Kriging type**:
 One of the four prediction methods this crate supports: **ordinary**, **simple**, **universal**, **binomial**. Each is a kriging model under a different assumption about the mean (unknown constant, known constant, polynomial trend, logit of a probability).
-_Avoid_: kriging "kind", kriging "type" (overloaded with `VariogramType`).
+_Avoid_: kriging "kind"; kriging "type" when meaning `VariogramType` (spherical, exponential, …).
 
-**Geometry**:
-The spatial coordinate system a kriging model operates on. Three are supported: **geographic** (lat/lon, Haversine distance), **projected** (planar `(x, y)`, anisotropic Euclidean), and **space-time** (any spatial geometry plus a scalar time axis).
-_Avoid_: backend, coordinate type, coordinate system.
+**Spatial domain**:
+Where the random field is defined and how distance is measured. Three are supported: **geographic** (lat/lon, Haversine / great-circle distance), **projected** (planar `(x, y)`, anisotropic Euclidean), and **spatio-temporal** (any spatial domain plus a scalar time axis).
+_Avoid_: geometry (code/API tag only), backend, coordinate type.
 
-**Variogram**:
-The function describing how dissimilarity grows with distance. A `VariogramModel` is a parametric form (spherical, exponential, …) with nugget, sill, range, and optional shape. An *empirical* variogram is the binned-distance estimate computed from data.
+**Semivariogram**:
+The function γ(h) describing how dissimilarity grows with separation h. Related to covariance by C(h) = C(0) − γ(h). A parametric **semivariogram model** (spherical, exponential, …) has nugget, sill, range, and optional shape parameters. An **empirical semivariogram** is the binned pair-distance estimate from data.
+_Avoid_: using "variogram" and "semivariogram" interchangeably without stating which is meant; `VariogramModel` is the code name for a parametric semivariogram model.
 
-**Binomial calibration**:
-The default binomial kriging pipeline: empirical-Bayes Beta prior → logit working values → ordinary kriging on the logits with per-site logit observation variance on the covariance diagonal → logistic back-transform to prevalence. *Not* a full binomial-likelihood field model. Produces `BinomialBuildNotes`.
-_Avoid_: "binomial kriging" (ambiguous — say "calibrated binomial" when distinguishing from a hypothetical full-likelihood path).
+**Binomial kriging**:
+Kriging of binomial proportions (successes/trials) via empirical-Bayes Beta smoothing → logit transform → ordinary kriging on the logit scale with heteroskedastic per-site observation variance → logistic back-transform to prevalence. A **logit-Gaussian random field** approach, not full binomial maximum-likelihood geostatistics. Produces `BinomialBuildNotes`.
+_Avoid_: "calibrated binomial" in user-facing docs (retained in internal code names such as `BinomialCalibratedResult`).
 
-**Inflation retry**:
-The build-time loop that doubles the per-site logit observation variance until the covariance system factorizes successfully. Owns `n_build_attempts` and `logit_inflation` in `BinomialBuildNotes`.
+**Variance inflation**:
+The build-time loop that doubles each per-site logit observation variance until the covariance system factorizes successfully. Recorded as `n_build_attempts` and `logit_inflation` in `BinomialBuildNotes`.
+_Avoid_: inflation retry.
 
-**Calibrated logit ordinary build**:
-The shared orchestration that turns binomial counts + a variogram into an ordinary kriging model on logits: compute prior-smoothed logits, compute per-site Laplace variance, run the inflation retry loop, attach build notes. Geometry-agnostic by construction; one builder serves geographic, projected, and space-time binomial models.
+**Logit kriging pipeline**:
+The shared orchestration that turns binomial counts + a semivariogram model into an ordinary kriging model on logits: compute prior-smoothed logits, compute per-site Laplace variance, run variance inflation if needed, attach build notes. Spatial-domain-agnostic; one builder serves geographic, projected, and spatio-temporal binomial models.
+_Avoid_: calibrated logit ordinary build.
 
 **Dual SPD formulation**:
 A reformulation of ordinary kriging that solves on the symmetric **positive-definite** covariance block `C` plus a precomputed constraint vector `β = C⁻¹·1`, rather than on the symmetric-indefinite bordered system `[C 1; 1ᵀ 0]`. Mathematically equivalent in exact arithmetic. Enables Cholesky factorization and incremental site addition via `cholesky_extend_spd_lower`. See ADR-0001.
@@ -38,14 +41,25 @@ The trait that abstracts distance over a coordinate type. `SpatialMetric` provid
 _Avoid_: distance function, distance backend, distance kernel.
 
 **Space-time metric**:
-Extends `SpatialMetric` with a scalar time distance. `SpaceTimeMetric: SpatialMetric { fn time_distance(ta, tb) -> Real; }`. Space-time variograms combine the spatial and temporal distances via separable or product-sum families.
-_Avoid_: spacetime kernel.
+The pair of a **spatial metric** and a scalar time distance. Space-time variograms combine those distances via separable or product-sum families. Feeds **pairwise covariance**; it does not parameterize the **ordinary kriging engine**.
+_Avoid_: spacetime kernel; treating this as the ordinary engine's generic parameter.
+
+**Pairwise covariance**:
+The map from a pair of sites to an entry of C, plus C(0). C includes model jitter; per-site observation variance is not part of this seam. Spatial domain and the semivariogram model sit behind it; the ordinary, simple, and universal kriging engines do not. Two adapters exist: 2-D (spatial metric + semivariogram model) and spatio-temporal (space-time metric + space-time variogram).
+_Avoid_: covariance kernel, covariance backend, distance kernel.
+
+**Trend basis**:
+The map from a site to the columns of the universal-kriging design matrix `F`. Two adapters exist: geographic polynomial (`UniversalTrend`) and space-time (`SpaceTimeTrendEval` wrapping `SpaceTimeUniversalTrend`). The **universal kriging engine** is parameterized by **pairwise covariance** plus this seam.
+_Avoid_: drift functions, basis backend.
 
 **Ordinary kriging engine**:
-The single solver behind every non-binomial 2-D and space-time ordinary kriging prediction. Parameterized by `SpatialMetric` (and `SpaceTimeMetric` for the space-time variant). Owns the dual SPD factorization, the constraint vector, batch prediction, and the jitter policy.
+The single solver behind every non-binomial 2-D and space-time ordinary kriging prediction. Parameterized by **pairwise covariance**. Owns the dual SPD factorization, the constraint vector, batch prediction, and per-site observation variance on the diagonal. Neighborhood search is a 2-D model feature over the **spatial metric**, not an engine feature.
+
+**Universal kriging engine**:
+The single solver behind non-constant 2-D and space-time universal kriging. Parameterized by **pairwise covariance** and **trend basis**. Owns the dual SPD factorization of `C`, `β = C⁻¹F`, and the Schur complement on `Fᵀβ`. Constant-trend models delegate to the ordinary engine.
 
 **Kriging conditioner**:
-A live, incremental view of an ordinary kriging engine that supports `append_condition(site, value, obs_var)` in O(n²) via the SPD bordered extension (`cholesky_extend_spd_lower`). The only path that production SGS uses to add a sampled target to the conditioning pool.
+A live, incrementally fitted kriging state used by sequential Gaussian simulation. It predicts against the current conditioning set and can append a simulated condition without rebuilding from scratch. Ordinary, simple, and universal kriging each have a conditioner on their working scale; binomial kriging composes an ordinary conditioner on logits.
 _Avoid_: SGS state, simulation pool, conditioning history.
 
 **Kriging predictor trait**:
@@ -56,28 +70,29 @@ The single tagged WASM adapter (`WasmKrigingModel`) wrapping every fitted krigin
 _Avoid_: WasmOrdinaryKriging, WasmBinomialKriging (legacy per-family WASM structs — removed in 0.4).
 
 **Unified CV / simulation seam**:
-The stateless WASM entry points `cv(options)` and `simulate(options)` keyed by `geometry` + `family`, for callers that pass raw arrays without building a model handle. Delegates to the same [`KrigingPredictor`](crate::predictor::cv::KrigingPredictor) and [`KrigingSimulator`](crate::predictor/simulation.rs) harnesses as the model-handle methods.
+The stateless WASM entry points `cv(options)` and `simulate(options)` keyed by `geometry` + `family`, for callers that pass raw arrays without building a model handle. Delegates to the same kriging predictor and conditioner-backed harnesses as the model-handle methods.
 _Avoid_: leaveOneOutBinomialProjected, conditionalSimulateSpaceTimeUniversal (legacy named exports — removed in 0.4).
 
 **Binomial counts**:
-The geometry-free `(successes, trials)` value with `smoothed_logit(prior)` and `smoothed_probability(prior)` methods. Coordinates are paired with counts via `BinomialSite<C>` where `C: SpatialMetric::Coord`. Replaces the three observation structs.
+The geometry-free `(successes, trials)` value with `smoothed_logit(prior)` and `smoothed_probability(prior)` methods. Coordinates are paired with counts via the domain observation structs (`BinomialObservation`, `ProjectedBinomialObservation`, `SpaceTimeBinomialObservation<C>`).
+_Avoid_: `BinomialSite` (never shipped).
 
 ## Relationships
 
-- A **kriging family** runs on any **geometry**; the cartesian product was historically enumerated by hand and is now factored through the **spatial metric** seam.
-- A **calibrated binomial** model is a thin wrapper over an **ordinary kriging engine** plus the **calibrated logit ordinary build**.
+- Any **kriging type** runs on any **spatial domain**; distance is factored through the **spatial metric** seam. Ordinary, simple, and universal prediction are factored through **pairwise covariance**, not by enumerating domain × kriging type. Universal additionally factors the design matrix through **trend basis**.
+- A **binomial kriging** model is a thin wrapper over an **ordinary kriging engine** plus the **logit kriging pipeline**.
 - **Sequential Gaussian simulation** is the **kriging conditioner** iterated over a target order.
-- The **kriging predictor trait** is the read-only interface that **cv** and **simulation** see — neither knows the geometry or family directly.
+- The **kriging predictor trait** is the read-only interface that cross-validation sees; the **kriging conditioner** is the live fitted state that simulation sees. Neither harness knows the spatial domain or kriging type directly.
 
 ## Example dialogue
 
-> **Reviewer:** Why does spacetime binomial have its own build loop?
+> **Reviewer:** Why does spatio-temporal binomial have its own build loop?
 >
-> **Author:** It doesn't — there's one *calibrated logit ordinary build* in `kriging/binomial.rs`. The space-time binomial model passes its `SpaceTimeMetric` and `SpaceTimeOrdinaryKrigingModel` into the same builder. Geometry is the only variable.
+> **Author:** It doesn't — there's one *logit kriging pipeline* in `kriging/binomial.rs`. The spatio-temporal binomial model passes its `SpaceTimeMetric` and `SpaceTimeOrdinaryKrigingModel` into the same builder. Spatial domain is the only variable.
 >
 > **Reviewer:** And SGS — does it still rebuild the model per target?
 >
-> **Author:** All production SGS paths hold a *kriging conditioner* and call `append_condition` per sampled target — ordinary, simple, universal (all drift orders), and calibrated binomial across geographic, projected, and space–time geometries. The factorization extends in O(n²) via `cholesky_extend_spd_lower`. The conditioner is the only thing that touches that primitive.
+> **Author:** All production SGS paths hold a *kriging conditioner* and append each sampled target — ordinary, simple, universal (all drift orders), and binomial kriging across geographic, projected, and spatio-temporal domains.
 >
 > **Reviewer:** What about anisotropy on projected data?
 >

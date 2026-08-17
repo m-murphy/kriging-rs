@@ -28,7 +28,7 @@ use std::num::NonZeroUsize;
 
 use kriging_rs::aggregate::polygon_weighted_summary;
 use kriging_rs::cv::{BinomialCvSummary, BinomialGeoPredictor, k_fold_cv};
-use kriging_rs::simulation::{BinomialGeoSimulator, sequential_binomial_simulate_many};
+use kriging_rs::simulation::sequential_binomial_simulate_many;
 use kriging_rs::variogram::fitting::fit_variogram;
 use kriging_rs::{
     BinomialKrigingModel, BinomialObservation, BinomialPrior, EmpiricalEstimator, GeoCoord,
@@ -187,7 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---------------------------------------------------------------------
     let n_realizations = 50usize;
     let ensemble = sequential_binomial_simulate_many(
-        BinomialGeoSimulator::new(&coords, &successes, &trials, variogram, prior)?,
+        model.into_model().into_conditioner()?,
         &targets,
         n_realizations,
         /* base_seed = */ 42,

@@ -10,7 +10,7 @@ Collapse the geometry × kriging-family cartesian product at the WASM/TypeScript
 2. **Unified stateless entry points** — `cv(options)` and `simulate(options)` (plus `simulateMany` for ensemble paths) keyed by `geometry` + `family` strings, for callers that skip building a model.
 3. **0.4 breaking change** — remove the 20+ named `leaveOneOut*` / `kFold*` / `conditionalSimulate*` exports. TypeScript model classes (`OrdinaryKriging`, etc.) become thin adapters over `WasmKrigingModel`; they gain instance CV methods.
 
-Rust internals already use [`KrigingPredictor`](../../src/predictor/cv.rs) and [`KrigingSimulator`](../../src/predictor/simulation.rs); this ADR completes the migration at the foreign seam that the Rust-side predictor harness refactor deliberately left unchanged.
+Rust internals already used cross-cutting CV and SGS harnesses; this ADR completed the migration at the foreign seam. [ADR-0005](0005-opaque-kriging-conditioner-sgs-seam.md) later replaced the Rust simulator trait with an opaque kriging conditioner while preserving this WASM seam.
 
 ## Why
 

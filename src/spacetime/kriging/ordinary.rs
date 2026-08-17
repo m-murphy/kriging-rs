@@ -5,6 +5,7 @@
 
 use crate::Real;
 use crate::error::KrigingError;
+use crate::kriging::conditioner::KrigingConditioner;
 use crate::kriging::ordinary::Prediction;
 use crate::kriging::pairwise::SpaceTimePairwiseCovariance;
 use crate::spacetime::coord::SpaceTimeCoord;
@@ -101,6 +102,29 @@ impl<M: SpatialMetric> SpaceTimeOrdinaryKrigingModel<M> {
         M::Coord: Copy,
     {
         self.engine.coords().to_vec()
+    }
+
+    /// Consume this fitted model as live state for sequential Gaussian simulation.
+    pub fn into_conditioner(
+        self,
+    ) -> Result<KrigingConditioner<SpaceTimeCoord<M::Coord>>, KrigingError>
+    where
+        M: 'static,
+        M::Coord: 'static,
+        M::Prepared: 'static,
+    {
+        self.into_conditioner_on()
+    }
+
+    pub(crate) fn into_conditioner_on<Scale>(
+        self,
+    ) -> Result<KrigingConditioner<SpaceTimeCoord<M::Coord>, Scale>, KrigingError>
+    where
+        M: 'static,
+        M::Coord: 'static,
+        M::Prepared: 'static,
+    {
+        Ok(KrigingConditioner::from_ordinary(self.engine))
     }
 
     /// Single-target prediction.

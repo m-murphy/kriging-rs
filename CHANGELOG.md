@@ -18,9 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BinomialTangentPlaneKriging` (npm) and `WasmKrigingModel` handles (WASM).
 - **`BinomialAdapterRef`** — WASM dispatch for binomial build notes, diagnostics, and
   instance CV across geo, projected, tangent-plane, and spacetime adapters.
+- **`KrigingConditioner<Site, Scale>`** — opaque live fitted state for ordinary, simple,
+  universal, and binomial sequential Gaussian simulation, with compile-time continuous/logit
+  scale separation and atomic condition append.
 
 ### Changed
 
+- **Universal kriging engine** — [`UniversalKrigingEngine<K, T>`](src/kriging/universal_engine.rs)
+  is parameterized by pairwise covariance and [trend basis](docs/adr/0004-trend-basis-universal-engine.md);
+  [`SpaceTimeUniversalKrigingEngine<M>`](src/spacetime/kriging/universal_engine.rs) is a type alias.
 - **Binomial `diagnostics()`** (Rust and npm) — count-based builds compute LOO logit MSDR
   from retained training counts and model coordinates; explicit count tensors are only
   required for precomputed-logit builds.
@@ -29,6 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **npm binomial quartet** — shared `binomial-model-shared` helpers for lifecycle,
   diagnostics, CV, and batch/grid prediction across geo, projected, tangent-plane, and
   spacetime classes.
+- **SGS construction** — fitted models now provide `.into_conditioner()`; the four
+  `sequential_*` functions consume conditioners while retaining their RNG, target-order, and
+  result semantics.
+- **Binomial SGS calibration** — simulation now uses the fitted model's canonical
+  Laplace/Fisher logit observation variance instead of a separate empirical-Bayes variance path.
+
+### Removed
+
+- **Breaking Rust API:** `KrigingSimulator`, `BinomialKrigingSimulator`, the ten
+  model/domain-specific `*Simulator` structs, and the duplicate `predictor::simulation` route.
+  Use a fitted model's `.into_conditioner()` and the functions in `simulation` instead.
 
 ## [0.4.0] - 2026-06-12
 
@@ -49,27 +66,30 @@ predictor/simulator harnesses, unified WASM CV/simulation and model handle, and 
 - **TypeScript:** `interpolateBinomialToGrid` includes `buildNotes` on
   `InterpolateBinomialToGridResult`. `getBuildNotes()` is available on
   `BinomialKriging`, `BinomialProjectedKriging`, and `SpaceTimeBinomialKriging`.
-- **Dual SPD ordinary kriging engine** — [`OrdinaryKrigingEngine<M: SpatialMetric>`](src/kriging/engine.rs)
-  and [`SpaceTimeOrdinaryKrigingEngine<M>`](src/spacetime/kriging/engine.rs): Cholesky on the
+- **Dual SPD ordinary kriging engine** — [`OrdinaryKrigingEngine<K: PairwiseCovariance>`](src/kriging/engine.rs)
+  and [`SpaceTimeOrdinaryKrigingEngine<M>`](src/spacetime/kriging/engine.rs) (type alias): Cholesky on the
   covariance block `C` plus precomputed `β = C⁻¹·1`, with incremental conditioning via
-  [`cholesky_extend_spd_lower`](src/cholesky_update.rs). See [ADR-0001](docs/adr/0001-dual-spd-ordinary-kriging.md).
+  [`cholesky_extend_spd_lower`](src/cholesky_update.rs). See [ADR-0001](docs/adr/0001-dual-spd-ordinary-kriging.md)
+  and [ADR-0003](docs/adr/0003-pairwise-covariance-ordinary-engine.md).
 - **Simple kriging engines** for incremental SGS and prediction wrappers:
-  [`SimpleKrigingEngine<M>`](src/kriging/simple_engine.rs) and
-  [`SpaceTimeSimpleKrigingEngine<M>`](src/spacetime/kriging/simple_engine.rs).
+  [`SimpleKrigingEngine<K: PairwiseCovariance>`](src/kriging/simple_engine.rs) and
+  [`SpaceTimeSimpleKrigingEngine<M>`](src/spacetime/kriging/simple_engine.rs) (type alias).
 - **Universal kriging engines** (dual SPD with multi-constraint Schur complement):
-  [`UniversalKrigingEngine`](src/kriging/universal_engine.rs) and
-  [`SpaceTimeUniversalKrigingEngine<M>`](src/spacetime/kriging/universal_engine.rs).
+  [`UniversalKrigingEngine<K, T>`](src/kriging/universal_engine.rs) parameterized by
+  pairwise covariance and [trend basis](docs/adr/0004-trend-basis-universal-engine.md), and
+  [`SpaceTimeUniversalKrigingEngine<M>`](src/spacetime/kriging/universal_engine.rs) (type alias).
   Constant trend delegates to the ordinary engine.
 - **Calibrated logit ordinary build** — shared [`build_calibrated_logit_ordinary`](src/kriging/binomial.rs)
   for geographic, projected, and space–time binomial models.
-- **Generic predictor / simulator harnesses** in [`src/predictor/`](src/predictor/):
+- **Generic predictor / simulator harnesses** (the simulator backend surface was later
+  replaced by the Unreleased conditioner API):
   - [`KrigingPredictor`](src/predictor/cv.rs) + [`leave_one_out_cv`](src/predictor/cv.rs) /
     [`k_fold_cv`](src/predictor/cv.rs)
-  - [`KrigingSimulator`](src/predictor/simulation.rs) +
-    [`sequential_gaussian_simulate`](src/predictor/simulation.rs) /
-    [`sequential_binomial_simulate`](src/predictor/simulation.rs)
+  - Legacy `KrigingSimulator` +
+    [`sequential_gaussian_simulate`](src/simulation.rs) /
+    [`sequential_binomial_simulate`](src/simulation.rs)
   - Per-geometry backend structs (e.g. [`OrdinaryGeoPredictor`](src/predictor/cv.rs),
-    [`BinomialProjectedSimulator`](src/predictor/simulation.rs))
+    legacy `BinomialProjectedSimulator`)
 - **Domain vocabulary** — [`CONTEXT.md`](CONTEXT.md) and architecture review artifacts.
 - **`cv()`** — single WASM entry point dispatching on `(geometry, family)` for
   geo, projected, and spacetime ordinary / simple / universal / binomial CV.
@@ -146,7 +166,7 @@ predictor/simulator harnesses, unified WASM CV/simulation and model handle, and 
 
 - Separate **hetero-only** binomial constructor (superseded by calibrated default on `new` /
   `new_with_prior` / `new_with_config`).
-- Dead helpers duplicated from [`predictor/simulation`](src/predictor/simulation.rs) in
+- Dead helpers duplicated from the former `predictor/simulation` module in
   [`simulation.rs`](src/simulation.rs) (`Rng`, `resolve_target_order`, `validate_continuous_inputs`).
 - Per-variant WASM/TypeScript CV and SGS exports from 0.3.0 (see migration table below).
 
@@ -154,7 +174,7 @@ predictor/simulator harnesses, unified WASM CV/simulation and model handle, and 
 
 - **GPU batch prediction** on [`OrdinaryKrigingModel`](src/kriging/ordinary.rs): uses
   `engine.coords()` and `engine.variogram()` after the engine refactor.
-- **`OrdinaryKrigingEngine::condition`** now appends to `coords` as well as `prepared`/`values`.
+- **Ordinary engine condition append** now appends to `coords` as well as `prepared`/`values`.
 
 ### Migration (Rust)
 
@@ -164,7 +184,7 @@ leave_one_out_cv(&OrdinaryGeoPredictor { coords, values, variogram })?;
 
 // SGS — was conditional_simulate_ordinary(...)
 sequential_gaussian_simulate(
-    OrdinaryGeoSimulator::new(cond_coords, cond_values, variogram)?,
+    OrdinaryKrigingModel::new(dataset, variogram)?.into_conditioner()?,
     &targets,
     SimulationOptions::new(seed),
 )?;

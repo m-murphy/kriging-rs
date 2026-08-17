@@ -138,6 +138,9 @@ pub use kriging::binomial::{
     logit_observation_variance_laplace_binomial,
     logit_observation_variance_one_step_laplace_binomial,
 };
+pub use kriging::conditioner::{
+    ConditionalGaussian, ContinuousScale, KrigingConditioner, LogitScale,
+};
 pub use kriging::ordinary::{Neighborhood, OrdinaryKrigingModel, Prediction};
 pub use kriging::simple::SimpleKrigingModel;
 pub use kriging::universal::{UniversalKrigingModel, UniversalTrend};

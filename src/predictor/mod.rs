@@ -1,7 +1,5 @@
-//! Generic cross-validation and sequential-Gaussian-simulation harnesses.
+//! Generic cross-validation harnesses.
 //!
-//! Model-specific logic lives in [`cv`] and [`simulation`] backend structs that implement
-//! [`KrigingPredictor`](cv::KrigingPredictor) and [`KrigingSimulator`](simulation::KrigingSimulator).
+//! Sequential Gaussian simulation lives in [`crate::simulation`].
 
 pub mod cv;
-pub mod simulation;

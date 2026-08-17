@@ -24,6 +24,7 @@ use crate::kriging::binomial::{
 };
 use crate::predictor::cv::BinomialProjectedPredictor;
 
+use crate::kriging::conditioner::{KrigingConditioner, LogitScale};
 use crate::kriging::engine::OrdinaryKrigingEngine;
 use crate::kriging::ordinary::Prediction;
 use crate::kriging::pairwise::SpatialPairwiseCovariance;
@@ -360,6 +361,17 @@ impl ProjectedKrigingModel {
         self.len() == 0
     }
 
+    /// Consume this fitted model as live state for sequential Gaussian simulation.
+    pub fn into_conditioner(self) -> Result<KrigingConditioner<ProjectedCoord>, KrigingError> {
+        self.into_conditioner_on()
+    }
+
+    fn into_conditioner_on<Scale>(
+        self,
+    ) -> Result<KrigingConditioner<ProjectedCoord, Scale>, KrigingError> {
+        Ok(KrigingConditioner::from_ordinary(self.engine))
+    }
+
     pub fn predict(&self, coord: ProjectedCoord) -> Result<Prediction, KrigingError> {
         self.engine
             .predict(&[coord])
@@ -598,6 +610,13 @@ impl BinomialProjectedKrigingModel {
 
     pub fn coords(&self) -> &[ProjectedCoord] {
         self.inner.coords()
+    }
+
+    /// Consume this fitted model as live logit-scale state for binomial SGS.
+    pub fn into_conditioner(
+        self,
+    ) -> Result<KrigingConditioner<ProjectedCoord, LogitScale>, KrigingError> {
+        self.inner.into_conditioner_on()
     }
 
     pub fn anisotropy(&self) -> Anisotropy2D {

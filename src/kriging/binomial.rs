@@ -3,6 +3,7 @@ use crate::cv::BinomialCvSummary;
 use crate::distance::GeoCoord;
 use crate::error::KrigingError;
 use crate::geo_dataset::GeoDataset;
+use crate::kriging::conditioner::{KrigingConditioner, LogitScale};
 use crate::kriging::ordinary::OrdinaryKrigingModel;
 use crate::predictor::cv::{BinomialGeoPredictor, leave_one_out_cv};
 use crate::utils::{Probability, logistic, logit};
@@ -465,7 +466,7 @@ pub struct BinomialCalibratedResult<T> {
 }
 
 impl<T> BinomialCalibratedResult<T> {
-    /// Keep only the model (e.g. for internal prediction or legacy call sites).
+    /// Keep only the model (e.g. for internal prediction call sites).
     pub fn into_model(self) -> T {
         self.model
     }
@@ -834,6 +835,13 @@ impl BinomialKrigingModel {
     /// Training coordinates (same order as [`Self::len`] stations).
     pub fn coords(&self) -> &[GeoCoord] {
         self.ordinary_model.coords()
+    }
+
+    /// Consume this fitted model as live logit-scale state for binomial SGS.
+    pub fn into_conditioner(
+        self,
+    ) -> Result<KrigingConditioner<GeoCoord, LogitScale>, KrigingError> {
+        self.ordinary_model.into_conditioner_on()
     }
 
     /// Build a binomial kriging model from pre-computed logit values.

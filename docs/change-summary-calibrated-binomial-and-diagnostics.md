@@ -9,7 +9,7 @@ This document summarizes the working-tree changes for the **0.5** release in **k
 The work clusters into five themes:
 
 1. **Dual SPD ordinary kriging (ADR-0001)** — Cholesky on the covariance block `C` + `β = C⁻¹·1` replaces bordered LU for ordinary kriging across geographic, projected, and space–time geometries. Enables incremental SGS via `cholesky_extend_spd_lower`.
-2. **Generic predictor / simulator harnesses** — [`KrigingPredictor`](../../src/predictor/cv.rs) and [`KrigingSimulator`](../../src/predictor/simulation.rs) replace 36 named Rust CV/simulation entry points. WASM/TS export names unchanged.
+2. **Generic predictor / conditioner harnesses** — [`KrigingPredictor`](../../src/predictor/cv.rs) and [`KrigingConditioner`](../../src/kriging/conditioner.rs) replace 36 named Rust CV/simulation entry points. WASM/TS export names unchanged.
 3. **Calibrated binomial (0.4 carry-over)** — empirical-Bayes logits, per-site logit observation variance, inflation retries, [`BinomialBuildNotes`](../../src/kriging/binomial.rs), diagnostics, WASM/TS parity.
 4. **Incremental SGS coverage** — all continuous and binomial simulator backends use the kriging conditioner; no refit-per-target paths remain.
 5. **Domain vocabulary** — [`CONTEXT.md`](../../CONTEXT.md), [ADR-0001](adr/0001-dual-spd-ordinary-kriging.md).
@@ -22,13 +22,14 @@ The work clusters into five themes:
 
 | Seam | Module | Notes |
 |------|--------|-------|
-| Ordinary engine | `src/kriging/engine.rs`, `src/spacetime/kriging/engine.rs` | Dual SPD; `fit`, `predict`, `condition` |
+| Ordinary engine | `src/kriging/engine.rs`, `src/spacetime/kriging/engine.rs` | Dual SPD; `fit`, `predict`, `append_condition` |
 | Simple engine | `src/kriging/simple_engine.rs`, `src/spacetime/kriging/simple_engine.rs` | SPD Cholesky; prediction + SGS |
 | Universal engine | `src/kriging/universal_engine.rs`, `src/spacetime/kriging/universal_engine.rs` | Dual SPD + Schur; constant → ordinary |
 | Calibrated binomial build | `src/kriging/binomial.rs` | `build_calibrated_logit_ordinary` — one builder, three geometries |
 | Predictor harness | `src/predictor/cv.rs` | `KrigingPredictor::predict_fold` + LOO/k-fold |
-| Simulator harness | `src/predictor/simulation.rs` | `KrigingSimulator` + SGS drivers |
-| Shrunk facades | `src/cv.rs`, `src/simulation.rs` | Types + `pub use predictor::*` |
+| Kriging conditioner | `src/kriging/conditioner.rs` | Opaque live fitted state with continuous/logit scales |
+| Simulation harness | `src/simulation.rs` | RNG, target order, and single/many SGS drivers |
+| CV facade | `src/cv.rs` | Residual/summary types + predictor harness re-export |
 
 ---
 
@@ -63,12 +64,12 @@ The work clusters into five themes:
 
 - Calibrated / binomial-aware fitting paths (including behavior exercised by **`fitBinomialVariogram`** on the WASM side and integration tests).
 
-### 3.7 Simulation (`src/predictor/simulation.rs`, `src/simulation.rs`)
+### 3.7 Simulation (`src/kriging/conditioner.rs`, `src/simulation.rs`)
 
-- Generic SGS harness with per-geometry **simulator backends** (`OrdinaryGeoSimulator`, `SimpleGeoSimulator`, …).
-- Incremental **condition** path for ordinary, simple, binomial, projected ordinary, space–time ordinary/simple, and constant-trend universal.
+- Generic SGS harness over one opaque, scale-typed **kriging conditioner** obtained from fitted models.
+- Incremental **condition** path for ordinary, simple, universal, and binomial kriging across geographic, projected, and space–time domains.
 - Skips duplicate-site append when kriging variance ≤ `1e-10`.
-- `src/simulation.rs` retains types (`SimulationOptions`, binomial result structs) and re-exports the harness; dead duplicate helpers removed.
+- `src/simulation.rs` owns options, result types, RNG/order orchestration, and single/many realization loops.
 
 ### 3.8 Predictor / CV (`src/predictor/cv.rs`, `src/cv.rs`)
 
@@ -146,7 +147,7 @@ The work clusters into five themes:
 
 | Area | Before | After |
 |------|--------|--------|
-| Rust CV / SGS (0.5) | Named `leave_one_out_*`, `k_fold_*`, `conditional_simulate_*` | **`KrigingPredictor`** / **`KrigingSimulator`** backends + generic harnesses |
+| Rust CV / SGS (0.5) | Named `leave_one_out_*`, `k_fold_*`, `conditional_simulate_*` | **`KrigingPredictor`** for CV; fitted-model **`.into_conditioner()`** + generic SGS harnesses |
 | Ordinary prediction numerics (0.5) | Bordered LU | Dual SPD Cholesky; small **`f32`** drift possible |
 | Rust binomial constructors | Returned `BinomialKrigingModel` (or similar) directly | Return **`BinomialCalibratedResult<…>`**; use **`.model`** / **`.into_model()`** / **`Deref`** |
 | Default binomial prior | May have differed by call site | **Default `Beta(1, 1)`** when omitted; use explicit **Jeffreys** if you need **`0.5/0.5`** |

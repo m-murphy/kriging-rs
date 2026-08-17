@@ -1,8 +1,7 @@
-//! WebAssembly bindings for the [`crate::spacetime`] module.
+//! Internal space–time wrappers for the tagged [`WasmKrigingModel`](super::model_handle::WasmKrigingModel) handle.
 //!
-//! Layout mirrors the 2-D bindings in [`super`]: one `WasmSpaceTime*Kriging` struct per
-//! kriging family, each with `fromArrays` and zero-copy `predictBatchArrays` constructors,
-//! plus stand-alone functions for empirical-variogram computation and parametric fitting.
+//! Per-family `WasmSpaceTime*Kriging` types are crate-private construction helpers, not WASM
+//! exports. Empirical-variogram and fitting entry points remain stand-alone WASM functions.
 
 #![allow(clippy::too_many_arguments)]
 // JS interop only accepts `f64`. See note in `super` (src/wasm/mod.rs).
@@ -20,9 +19,8 @@ use crate::distance::GeoCoord;
 use crate::kriging::binomial::BinomialCalibratedResult;
 use crate::projected::{Anisotropy2D, ProjectedCoord};
 use crate::simulation::{
-    SpacetimeBinomialSimulator, SpacetimeOrdinarySimulator, SpacetimeSimpleSimulator,
-    SpacetimeUniversalSimulator, sequential_binomial_simulate, sequential_binomial_simulate_many,
-    sequential_gaussian_simulate, sequential_gaussian_simulate_many,
+    sequential_binomial_simulate, sequential_binomial_simulate_many, sequential_gaussian_simulate,
+    sequential_gaussian_simulate_many,
 };
 use crate::spacetime::SpaceTimeBinomialDiagnostics;
 use crate::spacetime::{
@@ -1642,12 +1640,16 @@ pub(super) fn run_spacetime_simulate(opts: &UnifiedSimulateOptions) -> Result<Js
                 .iter()
                 .map(|v| *v as Real)
                 .collect();
-            let simulator =
-                SpacetimeOrdinarySimulator::new(GeoMetric, &cond_coords, &cond_values, vg)
-                    .map_err(kriging_err_to_js)?;
+            let conditioner = SpaceTimeOrdinaryKrigingModel::new(
+                GeoMetric,
+                SpaceTimeDataset::new(cond_coords, cond_values).map_err(kriging_err_to_js)?,
+                vg,
+            )
+            .and_then(SpaceTimeOrdinaryKrigingModel::into_conditioner)
+            .map_err(kriging_err_to_js)?;
             if opts.is_many() {
                 let samples = sequential_gaussian_simulate_many(
-                    simulator,
+                    conditioner,
                     &targets,
                     opts.realization_count() as usize,
                     opts.effective_base_seed(),
@@ -1657,9 +1659,12 @@ pub(super) fn run_spacetime_simulate(opts: &UnifiedSimulateOptions) -> Result<Js
                 let samples_f64: Vec<f64> = samples.iter().map(|v| *v as f64).collect();
                 Ok(Float64Array::from(samples_f64.as_slice()).into())
             } else {
-                let samples =
-                    sequential_gaussian_simulate(simulator, &targets, st_simulation_options(opts))
-                        .map_err(kriging_err_to_js)?;
+                let samples = sequential_gaussian_simulate(
+                    conditioner,
+                    &targets,
+                    st_simulation_options(opts),
+                )
+                .map_err(kriging_err_to_js)?;
                 let samples_f64: Vec<f64> = samples.iter().map(|v| *v as f64).collect();
                 Ok(Float64Array::from(samples_f64.as_slice()).into())
             }
@@ -1682,16 +1687,16 @@ pub(super) fn run_spacetime_simulate(opts: &UnifiedSimulateOptions) -> Result<Js
                 .iter()
                 .map(|v| *v as Real)
                 .collect();
-            let simulator = SpacetimeSimpleSimulator::new(
+            let conditioner = SpaceTimeSimpleKrigingModel::new(
                 GeoMetric,
-                &cond_coords,
-                &cond_values,
+                SpaceTimeDataset::new(cond_coords, cond_values).map_err(kriging_err_to_js)?,
                 vg,
                 mean as Real,
             )
+            .and_then(SpaceTimeSimpleKrigingModel::into_conditioner)
             .map_err(kriging_err_to_js)?;
             let samples =
-                sequential_gaussian_simulate(simulator, &targets, st_simulation_options(opts))
+                sequential_gaussian_simulate(conditioner, &targets, st_simulation_options(opts))
                     .map_err(kriging_err_to_js)?;
             let samples_f64: Vec<f64> = samples.iter().map(|v| *v as f64).collect();
             Ok(Float64Array::from(samples_f64.as_slice()).into())
@@ -1715,11 +1720,16 @@ pub(super) fn run_spacetime_simulate(opts: &UnifiedSimulateOptions) -> Result<Js
                 .map(|v| *v as Real)
                 .collect();
             let trend = parse_universal_trend(trend_str)?;
-            let simulator =
-                SpacetimeUniversalSimulator::new(GeoMetric, &cond_coords, &cond_values, vg, trend)
-                    .map_err(kriging_err_to_js)?;
+            let conditioner = SpaceTimeUniversalKrigingModel::new(
+                GeoMetric,
+                SpaceTimeDataset::new(cond_coords, cond_values).map_err(kriging_err_to_js)?,
+                vg,
+                trend,
+            )
+            .and_then(SpaceTimeUniversalKrigingModel::into_conditioner)
+            .map_err(kriging_err_to_js)?;
             let samples =
-                sequential_gaussian_simulate(simulator, &targets, st_simulation_options(opts))
+                sequential_gaussian_simulate(conditioner, &targets, st_simulation_options(opts))
                     .map_err(kriging_err_to_js)?;
             let samples_f64: Vec<f64> = samples.iter().map(|v| *v as f64).collect();
             Ok(Float64Array::from(samples_f64.as_slice()).into())
@@ -1734,18 +1744,29 @@ pub(super) fn run_spacetime_simulate(opts: &UnifiedSimulateOptions) -> Result<Js
                 ));
             }
             let prior = parse_binomial_prior(opts.prior_alpha, opts.prior_beta)?;
-            let simulator = SpacetimeBinomialSimulator::new(
+            let observations = cond_coords
+                .into_iter()
+                .zip(opts.conditioning_successes.iter().copied())
+                .zip(opts.conditioning_trials.iter().copied())
+                .filter(|(_, trials)| *trials > 0)
+                .map(|((coord, successes), trials)| {
+                    SpaceTimeBinomialObservation::new(coord, successes, trials)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(kriging_err_to_js)?;
+            let conditioner = SpaceTimeBinomialKrigingModel::new_with_prior(
                 GeoMetric,
-                &cond_coords,
-                &opts.conditioning_successes,
-                &opts.conditioning_trials,
+                observations,
                 vg,
                 prior,
+                Default::default(),
             )
+            .map(|fit| fit.into_model())
+            .and_then(SpaceTimeBinomialKrigingModel::into_conditioner)
             .map_err(kriging_err_to_js)?;
             if opts.is_many() {
                 let result = sequential_binomial_simulate_many(
-                    simulator,
+                    conditioner,
                     &targets,
                     opts.realization_count() as usize,
                     opts.effective_base_seed(),
@@ -1754,9 +1775,12 @@ pub(super) fn run_spacetime_simulate(opts: &UnifiedSimulateOptions) -> Result<Js
                 .map_err(kriging_err_to_js)?;
                 binomial_many_simulation_to_js(result)
             } else {
-                let result =
-                    sequential_binomial_simulate(simulator, &targets, st_simulation_options(opts))
-                        .map_err(kriging_err_to_js)?;
+                let result = sequential_binomial_simulate(
+                    conditioner,
+                    &targets,
+                    st_simulation_options(opts),
+                )
+                .map_err(kriging_err_to_js)?;
                 binomial_simulation_to_js(result)
             }
         }

@@ -57,7 +57,6 @@ pub(crate) fn forward_solve_lower(
 /// ```
 ///
 /// with `A = L Lᵀ`. Returns `L_new` with `A_new = L_new L_newᵀ`.
-#[allow(dead_code)] // engine::condition; simulation.rs next
 pub(crate) fn cholesky_extend_spd_lower(
     l: &DMatrix<Real>,
     cross_cov: &DVector<Real>,
