@@ -8,6 +8,7 @@ use crate::geo_dataset::GeoDataset;
 use crate::kriging::binomial::{
     BinomialKrigingModel, build_binomial_observations_dropping_zero_trials,
 };
+use crate::kriging::conditioner::KrigingConditioner;
 use crate::kriging::ordinary::OrdinaryKrigingModel;
 use crate::kriging::simple::SimpleKrigingModel;
 use crate::kriging::universal::UniversalKrigingModel;
@@ -58,6 +59,29 @@ fn samples_to_js(samples: Vec<Real>) -> JsValue {
     Float64Array::from(samples_f64.as_slice()).into()
 }
 
+pub(super) fn run_continuous_simulate<S>(
+    conditioner: KrigingConditioner<S>,
+    targets: &[S],
+    opts: &UnifiedSimulateOptions,
+) -> Result<JsValue, JsValue>
+where
+    S: Copy,
+{
+    let samples = if opts.is_many() {
+        sequential_gaussian_simulate_many(
+            conditioner,
+            targets,
+            opts.realization_count() as usize,
+            opts.effective_base_seed(),
+            target_order_usize(opts),
+        )
+    } else {
+        sequential_gaussian_simulate(conditioner, targets, simulation_options(opts))
+    }
+    .map_err(kriging_err_to_js)?;
+    Ok(samples_to_js(samples))
+}
+
 fn run_simulate_2d(opts: &UnifiedSimulateOptions) -> Result<JsValue, JsValue> {
     let geometry = opts.geometry.as_str();
     let family = opts.family.as_str();
@@ -94,22 +118,7 @@ fn run_simulate_2d(opts: &UnifiedSimulateOptions) -> Result<JsValue, JsValue> {
             )
             .and_then(OrdinaryKrigingModel::into_conditioner)
             .map_err(kriging_err_to_js)?;
-            if opts.is_many() {
-                let samples = sequential_gaussian_simulate_many(
-                    conditioner,
-                    &targets,
-                    opts.realization_count() as usize,
-                    opts.effective_base_seed(),
-                    target_order_usize(opts),
-                )
-                .map_err(kriging_err_to_js)?;
-                Ok(samples_to_js(samples))
-            } else {
-                let samples =
-                    sequential_gaussian_simulate(conditioner, &targets, simulation_options(opts))
-                        .map_err(kriging_err_to_js)?;
-                Ok(samples_to_js(samples))
-            }
+            run_continuous_simulate(conditioner, &targets, opts)
         }
         ("geo", "simple") => {
             let mean = opts
@@ -135,10 +144,7 @@ fn run_simulate_2d(opts: &UnifiedSimulateOptions) -> Result<JsValue, JsValue> {
             )
             .and_then(SimpleKrigingModel::into_conditioner)
             .map_err(kriging_err_to_js)?;
-            let samples =
-                sequential_gaussian_simulate(conditioner, &targets, simulation_options(opts))
-                    .map_err(kriging_err_to_js)?;
-            Ok(samples_to_js(samples))
+            run_continuous_simulate(conditioner, &targets, opts)
         }
         ("geo", "universal") => {
             let trend_str = opts.trend.as_deref().ok_or_else(|| {
@@ -165,10 +171,7 @@ fn run_simulate_2d(opts: &UnifiedSimulateOptions) -> Result<JsValue, JsValue> {
             )
             .and_then(UniversalKrigingModel::into_conditioner)
             .map_err(kriging_err_to_js)?;
-            let samples =
-                sequential_gaussian_simulate(conditioner, &targets, simulation_options(opts))
-                    .map_err(kriging_err_to_js)?;
-            Ok(samples_to_js(samples))
+            run_continuous_simulate(conditioner, &targets, opts)
         }
         ("geo", "binomial") => {
             if opts.conditioning_lats.len() != opts.conditioning_lons.len()
@@ -250,10 +253,7 @@ fn run_simulate_2d(opts: &UnifiedSimulateOptions) -> Result<JsValue, JsValue> {
             )
             .and_then(ProjectedKrigingModel::into_conditioner)
             .map_err(kriging_err_to_js)?;
-            let samples =
-                sequential_gaussian_simulate(conditioner, &targets, simulation_options(opts))
-                    .map_err(kriging_err_to_js)?;
-            Ok(samples_to_js(samples))
+            run_continuous_simulate(conditioner, &targets, opts)
         }
         ("projected", "binomial") => {
             if opts.conditioning_xs.len() != opts.conditioning_ys.len()
